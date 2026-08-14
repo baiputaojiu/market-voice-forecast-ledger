@@ -6,13 +6,16 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」のローカル実装と一時Git remote検証が完了した。ユーザーの最終承認を受け、公開GitHub作成と初回pushを実行中。アプリ本体は設計段階で、実装未着手。
+M0「複数PC間の作業状態保存・再開基盤」は完了。公開GitHubと別cloneから要件、決定、計画、進捗、2つのリポジトリスキル、検証手順を再構築できる。アプリ本体は設計段階で、実装未着手。次はM1「アプリ設計の完成」。
 
 ## Git状態（Git State）
 
-- 対象ディレクトリと親ディレクトリは、まだGitリポジトリではない。
-- branch、commit、remote、upstreamは存在しない。
-- ユーザーは2026-08-14にGit初期化、公開リポジトリ作成、初回commit・pushを最終承認した。
+- 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
+- branch: `main`
+- upstream: `origin/main`
+- visibility: `PUBLIC`
+- commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
+- 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
 
 ## 完了済み（Completed）
 
@@ -24,20 +27,22 @@ M0「複数PC間の作業状態保存・再開基盤」のローカル実装と�
 - `$save-work-state` と `$resume-work-state` をリポジトリスコープのCodexスキルとして実装した。
 - 両スキルをbaselineと適用後で各5反復評価し、安定した結果を固定の評価文書へ記録した。
 - 一時source、bare remote、second cloneを使う統合試験を実装した。
-- 26ファイルを初回公開候補として特定し、`.stitch`と実データ種別を除外した。
+- 承認済み26ファイルだけを初回commitし、公開GitHubの`main`へpushした。
+- 初回push後にlocal HEADとlive `origin/main`のSHA一致を確認した。
+- GitHubから別cloneし、26ファイルのみ、`.stitch`なし、clean、ahead/behind 0、全119テスト成功を確認した。
 
 ## 作業中（In Progress）
 
-- 公開候補26ファイルだけを初回commitし、`baiputaojiu/market-voice-forecast-ledger`へpushする。
-- push後にlive remote SHAと別cloneで再開可能性を確認する。
+- 現在進行中のアプリ実装作業はない。
+- 次の作業としてM1のデータモデルと変更不能スナップショット形式の設計を開始できる状態。
 
 ## 未着手（Not Started）
 
-- 対象ディレクトリのGit初期化と`main` branch作成。
-- 公開候補だけを明示的にstageし、staged公開安全検査後に最初のcommitを作成する作業。
-- 公開GitHubリポジトリの作成または接続、初回push、live remote SHA照合。
-- 別の一時cloneによる公開後の保存・再開確認。
-- M1以降のアプリ詳細設計とアプリ実装。
+- データモデルと変更不能スナップショット形式の確定。
+- YouTube収集、重複検出、音声処理、話者確認の詳細設計。
+- Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
+- UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
+- M2以降のアプリ実装。
 
 ## 検証結果（Verification Results）
 
@@ -48,7 +53,9 @@ M0「複数PC間の作業状態保存・再開基盤」のローカル実装と�
 - 保存スキル: baseline 0/5、適用後5/5が完全契約を満たした。
 - 再開スキル: baseline 0/5、適用後5/5が完全契約を満たした。
 - 全決定的スイート: 2026-08-14に119 passed、0 failed。
-- 対象ディレクトリと親が非Gitであることを検証済み。実Git初期化、commit、外部remote接続、pushは未実施。
+- 公開直前のworking tree検査とstaged検査は26ファイルで合格。`.stitch`、実データ、秘密情報はcommitされていない。
+- 公開GitHubは`PUBLIC`、既定branchは`main`、初回push後のlive remote SHA照合は成功。
+- GitHubからの別cloneでも状態文書検査、公開安全検査、119件の全テストが成功。
 
 ## 既知の問題（Known Issues）
 
@@ -66,10 +73,10 @@ M0「複数PC間の作業状態保存・再開基盤」のローカル実装と�
 
 ## 次の作業（Next Actions）
 
-1. `main`でGit初期化し、公開候補26ファイルを明示stageして公開安全検査を実行する。
-2. 最初のcommitを公開remoteへpushし、live remote SHA一致を確認する。
-3. 公開済みの事実をこの状態文書へ追補し、再度commit・push・SHA確認する。
-4. 別cloneで`AGENTS.md`、状態文書、2スキルを読み、再開手順を検証する。
+1. M1のデータモデルと変更不能スナップショット形式を設計する。
+2. 収集、文字起こし、話者分離・割当、予想分析の境界と入出力を詳細化する。
+3. Codex分析のprompt、JSON Schema、バッチmanifest、集約規則を確定する。
+4. UI例外処理、再試行、監査ログ、テスト戦略を確定する。
 
 ## 重要ファイル（Important Files）
 

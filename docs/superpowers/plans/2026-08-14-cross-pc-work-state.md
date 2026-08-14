@@ -118,4 +118,4 @@
 - [x] 全テストを実行し、119 passed、0 failedを確認する。
 - [x] `.gitignore` と公開方針に禁止データ種別の漏れがないか照合し、`secrets/` と `credentials/` の強制stageも拒否するよう補強した。
 - [x] 実装ファイル一覧、テスト結果、既知の制約、初回公開予定一覧を `docs/project/status.md` へ反映する。
-- [ ] 実Git初期化、commit、GitHub作成、pushを行わずユーザーへ最終承認を求める。
+- [x] 実Git初期化、commit、GitHub作成、pushを行わずユーザーへ最終承認を求める。
