@@ -76,3 +76,6 @@ temp/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local Git worktrees
+/.worktrees/
