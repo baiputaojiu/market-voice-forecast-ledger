@@ -1,6 +1,8 @@
-# M1 中核データモデル Implementation Plan
+# M1 中核データモデル Implementation Plan — Superseded Draft
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: SUPERSEDED DRAFT — DO NOT EXECUTE.** 2026-08-15の実装前レビューで要件欠落と作業粒度の問題が見つかり、M1を設計、M2を実装とする方式へ変更された。この文書のタスク本文は履歴参照用であり、書面反映済みspecのユーザー承認後に、M2中核バックエンドの16～20程度の小粒度タスクへ全面改訂する。
+
+> **Historical instruction (inactive):** この文書が有効だった時点では、タスク単位の実行スキルを使う想定だった。現在は上記の実行禁止を優先し、本文のcheckboxを開始しない。
 
 **Goal:** 承認済みM1設計に従い、主体別チャンネル方針から話者割当、変更不能な分析run、指数割当、現在予想、ヒートマップ、checkpoint、監査、削除までをSQLiteへ安全に保存するテスト済みの中核バックエンドを構築する。
 
