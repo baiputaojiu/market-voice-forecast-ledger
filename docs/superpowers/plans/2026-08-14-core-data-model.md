@@ -15,7 +15,7 @@
 - DB時刻はUTCのISO 8601文字列、日付指定cutoffは選択日のJST 23:59:59、期間はJST暦日 `YYYY-MM-DD` とする。
 - 分析用の動画日時は `published_at` だけとし、`recorded_at` を作成・保存・推定しない。
 - 江守哲は表示名「江守哲の米国株投資チャンネル」、固定YouTubeチャンネルID `UCVXka7buS_WptsAzSE0LcKg` を正本にする。
-- 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問の正本IDはこの計画で推測せず、確認値がない間は `configuration_required` とする。
+- 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問の公式YouTubeチャンネルIDはユーザー確認済みの `UCOfzLmXpI3qmZfV7_Cs1sYA` を正本にする。
 - 手動URL登録はチャンネル方針を迂回しない。江守哲のID不一致動画は音声取得、文字起こし、分析、ヒートマップへ進めない。
 - Codex runは `gpt-5.6-sol`、reasoning effort `max`、外部ツール呼び出し0件だけを採用し、下位モデルへfallbackしない。
 - Codex入力には対象主体へ割り当てた発話だけを含め、聞き手と保留区間を根拠にしない。
@@ -236,6 +236,14 @@ def test_emori_seed_uses_user_confirmed_channel_id(db):
     assert policy.youtube_channel_id == "UCVXka7buS_WptsAzSE0LcKg"
 
 
+def test_akatsuki_seed_uses_user_confirmed_official_channel_id(db):
+    bootstrap_reference_data(db)
+    policy = SourceRepository(db).get_policy_by_subject_name("暁投資顧問")
+    assert policy.policy_kind is PolicyKind.FIXED_CHANNEL
+    assert policy.configuration_status is ConfigurationStatus.CONFIGURED
+    assert policy.youtube_channel_id == "UCOfzLmXpI3qmZfV7_Cs1sYA"
+
+
 def test_manual_url_cannot_bypass_emori_fixed_channel(db):
     bootstrap_reference_data(db)
     repo = SourceRepository(db)
@@ -335,7 +343,7 @@ def evaluate_policy(
     return EligibilityDecision.channel_out_of_scope()
 ```
 
-`bootstrap_reference_data` must be idempotent. It must seed 木野内栄治 and 大川智宏 as `all_channels`, 江守哲 as the configured fixed channel above, and 暁投資顧問 as one organization with `fixed_channel` plus `configuration_required` until a confirmed official ID is recorded. It must seed the documented search aliases and must not invent a channel ID.
+`bootstrap_reference_data` must be idempotent. It must seed 木野内栄治 and 大川智宏 as `all_channels`, 江守哲 as configured fixed channel `UCVXka7buS_WptsAzSE0LcKg`, and 暁投資顧問 as one configured fixed-channel organization with official ID `UCOfzLmXpI3qmZfV7_Cs1sYA`. It must seed the documented search aliases and must not infer either ID from a display name.
 
 - [ ] **Step 5: Run policy tests and all backend tests**
 
@@ -1396,7 +1404,7 @@ git commit -m "test: verify synthetic core data flow"
 ## Completion Criteria
 
 - All nine numbered migrations apply once to a new SQLite DB and leave foreign keys enabled.
-- The four default analysis subjects exist; 江守哲 is configured with `UCVXka7buS_WptsAzSE0LcKg`; no unconfirmed 暁投資顧問 channel ID is invented.
+- The four default analysis subjects exist; 江守哲 is configured with `UCVXka7buS_WptsAzSE0LcKg`; 暁投資顧問 is configured with `UCOfzLmXpI3qmZfV7_Cs1sYA`.
 - Manual URL registration cannot bypass fixed-channel rules.
 - Duplicate reposts remain stored but only the canonical video contributes analysis input.
 - Subject, interviewer, and hold assignments are stored separately and only subject segments enter analysis inputs.

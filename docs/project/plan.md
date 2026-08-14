@@ -23,6 +23,7 @@ M0の作業状態保存・再開基盤は、公開GitHubへのpushと別clone検
 - 承認済み設計を `docs/superpowers/specs/2026-08-14-core-data-model-design.md` へ記録した。
 - 収集範囲を、木野内栄治・大川智宏は全チャンネルのゲスト出演を含む、江守哲は固定チャンネルIDだけ、暁投資顧問は公式チャンネルだけの組織主体へ改定した。
 - 江守哲の対象チャンネルを、表示名「江守哲の米国株投資チャンネル」、正本ID `UCVXka7buS_WptsAzSE0LcKg` として確認した。
+- 暁投資顧問の公式YouTubeチャンネルを、正本ID `UCOfzLmXpI3qmZfV7_Cs1sYA` として確認した。
 - 主体別チャンネル方針を含むM1中核データモデルspecのユーザーレビューが承認された。
 - 承認済みspecを12個のテスト先行タスクへ分解した詳細実装計画を `docs/superpowers/plans/2026-08-14-core-data-model.md` に作成した。
 

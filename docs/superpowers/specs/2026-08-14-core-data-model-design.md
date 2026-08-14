@@ -7,6 +7,7 @@
 - 設計レビュー: ユーザー承認済み
 - 次のゲート: `docs/superpowers/plans/2026-08-14-core-data-model.md` のユーザーレビュー
 - 設定済み入力: 江守哲は表示名「江守哲の米国株投資チャンネル」、正本YouTubeチャンネルID `UCVXka7buS_WptsAzSE0LcKg`
+- 設定済み入力: 暁投資顧問の公式YouTubeチャンネルIDは `UCOfzLmXpI3qmZfV7_Cs1sYA`
 
 ## 目的
 
@@ -121,9 +122,10 @@ flowchart LR
 
 - 分析主体ごとに現在有効な収集・分析チャンネル方針を1件保存する。
 - `policy_kind` は `all_channels` または `fixed_channel` とする。
-- 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問は公式チャンネルを固定対象にする。
+- 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問は公式チャンネルID `UCOfzLmXpI3qmZfV7_Cs1sYA` を固定対象にする。
 - `configuration_status` は `configured` または `configuration_required` とする。`fixed_channel` を `configured` にする場合は正規の `youtube_channel_id` を必須にし、チャンネル表示名、ハンドル、入力URL文字列は正本にしない。
 - 江守哲は確認用表示名「江守哲の米国株投資チャンネル」、`policy_kind = fixed_channel`、`configuration_status = configured`、固定ID `UCVXka7buS_WptsAzSE0LcKg` とする。固定IDはユーザー確認値であり、表示名から推定した値や検索結果へ自動変更しない。
+- 暁投資顧問は `policy_kind = fixed_channel`、`configuration_status = configured`、固定ID `UCOfzLmXpI3qmZfV7_Cs1sYA` とする。固定IDはユーザー確認値であり、チャンネル表示名から推定した値へ自動変更しない。
 - 方針または固定IDの変更は変更前後と理由を `audit_events` へ記録し、依存する分析scopeを `stale` にする。
 
 #### `videos`
@@ -445,7 +447,7 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 34. 江守哲の固定チャンネルID `UCVXka7buS_WptsAzSE0LcKg` と完全一致する動画だけが `eligible` になる。
 35. 江守哲の他チャンネル動画は、話者割当が本人で手動URL登録されても `channel_out_of_scope` のままで、分析runとヒートマップへ入らない。
 36. チャンネル表示名が変わっても正規チャンネルIDが同じなら判定は変わらず、同名でもIDが違えば不適合になる。
-37. 暁投資顧問は公式チャンネルの動画だけが `eligible` になり、出演者別ではなく組織主体の入力になる。
+37. 暁投資顧問は固定ID `UCOfzLmXpI3qmZfV7_Cs1sYA` と完全一致する公式チャンネル動画だけが `eligible` になり、出演者別ではなく組織主体の入力になる。
 38. 動画の正規チャンネルIDを解決できない場合は `channel_unresolved` となり、表示名一致だけで収集・分析へ進まない。
 
 ## テストの層
