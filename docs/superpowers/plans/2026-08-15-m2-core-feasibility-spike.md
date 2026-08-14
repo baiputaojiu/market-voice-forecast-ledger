@@ -8,6 +8,10 @@
 
 **Tech Stack:** Windows 11、Python 3.11以上（事前確認3.14.6）、SQLite（事前確認3.50.4）、Python標準ライブラリ、PowerShell 5.1/7互換、Git worktree。
 
+**User approval:** 2026-08-15 JST。スモールテスト開始までの全確認事項について承認済み。
+
+**Execution mode:** このスレッド内で `superpowers:executing-plans` により順次実行する。サブエージェントは起動しない。
+
 ## Global Constraints
 
 - 正本specは `docs/superpowers/specs/2026-08-15-m2-core-feasibility-spike-design.md` とする。

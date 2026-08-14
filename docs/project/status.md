@@ -6,7 +6,7 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンド19タスク計画も承認済みだが、本実装前に使い捨てのSQLite縦断スパイクを行う。書面specはユーザー承認済みで、現在は38 scenarioを7 Taskへ分けた詳細実行計画のユーザーレビュー待ち。アプリ本体とM2本実装は未着手である。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンド19タスク計画も承認済みだが、本実装前に使い捨てのSQLite縦断スパイクを行う。書面spec、38 scenario・7 Taskの詳細実行計画、開始までの確認事項はユーザー承認済み。現在は隔離worktreeの準備段階で、アプリ本体とM2本実装は未着手である。
 
 ## Git状態（Git State）
 
@@ -54,11 +54,12 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - スパイクの隔離方法、4群の検証シナリオ、必須安全条件、性能計測、結果分類、成果物の設計がユーザー承認された。
 - 読み取り専用の事前確認でPython 3.14.6、SQLite 3.50.4、必要な標準ライブラリ、約60GBの空き容量を確認した。
 - 書面化したフィージビリティ・スパイクspecがユーザー承認された。
+- 38 scenario・7 Taskの詳細実行計画とスモールテスト開始までの全確認事項がユーザー承認された。
 
 ## 作業中（In Progress）
 
 - 現在進行中のアプリ実装作業はない。
-- 38 scenarioを7個のテスト先行Taskへ分けたフィージビリティ・スパイク詳細実行計画を作成し、ユーザーレビューへ進めている。
+- 承認済み詳細計画をこのスレッド内で順次実行するため、隔離worktreeの準備を進めている。サブエージェントは起動しない。
 - worktree作成、実験コード作成、スモールテスト実行、M2本実装はいずれも未実施。
 
 ## 未着手（Not Started）
@@ -115,11 +116,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. ユーザーが38 scenario・7 Taskの詳細実行計画をレビューする。
-2. 承認後、`.worktrees/` を除外設定へ追加してから隔離worktreeを作る。
-3. 使い捨て実験コードで全scenario、故障注入、拡大fixture、性能計測を実行する。
-4. 結果、性能値、M1/M2修正候補を提示し、適用可否の承認を受ける。
-5. M2本実装は別の明示承認後に開始する。
+1. `.worktrees/` を除外設定へ追加してから隔離worktreeを作る。
+2. 使い捨て実験コードで全scenario、故障注入、拡大fixture、性能計測を実行する。
+3. 結果、性能値、M1/M2修正候補を提示し、適用可否の承認を受ける。
+4. M2本実装は別の明示承認後に開始する。
 
 ## 重要ファイル（Important Files）
 
@@ -131,7 +131,7 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - `docs/superpowers/specs/2026-08-14-core-data-model-design.md`: 書面反映版まで承認済みのM1中核データモデル、処理状態、削除、受け入れ試験設計。
 - `docs/superpowers/plans/2026-08-14-core-data-model.md`: ユーザー承認済みのM2中核バックエンド19タスク詳細計画。実装開始待ち。
 - `docs/superpowers/specs/2026-08-15-m2-core-feasibility-spike-design.md`: 書面までユーザー承認済みのM2事前フィージビリティ・スパイク設計。
-- `docs/superpowers/plans/2026-08-15-m2-core-feasibility-spike.md`: ユーザーレビュー待ちの38 scenario・7 Task詳細実行計画。
+- `docs/superpowers/plans/2026-08-15-m2-core-feasibility-spike.md`: ユーザー承認済みの38 scenario・7 Task詳細実行計画。実行中。
 - `.agents/skills/save-work-state/SKILL.md`: GitHubへ保存する処理契約。
 - `.agents/skills/resume-work-state/SKILL.md`: 別PCで再開する処理契約。
 - `tests/work-state/run-tests.ps1`: 決定的な全検査の入口。
