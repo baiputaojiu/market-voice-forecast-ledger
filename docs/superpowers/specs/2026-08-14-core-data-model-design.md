@@ -5,6 +5,7 @@
 - ユーザー承認日: 2026-08-14 JST
 - 対象: M1の最初のサブプロジェクト
 - 次のゲート: この文書のユーザーレビュー後に詳細実装計画を作る
+- 実装前の外部入力: 江守哲の正確な対象YouTubeチャンネルURLまたはIDをユーザーへ確認する。値は推測しない
 
 ## 目的
 
@@ -20,6 +21,7 @@ YouTube動画の取得、分割文字起こし、話者割当、本人発言抽�
 - 長時間CPU処理を5～10分単位で再開する。
 - 本文データを期限後に削除しても、予想と監査情報を保持する。
 - Web検索、現在相場、一般知識、shell、外部ツールをCodex分析へ混ぜない。
+- 分析主体ごとのチャンネル範囲を、動画発見方法や話者判定とは独立して検査する。
 
 ## スコープ外
 
@@ -52,7 +54,8 @@ YouTube動画の取得、分割文字起こし、話者割当、本人発言抽�
 
 ```mermaid
 flowchart LR
-    A["動画・発話区間"] --> B["現在の話者割当"]
+    Z["主体別チャンネル方針"] --> A["動画・発話区間の適合判定"]
+    A --> B["現在の話者割当"]
     B --> C["本人発言だけの分析入力"]
     C --> D["Codex発言分析"]
     D --> E["アプリ規則による指数割当"]
@@ -68,10 +71,11 @@ flowchart LR
 各境界の規則は次のとおり。
 
 1. 動画・発話区間には予想方向を保存しない。
-2. 話者割当には市場見通しを保存しない。
-3. Codex入力の根拠区間は対象者割当だけに限定する。
-4. Codexの指数候補と自己信頼度は提案として保存し、最終信頼度はアプリ規則で検査する。
-5. ヒートマップは正本ではなく、現在予想から再生成できるキャッシュとする。
+2. チャンネル適合判定と話者割当は別データにし、両方が適合した区間だけを分析候補にする。
+3. 話者割当には市場見通しを保存しない。
+4. Codex入力の根拠区間は対象者割当かつチャンネル適合済みの区間だけに限定する。
+5. Codexの指数候補と自己信頼度は提案として保存し、最終信頼度はアプリ規則で検査する。
+6. ヒートマップは正本ではなく、現在予想から再生成できるキャッシュとする。
 
 ## 日付と時間
 
@@ -112,12 +116,31 @@ flowchart LR
 - 検索別名は子テーブル `subject_aliases` に保存する。
 - 暁投資顧問は1つの組織主体とする。
 
+#### `subject_channel_policies`
+
+- 分析主体ごとに現在有効な収集・分析チャンネル方針を1件保存する。
+- `policy_kind` は `all_channels` または `fixed_channel` とする。
+- 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問は公式チャンネルを固定対象にする。
+- `configuration_status` は `configured` または `configuration_required` とする。`fixed_channel` を `configured` にする場合は正規の `youtube_channel_id` を必須にし、チャンネル表示名、ハンドル、入力URL文字列は正本にしない。
+- 江守哲の固定IDは現時点で未提示なので、`policy_kind = fixed_channel`、`configuration_status = configuration_required`、固定IDはNULLとする。架空値や検索結果を保存せず、ユーザー確認済みIDが設定されるまで江守哲の動画を収集・分析適合にしない。
+- 方針または固定IDの変更は変更前後と理由を `audit_events` へ記録し、依存する分析scopeを `stale` にする。
+
 #### `videos`
 
-- `youtube_video_id`、タイトル、チャンネル、`published_at`、動画時間、ライブ区分を保存する。
+- `youtube_video_id`、タイトル、正規の `youtube_channel_id`、表示用チャンネル名、`published_at`、動画時間、ライブ区分を保存する。
 - `youtube_video_id` は一意とする。
 - 同じ発言を含む切り抜き・再投稿は別動画として保存し、`duplicate_group_id` で分析上の二重計上を防ぐ。
 - `recorded_at` と分析用の取得日は持たない。
+
+#### `subject_video_eligibility`
+
+- 分析主体と動画の組ごとに、チャンネル方針だけを評価した現在値を1件保存する。話者本人の出演確認とは別判定にする。
+- 発見方法は `auto_search` または `manual_url`、判定は `eligible`、`channel_out_of_scope`、`configuration_required`、`channel_unresolved` とする。動画の正規チャンネルIDを解決できない場合もフェイルクローズにする。
+- `fixed_channel` は、動画URLから解決した正規の `youtube_channel_id` と方針の固定IDが完全一致した場合だけ `eligible` にする。表示名一致や文字列URL一致では採用しない。
+- 江守哲と暁投資顧問の自動検索は固定チャンネル内だけで行う。範囲外動画を自動検索の収集jobへ入れない。
+- 手動URL登録は候補メタデータの保存経路であり、チャンネル方針の例外経路ではない。江守哲の他チャンネル動画は `manual_url` でも `channel_out_of_scope` のまま、音声取得、文字起こし、予想分析へ進めない。
+- 動画単位の承認で `channel_out_of_scope` を覆せない。対象範囲を変える場合は `subject_channel_policies` 自体を監査付きで変更する。
+- 判定時の方針ID・方針hash、動画チャンネルID、理由code、判定日時を保存する。
 
 #### `transcription_chunks`
 
@@ -164,6 +187,8 @@ flowchart LR
 
 - runへ渡した発話区間と順序を固定する。
 - 対応する `speaker_assignments.assignment_kind` が `subject` で、scopeの主体と一致する区間だけを許可する。
+- 対応動画の `subject_video_eligibility` が同じ主体について `eligible` である区間だけを許可する。
+- run開始時のチャンネル方針ID・方針hash・適合判定を保存し、後から方針が変更されても、そのrunの入力境界を復元できるようにする。
 - run開始時の `assignment_kind`、`assigned_subject_id`、話者割当更新日時、割当証拠hashも保存し、後から現在の話者割当が修正されても、そのrunが採用した状態を復元できるようにする。
 - 聞き手と保留区間が1件でも含まれたrunは採用しない。
 
@@ -247,7 +272,7 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 
 #### `job_units`
 
-- 音声取得、文字起こし各chunk、話者割当、本人発言抽出、Codex batch、自動割当、ヒートマップ更新の実作業単位を保存する。
+- 動画メタデータ取得とチャンネル適合判定、音声取得、文字起こし各chunk、話者割当、本人発言抽出、Codex batch、自動割当、ヒートマップ更新の実作業単位を保存する。
 - 入力hash、出力hash、状態、試行回数、安全なerror code、開始・終了日時を持つ。
 - 出力の検証とunit成功状態を同じDBトランザクションで確定する。
 - 再開時は入力hashと出力hashが一致する成功unitだけを再利用する。
@@ -260,6 +285,15 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 - 本文フィールドはhash、区間ID、短い根拠だけを記録し、365日削除を迂回しない。
 
 ## 更新と状態遷移
+
+### チャンネル方針の設定・変更
+
+1. 入力されたチャンネルURLまたはIDをYouTubeの正規チャンネルIDへ解決する。チャンネル名から推測しない。
+2. 現在の `subject_channel_policies` を更新し、変更前後JSON、理由、操作者を `audit_events` へ追記する。
+3. 影響する `subject_video_eligibility` を再評価する。
+4. 以前の方針で採用した動画に依存する `analysis_scopes` を `stale` にし、旧結果を警告付きで表示する。
+5. 新方針で `channel_out_of_scope` になった動画の音声取得、文字起こし、新規分析を止める。既存の監査情報は削除しない。
+6. 再分析の全検証が成功した場合だけ現在予想を更新する。
 
 ### 話者割当の修正
 
@@ -296,7 +330,7 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 
 段階ごとに `完了unit数 / manifest総unit数` を表示する。
 
-- 動画取得
+- 動画取得（メタデータ取得とチャンネル適合判定を含む）
 - 分割文字起こし
 - 話者割当
 - 本人発言抽出
@@ -314,6 +348,7 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 - 外部ツール呼び出し件数が0ではない。
 - JSON Schema違反がある。
 - 入力に聞き手または保留区間が含まれる。
+- 入力動画の主体別チャンネル判定が `eligible` ではない、またはrun開始時の方針hashと一致しない。
 - 出力が入力にない動画ID・区間IDを参照する。
 - cutoff後に公開された動画を参照する。
 - アプリDBへのtransactional保存に失敗する。
@@ -343,6 +378,7 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 次を原子的に実行する。
 
 - unit出力保存とunit成功化。
+- チャンネル方針変更と監査event追加と動画適合性再評価と依存scopeのstale化。
 - 話者割当変更と監査event追加と依存scopeのstale化。
 - 同一scopeの現在発言、指数割当、現在予想の置換と監査event追加。
 - mapping reviewの追加と実効的な採用可否更新。
@@ -400,10 +436,21 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 29. 音声削除失敗を記録し、清掃jobで再試行できる。
 30. 現在予想からheatmap cacheを再構築できる。
 
+### 主体別チャンネル範囲
+
+31. 木野内栄治の他チャンネル出演動画はチャンネル判定が `eligible` になり、本人出演も確認できた場合に分析候補になる。
+32. 大川智宏の他チャンネル出演動画はチャンネル判定が `eligible` になり、本人出演も確認できた場合に分析候補になる。
+33. 江守哲の固定チャンネルIDが未設定なら `configuration_required` となり、値を推測せず、音声取得、文字起こし、予想分析へ進まない。
+34. 江守哲の固定チャンネルIDと完全一致する動画だけが `eligible` になる。
+35. 江守哲の他チャンネル動画は、話者割当が本人で手動URL登録されても `channel_out_of_scope` のままで、分析runとヒートマップへ入らない。
+36. チャンネル表示名が変わっても正規チャンネルIDが同じなら判定は変わらず、同名でもIDが違えば不適合になる。
+37. 暁投資顧問は公式チャンネルの動画だけが `eligible` になり、出演者別ではなく組織主体の入力になる。
+38. 動画の正規チャンネルIDを解決できない場合は `channel_unresolved` となり、表示名一致だけで収集・分析へ進まない。
+
 ## テストの層
 
 - DB制約テスト: 一意性、外部キー、状態enum、時刻範囲、現在値1件、レビューゲート。
-- ドメイン規則テスト: cutoff、相対期間、話者隔離、転換点、信頼度、競合市場、空欄。
+- ドメイン規則テスト: 主体別チャンネルID適合、手動URLの非迂回、cutoff、相対期間、話者隔離、転換点、信頼度、競合市場、空欄。
 - pipeline統合テスト: checkpoint、停止・再開、失敗再試行、stale化、transaction、削除。
 - 合成end-to-endテスト: 架空名と合成発言だけで、保存済み入力から16行ヒートマップまで検証する。
 - 手動性能確認: ユーザー報告の文字起こし約74分、話者割当約4分、Codex分析約4.5分を比較値にするが、固定SLAにはしない。
@@ -418,11 +465,12 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 2. SQLite schemaとmigration。
 3. repository層とtransactional更新。
 4. audit、retention、job state machine。
-5. 話者割当からstale化までのドメインservice。
-6. analysis scope、run、input snapshot。
-7. Codex出力の正規化とfail-closed検証。
-8. 指数割当規則とreview gate。
-9. current forecastとheatmap cache。
-10. FastAPI境界と合成end-to-endテスト。
+5. 主体別チャンネル方針、動画適合判定、方針変更からstale化までのドメインservice。
+6. 話者割当からstale化までのドメインservice。
+7. analysis scope、run、input snapshot。
+8. Codex出力の正規化とfail-closed検証。
+9. 指数割当規則とreview gate。
+10. current forecastとheatmap cache。
+11. FastAPI境界と合成end-to-endテスト。
 
 UI、音声engine、Codex CLI adapterはこの中核境界へ依存し、中核DBがそれらの実装詳細へ依存しない構成にする。
