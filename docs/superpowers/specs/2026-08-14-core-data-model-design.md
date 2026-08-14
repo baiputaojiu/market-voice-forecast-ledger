@@ -5,7 +5,7 @@
 - ユーザー承認日: 2026-08-14 JST
 - 対象: M1の最初のサブプロジェクト
 - 次のゲート: この文書のユーザーレビュー後に詳細実装計画を作る
-- 実装前の外部入力: 表示名「江守哲の米国株投資チャンネル」の正確なYouTubeチャンネルURLまたはIDをユーザーへ確認する。表示名から値は推測しない
+- 設定済み入力: 江守哲は表示名「江守哲の米国株投資チャンネル」、正本YouTubeチャンネルID `UCVXka7buS_WptsAzSE0LcKg`
 
 ## 目的
 
@@ -122,7 +122,7 @@ flowchart LR
 - `policy_kind` は `all_channels` または `fixed_channel` とする。
 - 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問は公式チャンネルを固定対象にする。
 - `configuration_status` は `configured` または `configuration_required` とする。`fixed_channel` を `configured` にする場合は正規の `youtube_channel_id` を必須にし、チャンネル表示名、ハンドル、入力URL文字列は正本にしない。
-- 江守哲は確認用表示名として「江守哲の米国株投資チャンネル」を保存する。固定IDは現時点で未提示なので、`policy_kind = fixed_channel`、`configuration_status = configuration_required`、固定IDはNULLとする。表示名から推定した値や検索結果を正本として保存せず、ユーザー確認済みIDが設定されるまで江守哲の動画を収集・分析適合にしない。
+- 江守哲は確認用表示名「江守哲の米国株投資チャンネル」、`policy_kind = fixed_channel`、`configuration_status = configured`、固定ID `UCVXka7buS_WptsAzSE0LcKg` とする。固定IDはユーザー確認値であり、表示名から推定した値や検索結果へ自動変更しない。
 - 方針または固定IDの変更は変更前後と理由を `audit_events` へ記録し、依存する分析scopeを `stale` にする。
 
 #### `videos`
@@ -441,7 +441,7 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 31. 木野内栄治の他チャンネル出演動画はチャンネル判定が `eligible` になり、本人出演も確認できた場合に分析候補になる。
 32. 大川智宏の他チャンネル出演動画はチャンネル判定が `eligible` になり、本人出演も確認できた場合に分析候補になる。
 33. 江守哲の固定チャンネルIDが未設定なら `configuration_required` となり、値を推測せず、音声取得、文字起こし、予想分析へ進まない。
-34. 江守哲の固定チャンネルIDと完全一致する動画だけが `eligible` になる。
+34. 江守哲の固定チャンネルID `UCVXka7buS_WptsAzSE0LcKg` と完全一致する動画だけが `eligible` になる。
 35. 江守哲の他チャンネル動画は、話者割当が本人で手動URL登録されても `channel_out_of_scope` のままで、分析runとヒートマップへ入らない。
 36. チャンネル表示名が変わっても正規チャンネルIDが同じなら判定は変わらず、同名でもIDが違えば不適合になる。
 37. 暁投資顧問は公式チャンネルの動画だけが `eligible` になり、出演者別ではなく組織主体の入力になる。
