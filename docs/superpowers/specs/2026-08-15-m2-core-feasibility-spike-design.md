@@ -3,9 +3,10 @@
 ## 状態
 
 - 設計承認日: 2026-08-15 JST
+- 書面spec承認日: 2026-08-15 JST
 - 対象: 承認済みM2中核バックエンド計画の技術的不確実性
 - 種別: 本実装へ流用しない、合成データだけの使い捨て検証
-- 次のゲート: この書面specのユーザーレビュー
+- 次のゲート: 38 scenario・7 Task詳細実行計画のユーザーレビュー
 - 本実装状態: 未着手
 
 ## 目的
@@ -42,7 +43,7 @@ HTTP境界も確認できるが、本実装に近づきすぎ、使い捨て検�
 - `.worktrees/` が未作成かつ未除外であるため、worktree作成前に `.gitignore` へ追加し、その変更だけを明示的にcommitする。
 - 使い捨てコードは `experiments/m2-core-feasibility/` 配下だけに置く。
 - 本番予定の `src/market_voice_forecast_ledger/` と `tests/backend/` は作成・変更しない。
-- Python標準ライブラリの `sqlite3`、`unittest`、`tempfile`、`hashlib`、`json`、`time`、`tracemalloc` だけを使い、依存packageを追加しない。
+- Python標準ライブラリだけを使う。主に `sqlite3`、`unittest`、`tempfile`、`hashlib`、`json`、`time`、`tracemalloc`、`datetime`、`zoneinfo`、`pathlib`、`dataclasses`、`statistics`、`argparse`、`platform`、`subprocess` を使い、依存packageを追加しない。
 - SQLite DBと生成JSONはOSの一時ディレクトリへ置き、リポジトリへcommitしない。
 - 実在人物の発言、実YouTubeメタデータ、音声、全文文字起こし、話者特徴量、認証情報を使わない。
 - 架空名、架空チャンネルID、合成発言だけをfixtureに使う。
