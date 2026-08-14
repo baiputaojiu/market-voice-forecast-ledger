@@ -6,7 +6,7 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」は完了。M1「アプリ設計の完成」を進行中で、中核データモデルと処理状態の設計をユーザーが承認した。現在は主体別の収集チャンネル方針を反映した正式specのユーザーレビュー待ちで、レビュー後にこのサブプロジェクトの詳細実装計画を作る。アプリ本体は実装未着手。
+M0「複数PC間の作業状態保存・再開基盤」は完了。M1「アプリ設計の完成」を進行中で、主体別チャンネル方針を含む中核データモデルspecはユーザー承認済み。現在は12タスクの詳細実装計画のユーザーレビュー待ちで、アプリ本体は実装未着手。
 
 ## Git状態（Git State）
 
@@ -40,11 +40,13 @@ M0「複数PC間の作業状態保存・再開基盤」は完了。M1「アプ�
 - 収集範囲を、木野内栄治・大川智宏は他チャンネル出演を含む、江守哲は固定YouTubeチャンネルIDだけ、暁投資顧問は公式チャンネルだけの組織主体へ改定した。
 - 手動URL登録でも主体別チャンネル方針を迂回させず、江守哲の他チャンネル動画は予想分析へ採用しないデータ境界をM1設計へ追加した。
 - 江守哲の対象チャンネルを、表示名「江守哲の米国株投資チャンネル」、正本ID `UCVXka7buS_WptsAzSE0LcKg` としてユーザー確認済みにした。
+- 主体別チャンネル方針を含むM1中核データモデルspecのユーザーレビューが承認された。
+- 承認済みspecを、SQLite基盤、チャンネル適合、話者割当、job、分析run、発言分類、指数割当、現在予想、監査、削除、FastAPI、合成E2Eの12タスクへ分解した詳細実装計画を作成した。
 
 ## 作業中（In Progress）
 
 - 現在進行中のアプリ実装作業はない。
-- 主体別チャンネル方針を追加したM1中核データモデルspecのユーザーレビュー待ち。レビュー承認前に詳細実装計画や実装へ進まない。
+- `docs/superpowers/plans/2026-08-14-core-data-model.md` のユーザーレビュー待ち。計画承認前にコード実装へ進まない。
 
 ## 未着手（Not Started）
 
@@ -91,6 +93,7 @@ M0「複数PC間の作業状態保存・再開基盤」は完了。M1「アプ�
 
 ## 未解決事項（Open Questions）
 
+- 暁投資顧問の公式YouTubeチャンネルの正本ID。中核schemaでは `configuration_required` として実装できるが、実際の動画収集開始前にユーザー確認が必要である。
 - Windowsネイティブ音声処理とWSL2アダプターの最終選択。M1の技術検証で決める。
 - 公開用の画面資料で実在する分析主体名を残すか、合成名だけにするか。誤認防止の観点から合成名を推奨する。
 - 参照声との照合信頼度の尺度、対象者・聞き手・保留を分ける閾値、手動レビュー手順。
@@ -98,9 +101,9 @@ M0「複数PC間の作業状態保存・再開基盤」は完了。M1「アプ�
 
 ## 次の作業（Next Actions）
 
-1. ユーザーが、主体別チャンネル方針を追加した `docs/superpowers/specs/2026-08-14-core-data-model-design.md` をレビューする。
-2. レビュー承認後、SQLite schema、migration、repository、監査、job state machineの詳細実装計画を作る。
-3. 計画承認後、確認済みチャンネルIDを初期設定へ含め、テスト先行で中核データモデルを実装する。
+1. ユーザーが `docs/superpowers/plans/2026-08-14-core-data-model.md` をレビューし、実行方式を選ぶ。
+2. 計画承認後、`superpowers:using-git-worktrees` で隔離作業領域を作る。
+3. `superpowers:subagent-driven-development` または `superpowers:executing-plans` を使い、12タスクをテスト先行で実行する。
 4. 後続M1として、YouTube収集・重複検出・音声処理・話者確認の詳細設計へ進む。
 5. Codex prompt、JSON Schema、CLI adapter、指数割当規則の詳細specを順に作る。
 
@@ -112,6 +115,7 @@ M0「複数PC間の作業状態保存・再開基盤」は完了。M1「アプ�
 - `docs/project/public-data-policy.md`: 公開・非公開情報の境界。
 - `docs/superpowers/specs/2026-08-14-cross-pc-work-state-design.md`: 保存・再開基盤の承認済み設計。
 - `docs/superpowers/specs/2026-08-14-core-data-model-design.md`: M1中核データモデル、処理状態、削除、受け入れ試験の承認済み設計。
+- `docs/superpowers/plans/2026-08-14-core-data-model.md`: 承認済みM1中核specを実装する12タスクの詳細計画。
 - `.agents/skills/save-work-state/SKILL.md`: GitHubへ保存する処理契約。
 - `.agents/skills/resume-work-state/SKILL.md`: 別PCで再開する処理契約。
 - `tests/work-state/run-tests.ps1`: 決定的な全検査の入口。
