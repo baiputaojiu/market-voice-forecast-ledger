@@ -5,7 +5,7 @@
 - ユーザー承認日: 2026-08-14 JST
 - 対象: M1の最初のサブプロジェクト
 - 次のゲート: この文書のユーザーレビュー後に詳細実装計画を作る
-- 実装前の外部入力: 江守哲の正確な対象YouTubeチャンネルURLまたはIDをユーザーへ確認する。値は推測しない
+- 実装前の外部入力: 表示名「江守哲の米国株投資チャンネル」の正確なYouTubeチャンネルURLまたはIDをユーザーへ確認する。表示名から値は推測しない
 
 ## 目的
 
@@ -122,7 +122,7 @@ flowchart LR
 - `policy_kind` は `all_channels` または `fixed_channel` とする。
 - 木野内栄治と大川智宏は `all_channels`、江守哲と暁投資顧問は `fixed_channel` とする。暁投資顧問は公式チャンネルを固定対象にする。
 - `configuration_status` は `configured` または `configuration_required` とする。`fixed_channel` を `configured` にする場合は正規の `youtube_channel_id` を必須にし、チャンネル表示名、ハンドル、入力URL文字列は正本にしない。
-- 江守哲の固定IDは現時点で未提示なので、`policy_kind = fixed_channel`、`configuration_status = configuration_required`、固定IDはNULLとする。架空値や検索結果を保存せず、ユーザー確認済みIDが設定されるまで江守哲の動画を収集・分析適合にしない。
+- 江守哲は確認用表示名として「江守哲の米国株投資チャンネル」を保存する。固定IDは現時点で未提示なので、`policy_kind = fixed_channel`、`configuration_status = configuration_required`、固定IDはNULLとする。表示名から推定した値や検索結果を正本として保存せず、ユーザー確認済みIDが設定されるまで江守哲の動画を収集・分析適合にしない。
 - 方針または固定IDの変更は変更前後と理由を `audit_events` へ記録し、依存する分析scopeを `stale` にする。
 
 #### `videos`
