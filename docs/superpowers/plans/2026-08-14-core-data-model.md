@@ -10,9 +10,13 @@
 
 **Plan revision:** 2026-08-15 JST。初回12タスク草案を置換し、承認済みM1書面設計から19個の独立レビュー単位へ再構成した。
 
+**User approval:** 2026-08-15 JST。
+
+**Execution mode:** 案1のタスク別サブエージェント実装・レビューを採用。ユーザーの明示的な開始指示があるまで、worktree作成、サブエージェント起動、テスト作成、コード実装を行わない。
+
 ## Global Constraints
 
-- 実装開始時は `superpowers:using-git-worktrees` で隔離作業領域を確認・作成し、この計画のユーザー承認前にTask 1を開始しない。
+- 実装開始の明示指示を受けた後、`superpowers:using-git-worktrees` で隔離作業領域を確認・作成し、Task 1を開始する。
 - Windows 11で動作し、実データの既定保存先は `%LOCALAPPDATA%\MarketVoiceForecastLedger\`、テストデータは必ずpytestの `tmp_path` 配下に置く。
 - HTTP serverは `127.0.0.1` だけへbindする。MVPはローカルトークン、`Origin`検査、Windowsアカウント認証を持たず、信頼できる単独利用PCを前提とする。状態変更へGETを使わない。
 - DB時刻はUTCのISO 8601、日付指定cutoffは選択日のJST 23:59:59、期間はJST暦日の `YYYY-MM-DD` とする。
