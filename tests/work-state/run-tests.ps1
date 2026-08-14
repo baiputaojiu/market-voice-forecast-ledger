@@ -1,0 +1,503 @@
+[CmdletBinding()]
+param(
+    [ValidateSet('All', 'Docs', 'Scripts', 'Integration', 'SaveSkill', 'ResumeSkill')]
+    [string]$Suite = 'All'
+)
+
+$ErrorActionPreference = 'Stop'
+$script:Failures = 0
+$script:Passes = 0
+$ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+
+function Assert-True {
+    param(
+        [Parameter(Mandatory)]
+        [bool]$Condition,
+        [Parameter(Mandatory)]
+        [string]$Message
+    );
+
+    if ($Condition) {
+        $script:Passes++
+        Write-Host "PASS: $Message"
+        return
+    }
+
+    $script:Failures++
+    Write-Host "FAIL: $Message" -ForegroundColor Red
+}
+
+function Assert-FileContainsHeadings {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+        [Parameter(Mandatory)]
+        [string[]]$Headings
+    );
+
+    $path = Join-Path $ProjectRoot $RelativePath
+    $exists = Test-Path -LiteralPath $path -PathType Leaf
+    Assert-True $exists "$RelativePath exists"
+    if (-not $exists) {
+        return
+    }
+
+    $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $path
+    foreach ($heading in $Headings) {
+        Assert-True ($content -match [regex]::Escape($heading)) "$RelativePath contains heading '$heading'"
+    }
+}
+
+function Test-Docs {
+    $requiredFiles = @(
+        'AGENTS.md',
+        'README.md',
+        '.gitignore',
+        '.gitattributes',
+        '.editorconfig',
+        'docs/project/requirements.md',
+        'docs/project/decisions.md',
+        'docs/project/plan.md',
+        'docs/project/status.md',
+        'docs/project/public-data-policy.md',
+        'tests/work-state/README.md',
+        'tests/work-state/skill-evaluation.md'
+    );
+
+    foreach ($relativePath in $requiredFiles) {
+        Assert-True (Test-Path -LiteralPath (Join-Path $ProjectRoot $relativePath) -PathType Leaf) "$relativePath exists"
+    }
+
+    Assert-FileContainsHeadings -RelativePath 'docs/project/requirements.md' -Headings @(
+        'Project Purpose',
+        'Current Scope',
+        'Confirmed Requirements',
+        'Analysis Information Boundary',
+        'Future Features Outside MVP'
+    );
+    Assert-FileContainsHeadings -RelativePath 'docs/project/decisions.md' -Headings @(
+        'Recording Rules',
+        'Accepted Decisions',
+        'Rejected or Superseded Options'
+    );
+    Assert-FileContainsHeadings -RelativePath 'docs/project/plan.md' -Headings @(
+        'Current Milestone',
+        'Completed',
+        'In Progress',
+        'Not Started'
+    );
+    Assert-FileContainsHeadings -RelativePath 'docs/project/status.md' -Headings @(
+        'Current Phase',
+        'Git State',
+        'Completed',
+        'In Progress',
+        'Verification Results',
+        'Known Issues',
+        'Open Questions',
+        'Next Actions',
+        'Important Files'
+    );
+    Assert-FileContainsHeadings -RelativePath 'docs/project/public-data-policy.md' -Headings @(
+        'Public Information',
+        'Excluded Information',
+        'Default Local Data Location'
+    );
+    Assert-FileContainsHeadings -RelativePath 'tests/work-state/README.md' -Headings @(
+        'Fast Tests',
+        'Skill Evaluations'
+    );
+    Assert-FileContainsHeadings -RelativePath 'tests/work-state/skill-evaluation.md' -Headings @(
+        'Save Skill',
+        'Resume Skill',
+        'Stable Result'
+    );
+
+    $agentsPath = Join-Path $ProjectRoot 'AGENTS.md'
+    if (Test-Path -LiteralPath $agentsPath -PathType Leaf) {
+        $agentsLines = @(Get-Content -Encoding UTF8 -LiteralPath $agentsPath)
+        Assert-True ($agentsLines.Count -le 60) 'AGENTS.md stays at or below 60 lines'
+        $agentsContent = $agentsLines -join "`n"
+        Assert-True ($agentsContent -match '\$save-work-state') 'AGENTS.md routes save requests to $save-work-state'
+        Assert-True ($agentsContent -match '\$resume-work-state') 'AGENTS.md routes resume requests to $resume-work-state'
+    }
+
+    $readmePath = Join-Path $ProjectRoot 'README.md'
+    if (Test-Path -LiteralPath $readmePath -PathType Leaf) {
+        $readme = Get-Content -Raw -Encoding UTF8 -LiteralPath $readmePath
+        foreach ($relativeLink in @(
+            'docs/project/status.md',
+            'docs/project/requirements.md',
+            'docs/project/decisions.md',
+            'docs/project/plan.md'
+        )) {
+            Assert-True ($readme -match [regex]::Escape($relativeLink)) "README.md links to $relativeLink"
+        }
+    }
+}
+
+function Invoke-ScriptProcess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ScriptPath,
+        [string[]]$Arguments = @()
+    )
+
+    $powerShellExe = (Get-Process -Id $PID).Path
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = & $powerShellExe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @Arguments 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousErrorAction
+    [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output = $output.Trim()
+    }
+}
+
+function Invoke-Git {
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkingDirectory,
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = & git -C $WorkingDirectory @Arguments 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousErrorAction
+    if ($exitCode -ne 0) {
+        throw "git failed in $WorkingDirectory`: git $($Arguments -join ' ')`n$output"
+    }
+    $output.Trim()
+}
+
+function Remove-TestRoot {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    $leaf = Split-Path -Leaf $fullPath
+    if (-not $fullPath.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove non-temp path: $fullPath"
+    }
+    if (-not $leaf.StartsWith('mvfl-work-state-tests-', [System.StringComparison]::Ordinal)) {
+        throw "Refusing to remove unexpected temp directory: $fullPath"
+    }
+    if (Test-Path -LiteralPath $fullPath) {
+        Remove-Item -LiteralPath $fullPath -Recurse -Force
+    }
+}
+
+function Test-Scripts {
+    $scriptPaths = @{
+        Inspect = Join-Path $ProjectRoot 'scripts/work-state/inspect-git-state.ps1'
+        Safety = Join-Path $ProjectRoot 'scripts/work-state/check-public-safety.ps1'
+        Docs = Join-Path $ProjectRoot 'scripts/work-state/check-state-docs.ps1'
+        Remote = Join-Path $ProjectRoot 'scripts/work-state/verify-remote-head.ps1'
+    }
+
+    foreach ($name in $scriptPaths.Keys) {
+        Assert-True (Test-Path -LiteralPath $scriptPaths[$name] -PathType Leaf) "$name script exists"
+    }
+    if (@($scriptPaths.Values | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -gt 0) {
+        return
+    }
+
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mvfl-work-state-tests-" + [guid]::NewGuid().ToString('N'))
+    $nonGit = Join-Path $testRoot 'not-a-repository'
+    $safeData = Join-Path $testRoot 'safe-data'
+    $source = Join-Path $testRoot 'source'
+    $remote = Join-Path $testRoot 'remote.git'
+
+    try {
+        New-Item -ItemType Directory -Path $nonGit, $safeData, $source -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $safeData 'README.md') -Encoding ASCII -Value '# Safe fixture'
+
+        $notRepo = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $nonGit, '-Json')
+        Assert-True ($notRepo.ExitCode -ne 0) 'inspect-git-state rejects a non-Git directory'
+
+        $safeResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '1024')
+        Assert-True ($safeResult.ExitCode -eq 0) 'check-public-safety accepts a safe text fixture'
+
+        $secretFixture = 'api' + '_key = "real-looking-secret-value-1234567890"'
+        Set-Content -LiteralPath (Join-Path $safeData 'secret.txt') -Encoding ASCII -Value $secretFixture
+        $secretResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '1024')
+        Assert-True ($secretResult.ExitCode -ne 0) 'check-public-safety rejects a secret assignment'
+        Remove-Item -LiteralPath (Join-Path $safeData 'secret.txt') -Force
+
+        Set-Content -LiteralPath (Join-Path $safeData 'production.sqlite') -Encoding ASCII -Value 'not a real database'
+        $databaseResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '1024')
+        Assert-True ($databaseResult.ExitCode -ne 0) 'check-public-safety rejects a database file'
+        Remove-Item -LiteralPath (Join-Path $safeData 'production.sqlite') -Force
+
+        Set-Content -LiteralPath (Join-Path $safeData 'large.txt') -Encoding ASCII -Value ('x' * 256)
+        $largeResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '100')
+        Assert-True ($largeResult.ExitCode -ne 0) 'check-public-safety rejects a file above the configured size limit'
+
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & git init --bare $remote 2>&1 | Out-Null
+        $bareExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorAction
+        if ($bareExitCode -ne 0) { throw 'git init --bare failed' }
+        Invoke-Git -WorkingDirectory $source -Arguments @('init') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('branch', '-M', 'main') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('config', 'user.name', 'Work State Tests') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('config', 'user.email', 'work-state-tests@example.invalid') | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'README.md') -Encoding ASCII -Value '# Fixture repository'
+        Invoke-Git -WorkingDirectory $source -Arguments @('add', 'README.md') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('commit', '-m', 'initial fixture') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('remote', 'add', 'origin', $remote) | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('push', '-u', 'origin', 'main') | Out-Null
+
+        $cleanState = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $source, '-Json')
+        Assert-True ($cleanState.ExitCode -eq 0) 'inspect-git-state accepts a Git repository'
+        if ($cleanState.ExitCode -eq 0) {
+            $state = $cleanState.Output | ConvertFrom-Json
+            Assert-True ($state.branch -eq 'main') 'inspect-git-state reports the current branch'
+            Assert-True (-not $state.dirty) 'inspect-git-state reports a clean tree'
+            Assert-True ($state.upstream -eq 'origin/main') 'inspect-git-state reports upstream'
+            Assert-True ($state.ahead -eq 0 -and $state.behind -eq 0) 'inspect-git-state reports zero ahead and behind'
+        }
+
+        Set-Content -LiteralPath (Join-Path $source 'untracked.txt') -Encoding ASCII -Value 'untracked'
+        $dirtyState = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $source, '-Json')
+        Assert-True ($dirtyState.ExitCode -eq 0 -and (($dirtyState.Output | ConvertFrom-Json).dirty)) 'inspect-git-state includes untracked files in dirty state'
+        Remove-Item -LiteralPath (Join-Path $source 'untracked.txt') -Force
+
+        $remoteMatch = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $source)
+        Assert-True ($remoteMatch.ExitCode -eq 0) 'verify-remote-head succeeds when remote and local HEAD match'
+
+        Set-Content -LiteralPath (Join-Path $source 'local-only.txt') -Encoding ASCII -Value 'not pushed'
+        Invoke-Git -WorkingDirectory $source -Arguments @('add', 'local-only.txt') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('commit', '-m', 'local only') | Out-Null
+        $remoteMismatch = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $source)
+        Assert-True ($remoteMismatch.ExitCode -ne 0) 'verify-remote-head rejects an unpushed local commit'
+
+        $docsResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Docs -Arguments @('-ProjectRoot', $ProjectRoot)
+        Assert-True ($docsResult.ExitCode -eq 0) 'check-state-docs accepts the project state documents'
+    }
+    finally {
+        Remove-TestRoot -Path $testRoot
+    }
+}
+
+function Test-Integration {
+    $scriptPaths = @{
+        Inspect = Join-Path $ProjectRoot 'scripts/work-state/inspect-git-state.ps1'
+        Safety = Join-Path $ProjectRoot 'scripts/work-state/check-public-safety.ps1'
+        Remote = Join-Path $ProjectRoot 'scripts/work-state/verify-remote-head.ps1'
+    }
+
+    foreach ($name in $scriptPaths.Keys) {
+        Assert-True (Test-Path -LiteralPath $scriptPaths[$name] -PathType Leaf) "Integration prerequisite $name exists"
+    }
+    if (@($scriptPaths.Values | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -gt 0) {
+        return
+    }
+
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mvfl-work-state-tests-" + [guid]::NewGuid().ToString('N'))
+    $source = Join-Path $testRoot 'source'
+    $consumer = Join-Path $testRoot 'consumer'
+    $remote = Join-Path $testRoot 'remote.git'
+
+    try {
+        New-Item -ItemType Directory -Path $source -Force | Out-Null
+
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & git init --bare $remote 2>&1 | Out-Null
+        $bareExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorAction
+        if ($bareExitCode -ne 0) { throw 'git init --bare failed' }
+
+        Invoke-Git -WorkingDirectory $source -Arguments @('init') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('branch', '-M', 'main') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('config', 'user.name', 'Work State Tests') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('config', 'user.email', 'work-state-tests@example.invalid') | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'README.md') -Encoding ASCII -Value '# Integration fixture'
+        Invoke-Git -WorkingDirectory $source -Arguments @('add', 'README.md') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('commit', '-m', 'initial fixture') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('remote', 'add', 'origin', $remote) | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('push', '-u', 'origin', 'main') | Out-Null
+        Invoke-Git -WorkingDirectory $remote -Arguments @('symbolic-ref', 'HEAD', 'refs/heads/main') | Out-Null
+        Invoke-Git -WorkingDirectory $testRoot -Arguments @('clone', '--branch', 'main', $remote, $consumer) | Out-Null
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('config', 'user.name', 'Work State Tests') | Out-Null
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('config', 'user.email', 'work-state-tests@example.invalid') | Out-Null
+
+        Set-Content -LiteralPath (Join-Path $source 'remote-change.txt') -Encoding ASCII -Value 'remote change'
+        Invoke-Git -WorkingDirectory $source -Arguments @('add', 'remote-change.txt') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('commit', '-m', 'remote change') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('push') | Out-Null
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('fetch', '--prune') | Out-Null
+
+        $behindResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $consumer, '-Json')
+        $behindState = if ($behindResult.ExitCode -eq 0) { $behindResult.Output | ConvertFrom-Json } else { $null }
+        Assert-True ($behindResult.ExitCode -eq 0 -and $behindState.ahead -eq 0 -and $behindState.behind -eq 1) 'second clone detects one remote commit behind'
+
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('pull', '--ff-only') | Out-Null
+        $fastForwardVerify = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $consumer)
+        Assert-True ($fastForwardVerify.ExitCode -eq 0) 'fast-forwarded second clone matches the live remote head'
+
+        Set-Content -LiteralPath (Join-Path $consumer 'machine-local.txt') -Encoding ASCII -Value 'local only'
+        $dirtyResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $consumer, '-Json')
+        Assert-True ($dirtyResult.ExitCode -eq 0 -and (($dirtyResult.Output | ConvertFrom-Json).dirty)) 'second clone detects an untracked machine-local edit'
+        Remove-Item -LiteralPath (Join-Path $consumer 'machine-local.txt') -Force
+
+        Set-Content -LiteralPath (Join-Path $consumer 'production.sqlite') -Encoding ASCII -Value 'not a real database'
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('add', '-f', 'production.sqlite') | Out-Null
+        $stagedDatabase = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $consumer, '-Mode', 'Staged')
+        Assert-True ($stagedDatabase.ExitCode -ne 0) 'staged safety scan rejects a force-added database'
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('restore', '--staged', 'production.sqlite') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $consumer 'production.sqlite') -Force
+
+        $credentialsDirectory = Join-Path $consumer 'credentials'
+        New-Item -ItemType Directory -Path $credentialsDirectory -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $credentialsDirectory 'note.txt') -Encoding ASCII -Value 'machine-specific credential material'
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('add', '-f', 'credentials/note.txt') | Out-Null
+        $stagedCredentials = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $consumer, '-Mode', 'Staged')
+        Assert-True ($stagedCredentials.ExitCode -ne 0) 'staged safety scan rejects a force-added credentials directory'
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('restore', '--staged', 'credentials/note.txt') | Out-Null
+        Remove-Item -LiteralPath $credentialsDirectory -Recurse -Force
+
+        $secretFixture = 'api' + '_key = "real-looking-secret-value-1234567890"'
+        Set-Content -LiteralPath (Join-Path $consumer 'local-secret.txt') -Encoding ASCII -Value $secretFixture
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('add', 'local-secret.txt') | Out-Null
+        $stagedSecret = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $consumer, '-Mode', 'Staged')
+        Assert-True ($stagedSecret.ExitCode -ne 0) 'staged safety scan rejects a secret assignment'
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('restore', '--staged', 'local-secret.txt') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $consumer 'local-secret.txt') -Force
+
+        Set-Content -LiteralPath (Join-Path $consumer 'consumer-change.txt') -Encoding ASCII -Value 'consumer change'
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('add', 'consumer-change.txt') | Out-Null
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('commit', '-m', 'consumer-only change') | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'second-remote-change.txt') -Encoding ASCII -Value 'second remote change'
+        Invoke-Git -WorkingDirectory $source -Arguments @('add', 'second-remote-change.txt') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('commit', '-m', 'second remote change') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('push') | Out-Null
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('fetch', '--prune') | Out-Null
+
+        $divergedResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $consumer, '-Json')
+        $divergedState = if ($divergedResult.ExitCode -eq 0) { $divergedResult.Output | ConvertFrom-Json } else { $null }
+        Assert-True ($divergedResult.ExitCode -eq 0 -and $divergedState.ahead -eq 1 -and $divergedState.behind -eq 1) 'second clone detects divergent local and remote history'
+
+        $divergedVerify = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $consumer)
+        Assert-True ($divergedVerify.ExitCode -ne 0) 'remote verification rejects a divergent local head'
+
+        Invoke-Git -WorkingDirectory $consumer -Arguments @('remote', 'set-url', 'origin', (Join-Path $testRoot 'missing-remote.git')) | Out-Null
+        $missingRemoteVerify = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $consumer)
+        Assert-True ($missingRemoteVerify.ExitCode -ne 0) 'remote verification rejects an unreachable remote'
+    }
+    finally {
+        Remove-TestRoot -Path $testRoot
+    }
+}
+
+function Test-SaveSkill {
+    $skillRoot = Join-Path $ProjectRoot '.agents/skills/save-work-state'
+    $skillPath = Join-Path $skillRoot 'SKILL.md'
+    $metadataPath = Join-Path $skillRoot 'agents/openai.yaml'
+    $scenarioPath = Join-Path $ProjectRoot 'tests/work-state/scenarios/save-work-state.md'
+
+    Assert-True (Test-Path -LiteralPath $skillPath -PathType Leaf) 'save-work-state SKILL.md exists'
+    Assert-True (Test-Path -LiteralPath $metadataPath -PathType Leaf) 'save-work-state openai.yaml exists'
+    Assert-True (Test-Path -LiteralPath $scenarioPath -PathType Leaf) 'save-work-state scenario exists'
+    if (-not (Test-Path -LiteralPath $skillPath -PathType Leaf)) {
+        return
+    }
+
+    $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $skillPath
+    Assert-True ($content -match '(?m)^name: save-work-state$') 'save-work-state has the expected name'
+    Assert-True ($content -match '(?m)^description: Use when ') 'save-work-state description starts with Use when'
+    Assert-True ($content -notmatch 'TODO|TBD') 'save-work-state has no placeholders'
+    foreach ($scriptReference in @(
+        'scripts/work-state/inspect-git-state.ps1',
+        'scripts/work-state/check-state-docs.ps1',
+        'scripts/work-state/check-public-safety.ps1',
+        'scripts/work-state/verify-remote-head.ps1'
+    )) {
+        Assert-True ($content -match [regex]::Escape($scriptReference)) "save-work-state references $scriptReference"
+    }
+    Assert-True ($content -match [regex]::Escape('git add .')) 'save-work-state explicitly addresses whole-tree staging'
+    Assert-True ($content -match 'live remote branch SHA') 'save-work-state requires live remote verification'
+    Assert-True ($content -match 'cross-PC save incomplete') 'save-work-state defines incomplete save reporting'
+
+    if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
+        $metadata = Get-Content -Raw -Encoding UTF8 -LiteralPath $metadataPath
+        Assert-True ($metadata -match [regex]::Escape('$save-work-state')) 'save-work-state metadata default prompt invokes the skill'
+        Assert-True ($metadata -match '(?m)^\s*allow_implicit_invocation: true$') 'save-work-state allows implicit invocation'
+    }
+
+    if (Test-Path -LiteralPath $scenarioPath -PathType Leaf) {
+        $scenario = Get-Content -Raw -Encoding UTF8 -LiteralPath $scenarioPath
+        Assert-True ($scenario -match '## Prompt') 'save-work-state scenario has a prompt'
+        Assert-True ($scenario -match '## Evaluation contract') 'save-work-state scenario has an evaluation contract'
+    }
+}
+
+function Test-ResumeSkill {
+    $skillRoot = Join-Path $ProjectRoot '.agents/skills/resume-work-state'
+    $skillPath = Join-Path $skillRoot 'SKILL.md'
+    $metadataPath = Join-Path $skillRoot 'agents/openai.yaml'
+    $scenarioPath = Join-Path $ProjectRoot 'tests/work-state/scenarios/resume-work-state.md'
+
+    Assert-True (Test-Path -LiteralPath $skillPath -PathType Leaf) 'resume-work-state SKILL.md exists'
+    Assert-True (Test-Path -LiteralPath $metadataPath -PathType Leaf) 'resume-work-state openai.yaml exists'
+    Assert-True (Test-Path -LiteralPath $scenarioPath -PathType Leaf) 'resume-work-state scenario exists'
+    if (-not (Test-Path -LiteralPath $skillPath -PathType Leaf)) {
+        return
+    }
+
+    $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $skillPath
+    Assert-True ($content -match '(?m)^name: resume-work-state$') 'resume-work-state has the expected name'
+    Assert-True ($content -match '(?m)^description: Use when ') 'resume-work-state description starts with Use when'
+    Assert-True ($content -notmatch 'TODO|TBD') 'resume-work-state has no placeholders'
+    foreach ($scriptReference in @(
+        'scripts/work-state/inspect-git-state.ps1',
+        'scripts/work-state/check-state-docs.ps1',
+        'scripts/work-state/verify-remote-head.ps1'
+    )) {
+        Assert-True ($content -match [regex]::Escape($scriptReference)) "resume-work-state references $scriptReference"
+    }
+    Assert-True ($content -match [regex]::Escape('git pull --ff-only')) 'resume-work-state requires fast-forward-only pull'
+    Assert-True ($content -match 'Do not stash') 'resume-work-state forbids automatic stash on a dirty tree'
+    Assert-True ($content -match 'Actual Git state, source, and fresh tests override saved prose') 'resume-work-state prioritizes executable evidence'
+    Assert-True ($content -match 'Pre-Work Summary Contract') 'resume-work-state defines a pre-work summary'
+
+    if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
+        $metadata = Get-Content -Raw -Encoding UTF8 -LiteralPath $metadataPath
+        Assert-True ($metadata -match [regex]::Escape('$resume-work-state')) 'resume-work-state metadata default prompt invokes the skill'
+        Assert-True ($metadata -match '(?m)^\s*allow_implicit_invocation: true$') 'resume-work-state allows implicit invocation'
+    }
+
+    if (Test-Path -LiteralPath $scenarioPath -PathType Leaf) {
+        $scenario = Get-Content -Raw -Encoding UTF8 -LiteralPath $scenarioPath
+        Assert-True ($scenario -match '## Prompt') 'resume-work-state scenario has a prompt'
+        Assert-True ($scenario -match '## Evaluation contract') 'resume-work-state scenario has an evaluation contract'
+    }
+}
+
+if ($Suite -in @('All', 'Docs')) {
+    Test-Docs
+}
+if ($Suite -in @('All', 'Scripts')) {
+    Test-Scripts
+}
+if ($Suite -in @('All', 'Integration')) {
+    Test-Integration
+}
+if ($Suite -in @('All', 'SaveSkill')) {
+    Test-SaveSkill
+}
+if ($Suite -in @('All', 'ResumeSkill')) {
+    Test-ResumeSkill
+}
+
+Write-Host "RESULT: $script:Passes passed, $script:Failures failed"
+if ($script:Failures -gt 0) {
+    exit 1
+}
+
+exit 0
