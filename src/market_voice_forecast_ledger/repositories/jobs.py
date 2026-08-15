@@ -6,6 +6,7 @@ from typing import Final
 
 from market_voice_forecast_ledger.domain.common import canonical_json, utc_iso
 from market_voice_forecast_ledger.domain.enums import (
+    EligibilityStatus,
     JobKind,
     JobStage,
     JobStatus,
@@ -139,6 +140,140 @@ class JobRepository:
             total_units=row["total_units"],
             status=JobStatus(row["status"]),
         )
+
+    def create_sealed_video_pipeline_bindings(
+        self, job_id: int, eligibility_ids: tuple[int, ...]
+    ) -> None:
+        self._require_transaction()
+        self._conn.execute(
+            """
+            INSERT INTO video_pipeline_job_binding_sets(
+                job_id, expected_binding_count, is_sealed
+            ) VALUES (?, ?, 0)
+            """,
+            (job_id, len(eligibility_ids)),
+        )
+        self._conn.executemany(
+            """
+            INSERT INTO video_pipeline_job_bindings(job_id, eligibility_id)
+            VALUES (?, ?)
+            """,
+            ((job_id, eligibility_id) for eligibility_id in eligibility_ids),
+        )
+        cursor = self._conn.execute(
+            """
+            UPDATE video_pipeline_job_binding_sets
+            SET is_sealed=1
+            WHERE job_id=? AND is_sealed=0
+            """,
+            (job_id,),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("video-pipeline binding set was not sealed")
+
+    def copy_video_pipeline_bindings(
+        self, source_job_id: int, successor_job_id: int
+    ) -> None:
+        self._require_transaction()
+        eligibility_ids = self.list_video_pipeline_binding_ids(source_job_id)
+        if eligibility_ids:
+            self.create_sealed_video_pipeline_bindings(
+                successor_job_id, eligibility_ids
+            )
+
+    def list_video_pipeline_binding_ids(self, job_id: int) -> tuple[int, ...]:
+        binding_set = self._conn.execute(
+            """
+            SELECT
+                binding_set.expected_binding_count,
+                binding_set.is_sealed,
+                job.job_kind,
+                (
+                    SELECT COUNT(*)
+                    FROM video_pipeline_job_bindings AS member
+                    WHERE member.job_id=binding_set.job_id
+                ) AS member_count,
+                (
+                    SELECT COUNT(DISTINCT eligibility.video_id)
+                    FROM video_pipeline_job_bindings AS member
+                    JOIN subject_video_eligibility AS eligibility
+                        ON eligibility.id=member.eligibility_id
+                    WHERE member.job_id=binding_set.job_id
+                ) AS video_count
+            FROM video_pipeline_job_binding_sets AS binding_set
+            JOIN jobs AS job ON job.id=binding_set.job_id
+            WHERE binding_set.job_id=?
+            """,
+            (job_id,),
+        ).fetchone()
+        if binding_set is None:
+            return ()
+        if (
+            binding_set["job_kind"] != JobKind.VIDEO_PIPELINE.value
+            or binding_set["is_sealed"] != 1
+            or binding_set["expected_binding_count"]
+            != binding_set["member_count"]
+            or binding_set["member_count"] <= 0
+            or binding_set["video_count"] != 1
+        ):
+            raise DomainError(
+                "VIDEO_PIPELINE_BINDINGS_INVALID",
+                "video-pipeline binding set is incomplete or unsealed",
+            )
+        rows = self._conn.execute(
+            """
+            SELECT eligibility_id
+            FROM video_pipeline_job_bindings
+            WHERE job_id=?
+            ORDER BY eligibility_id
+            """,
+            (job_id,),
+        ).fetchall()
+        return tuple(row["eligibility_id"] for row in rows)
+
+    def has_current_eligible_video_binding(self, job_id: int) -> bool:
+        if not self.list_video_pipeline_binding_ids(job_id):
+            return False
+        return self._conn.execute(
+            """
+            SELECT 1
+            FROM video_pipeline_job_bindings AS binding
+            JOIN subject_video_eligibility AS eligibility
+                ON eligibility.id=binding.eligibility_id
+            JOIN subject_channel_policies AS policy
+                ON policy.id=eligibility.policy_id
+                AND policy.subject_id=eligibility.subject_id
+                AND policy.policy_hash=eligibility.policy_hash
+            WHERE binding.job_id=?
+                AND eligibility.status=?
+            LIMIT 1
+            """,
+            (job_id, EligibilityStatus.ELIGIBLE.value),
+        ).fetchone() is not None
+
+    def list_video_job_ids_for_eligibility(
+        self, eligibility_id: int
+    ) -> tuple[int, ...]:
+        rows = self._conn.execute(
+            """
+            SELECT binding.job_id
+            FROM video_pipeline_job_bindings AS binding
+            JOIN video_pipeline_job_binding_sets AS binding_set
+                ON binding_set.job_id=binding.job_id
+            JOIN jobs AS job ON job.id=binding.job_id
+            WHERE binding.eligibility_id=?
+                AND job.job_kind=?
+                AND binding_set.is_sealed=1
+                AND binding_set.expected_binding_count=(
+                    SELECT COUNT(*)
+                    FROM video_pipeline_job_bindings AS member
+                    WHERE member.job_id=binding.job_id
+                )
+            ORDER BY binding.job_id
+            """,
+            (eligibility_id, JobKind.VIDEO_PIPELINE.value),
+        ).fetchall()
+        return tuple(row["job_id"] for row in rows)
 
     def get_unit(self, job_id: int, unit_key: str) -> JobUnit:
         row = self._conn.execute(

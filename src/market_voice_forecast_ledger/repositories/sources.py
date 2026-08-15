@@ -9,6 +9,7 @@ from market_voice_forecast_ledger.domain.common import (
 )
 from market_voice_forecast_ledger.domain.enums import (
     ConfigurationStatus,
+    EligibilityStatus,
     PolicyKind,
     SubjectKind,
 )
@@ -191,8 +192,124 @@ class SourceRepository:
             raise LookupError(f"policy not found for subject name: {name}")
         return _policy_from_row(row)
 
+    def replace_policy(
+        self,
+        subject_id: int,
+        policy: ChannelPolicy,
+        updated_at: datetime,
+    ) -> ChannelPolicy:
+        self._require_transaction()
+        cursor = self._conn.execute(
+            """
+            UPDATE subject_channel_policies
+            SET
+                policy_kind=?,
+                configuration_status=?,
+                youtube_channel_id=?,
+                channel_display_name=?,
+                policy_hash=?,
+                updated_at=?
+            WHERE subject_id=?
+            """,
+            (
+                policy.policy_kind.value,
+                policy.configuration_status.value,
+                policy.youtube_channel_id,
+                policy.channel_display_name,
+                _policy_hash(policy),
+                utc_iso(updated_at),
+                subject_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LookupError(f"policy not found for subject: {subject_id}")
+        return self.get_policy(subject_id)
+
+    def list_subject_eligibilities(
+        self, subject_id: int
+    ) -> tuple[sqlite3.Row, ...]:
+        return tuple(
+            self._conn.execute(
+                """
+                SELECT
+                    eligibility.id,
+                    eligibility.subject_id,
+                    eligibility.video_id,
+                    eligibility.discovery_method,
+                    eligibility.status,
+                    eligibility.policy_id,
+                    eligibility.policy_hash,
+                    eligibility.decision_reason,
+                    eligibility.decided_at,
+                    video.youtube_channel_id AS video_youtube_channel_id
+                FROM subject_video_eligibility AS eligibility
+                JOIN videos AS video ON video.id=eligibility.video_id
+                WHERE eligibility.subject_id=?
+                ORDER BY eligibility.video_id
+                """,
+                (subject_id,),
+            )
+        )
+
+    def replace_eligibility(
+        self,
+        eligibility_id: int,
+        *,
+        status: EligibilityStatus,
+        policy_id: int,
+        policy_hash: str,
+        decision_reason: str,
+        decided_at: datetime,
+    ) -> None:
+        self._require_transaction()
+        cursor = self._conn.execute(
+            """
+            UPDATE subject_video_eligibility
+            SET
+                status=?,
+                policy_id=?,
+                policy_hash=?,
+                decision_reason=?,
+                decided_at=?
+            WHERE id=?
+            """,
+            (
+                status.value,
+                policy_id,
+                policy_hash,
+                decision_reason,
+                utc_iso(decided_at),
+                eligibility_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LookupError(f"eligibility not found: {eligibility_id}")
+
+    def subject_is_currently_eligible_for_video(
+        self, subject_id: int, video_id: int
+    ) -> bool:
+        return self._conn.execute(
+            """
+            SELECT 1
+            FROM subject_video_eligibility AS eligibility
+            JOIN subject_channel_policies AS policy
+                ON policy.id=eligibility.policy_id
+                AND policy.subject_id=eligibility.subject_id
+                AND policy.policy_hash=eligibility.policy_hash
+            WHERE eligibility.subject_id=?
+                AND eligibility.video_id=?
+                AND eligibility.status=?
+            LIMIT 1
+            """,
+            (subject_id, video_id, EligibilityStatus.ELIGIBLE.value),
+        ).fetchone() is not None
+
     def count_videos(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+
+    def _require_transaction(self) -> None:
+        if not self._conn.in_transaction:
+            raise RuntimeError("source correction requires an active transaction")
 
 
 def _policy_hash(policy: ChannelPolicy) -> str:

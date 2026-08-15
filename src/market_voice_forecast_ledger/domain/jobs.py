@@ -58,12 +58,20 @@ LEGAL_TRANSITIONS = {
         }
     ),
     JobStatus.PAUSE_REQUESTED: frozenset(
-        {JobStatus.PAUSED, JobStatus.FAILED}
+        {JobStatus.PAUSED, JobStatus.CANCEL_REQUESTED, JobStatus.FAILED}
     ),
     JobStatus.PAUSED: frozenset({JobStatus.RUNNING, JobStatus.STOPPED}),
     JobStatus.CANCEL_REQUESTED: frozenset({JobStatus.STOPPED}),
-    JobStatus.FAILED: frozenset({JobStatus.RETRYING}),
-    JobStatus.RETRYING: frozenset({JobStatus.RUNNING, JobStatus.FAILED}),
+    JobStatus.FAILED: frozenset(
+        {
+            JobStatus.RETRYING,
+            JobStatus.CANCEL_REQUESTED,
+            JobStatus.STOPPED,
+        }
+    ),
+    JobStatus.RETRYING: frozenset(
+        {JobStatus.RUNNING, JobStatus.FAILED, JobStatus.STOPPED}
+    ),
 }
 
 _SAFE_UNIT_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")

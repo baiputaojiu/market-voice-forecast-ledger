@@ -28,6 +28,7 @@ from market_voice_forecast_ledger.domain.sources import ChannelPolicy
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+_SAFE_STALE_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 
 class AnalysisRepository:
@@ -579,6 +580,115 @@ class AnalysisRepository:
             """,
             (run_id,),
         ).fetchone()[0]
+
+    def mark_scopes_using_segment_stale(
+        self, segment_id: int, reason: str
+    ) -> tuple[int, ...]:
+        self._validate_stale_input(segment_id, reason)
+        self._require_transaction()
+        scope_ids = tuple(
+            row["id"]
+            for row in self._conn.execute(
+                """
+                SELECT scope.id
+                FROM analysis_scopes AS scope
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM analysis_runs AS run
+                    JOIN analysis_run_segments AS run_segment
+                        ON run_segment.run_id=run.id
+                    WHERE run.scope_id=scope.id
+                        AND run_segment.segment_id=?
+                )
+                ORDER BY scope.id
+                """,
+                (segment_id,),
+            )
+        )
+        self._conn.execute(
+            """
+            UPDATE analysis_scopes AS scope
+            SET status=?, stale_reason=?
+            WHERE EXISTS (
+                SELECT 1
+                FROM analysis_runs AS run
+                JOIN analysis_run_segments AS run_segment
+                    ON run_segment.run_id=run.id
+                WHERE run.scope_id=scope.id
+                    AND run_segment.segment_id=?
+            )
+            AND (scope.status IS NOT ? OR scope.stale_reason IS NOT ?)
+            """,
+            (
+                ScopeStatus.STALE.value,
+                reason,
+                segment_id,
+                ScopeStatus.STALE.value,
+                reason,
+            ),
+        )
+        return scope_ids
+
+    def mark_scopes_using_policy_stale(
+        self, policy_id: int, reason: str
+    ) -> tuple[int, ...]:
+        self._validate_stale_input(policy_id, reason)
+        self._require_transaction()
+        scope_ids = tuple(
+            row["id"]
+            for row in self._conn.execute(
+                """
+                SELECT scope.id
+                FROM analysis_scopes AS scope
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM analysis_runs AS run
+                    JOIN analysis_run_segments AS run_segment
+                        ON run_segment.run_id=run.id
+                    WHERE run.scope_id=scope.id
+                        AND run_segment.policy_id=?
+                )
+                ORDER BY scope.id
+                """,
+                (policy_id,),
+            )
+        )
+        self._conn.execute(
+            """
+            UPDATE analysis_scopes AS scope
+            SET status=?, stale_reason=?
+            WHERE EXISTS (
+                SELECT 1
+                FROM analysis_runs AS run
+                JOIN analysis_run_segments AS run_segment
+                    ON run_segment.run_id=run.id
+                WHERE run.scope_id=scope.id
+                    AND run_segment.policy_id=?
+            )
+            AND (scope.status IS NOT ? OR scope.stale_reason IS NOT ?)
+            """,
+            (
+                ScopeStatus.STALE.value,
+                reason,
+                policy_id,
+                ScopeStatus.STALE.value,
+                reason,
+            ),
+        )
+        return scope_ids
+
+    @staticmethod
+    def _validate_stale_input(identifier: int, reason: str) -> None:
+        if (
+            type(identifier) is not int
+            or identifier <= 0
+            or type(reason) is not str
+            or _SAFE_STALE_REASON.fullmatch(reason) is None
+        ):
+            raise DomainError(
+                "STALE_TRANSITION_INVALID",
+                "stale transition requires a positive id and safe reason code",
+            )
 
     def _require_transaction(self) -> None:
         if not self._conn.in_transaction:

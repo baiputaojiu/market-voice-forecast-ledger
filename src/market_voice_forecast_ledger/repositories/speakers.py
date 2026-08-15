@@ -98,6 +98,15 @@ class SpeakerRepository:
             raise LookupError(f"transcript segment not found: {segment_id}")
         return _segment_from_row(row)
 
+    def get_segment_video_id(self, segment_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT video_id FROM transcript_segments WHERE id=?",
+            (segment_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"transcript segment not found: {segment_id}")
+        return row["video_id"]
+
     def list_segments_for_video(self, video_id: int) -> tuple[TranscriptSegment, ...]:
         rows = self._conn.execute(
             """
@@ -223,6 +232,15 @@ class SpeakerRepository:
             for segment_id in segment_ids
             if segment_id in by_segment_id
         )
+
+    def get_assignment(self, segment_id: int) -> SpeakerAssignment:
+        row = self._conn.execute(
+            "SELECT * FROM speaker_assignments WHERE segment_id=?",
+            (segment_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"speaker assignment not found: {segment_id}")
+        return _assignment_from_row(row)
 
 
 def _segment_from_row(row: sqlite3.Row) -> TranscriptSegment:

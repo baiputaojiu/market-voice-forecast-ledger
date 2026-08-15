@@ -821,6 +821,67 @@ def test_queued_job_can_stop_but_cannot_pause_or_resume(db):
     assert resume_error.value.code == "STOPPED_JOB_REQUIRES_SUCCESSOR"
 
 
+@pytest.mark.parametrize(
+    ("initial_status", "expected_status"),
+    [
+        (JobStatus.FAILED, JobStatus.STOPPED),
+        (JobStatus.RETRYING, JobStatus.STOPPED),
+        (JobStatus.PAUSE_REQUESTED, JobStatus.CANCEL_REQUESTED),
+        (JobStatus.CANCEL_REQUESTED, JobStatus.CANCEL_REQUESTED),
+    ],
+)
+def test_stop_converges_retry_pause_and_existing_cancel_states(
+    db, initial_status, expected_status
+):
+    service = JobStateService(db)
+    job_id = service.create(_video_manifest(1))
+    service.begin_unit(job_id, "transcription:chunk:1")
+
+    if initial_status in {JobStatus.FAILED, JobStatus.RETRYING}:
+        service.fail_unit(job_id, "transcription:chunk:1", "synthetic_retryable")
+        if initial_status is JobStatus.RETRYING:
+            service.resume(job_id, {})
+    elif initial_status is JobStatus.PAUSE_REQUESTED:
+        service.request_pause(job_id)
+    else:
+        service.request_stop(job_id)
+
+    assert service.status(job_id) is initial_status
+    assert service.request_stop(job_id) is expected_status
+
+
+def test_stopping_failed_job_waits_for_live_running_sibling_boundary(db):
+    service = JobStateService(db)
+    job_id = service.create(_video_manifest(2))
+    service.begin_unit(job_id, "transcription:chunk:1")
+    service.begin_unit(job_id, "transcription:chunk:2")
+    service.fail_unit(job_id, "transcription:chunk:1", "synthetic_retryable")
+    assert service.status(job_id) is JobStatus.FAILED
+
+    assert service.request_stop(job_id) is JobStatus.CANCEL_REQUESTED
+
+    assert service.unit(job_id, "transcription:chunk:1").status is UnitStatus.FAILED
+    assert service.unit(job_id, "transcription:chunk:2").status is UnitStatus.RUNNING
+    attempts = tuple(
+        row["result_status"]
+        for row in db.execute(
+            "SELECT result_status FROM job_unit_attempts "
+            "WHERE job_id=? ORDER BY unit_key",
+            (job_id,),
+        )
+    )
+    assert attempts == ("failed",)
+
+    service.complete_unit(
+        job_id, "transcription:chunk:2", "live-sibling-artifact"
+    )
+    assert service.status(job_id) is JobStatus.STOPPED
+    assert (
+        service.unit(job_id, "transcription:chunk:2").status
+        is UnitStatus.SUCCESS
+    )
+
+
 def test_cancel_requested_crash_finalizes_stop_before_successor(
     db_path, tmp_path
 ):
