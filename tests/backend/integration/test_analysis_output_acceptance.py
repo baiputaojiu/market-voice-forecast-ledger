@@ -193,6 +193,54 @@ def test_output_row_is_one_per_run_unit_and_append_only(
         )
 
 
+def test_insert_or_replace_cannot_bypass_output_append_only_trigger(
+    db, started_run, valid_output_json
+):
+    CodexContractService(db).validate_and_store(
+        started_run.id, CODEX_UNIT_KEY, valid_output_json, _valid_receipt()
+    )
+    before = dict(
+        db.execute(
+            "SELECT * FROM analysis_run_outputs WHERE run_id=?",
+            (started_run.id,),
+        ).fetchone()
+    )
+    replacement = before | {
+        "canonical_output_json": '{"replaced":true}',
+        "output_sha256": "0" * 64,
+        "created_at": "2099-01-01T00:00:00.000000Z",
+    }
+
+    with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+        db.execute(
+            """
+            INSERT OR REPLACE INTO analysis_run_outputs(
+                id,
+                run_id,
+                job_id,
+                unit_key,
+                batch_ordinal,
+                canonical_output_json,
+                output_sha256,
+                receipt_model,
+                receipt_reasoning_effort,
+                receipt_tool_call_count,
+                receipt_boundary_mode,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(replacement.values()),
+        )
+
+    after = dict(
+        db.execute(
+            "SELECT * FROM analysis_run_outputs WHERE run_id=?",
+            (started_run.id,),
+        ).fetchone()
+    )
+    assert after == before
+
+
 @pytest.mark.parametrize(
     ("foreign", "unit_key", "batch_ordinal"),
     [

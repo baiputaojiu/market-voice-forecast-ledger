@@ -21,6 +21,7 @@ def test_settings_keep_runtime_data_outside_repository(tmp_path):
 def test_migrations_apply_once_and_connection_enables_safety_pragmas(tmp_path):
     conn = open_database(tmp_path / "ledger.sqlite3")
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
     applied = apply_migrations(conn)
     assert applied[0] == "0001_foundation"
     assert apply_migrations(conn) == ()
