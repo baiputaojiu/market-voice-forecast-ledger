@@ -803,6 +803,113 @@ def test_valid_successor_can_finish_a_pending_upstream_unit_then_replace(db):
     assert result.after.projection_batch_id == batch.id
 
 
+def test_valid_successor_can_rerun_a_verified_empty_statement_artifact(db):
+    prepared_input = _prepare_personal_analysis(db)
+    run = _begin(db, prepared_input)
+    jobs = JobStateService(db)
+    jobs.begin_unit(prepared_input.job_id, CODEX_BATCH_UNIT_KEY)
+    CodexContractService(db).validate_and_store(
+        run.id,
+        CODEX_BATCH_UNIT_KEY,
+        json.dumps(
+            {
+                "run_id": run.id,
+                "batch_key": CODEX_BATCH_UNIT_KEY,
+                "statements": [],
+            }
+        ),
+        _valid_receipt(),
+    )
+    predecessor = PreparedProjection(
+        run.id, prepared_input.job_id, (), (), (), ()
+    )
+    successor_id, successor_plan = _attach_reusing_successor(db, predecessor)
+    assert STATEMENT_NORMALIZATION_UNIT_KEY not in successor_plan.reused_unit_keys
+
+    jobs.begin_unit(successor_id, STATEMENT_NORMALIZATION_UNIT_KEY)
+    assert StatementService(db).normalize_and_store(run.id) == ()
+    first_output_hash = jobs.unit(
+        successor_id, STATEMENT_NORMALIZATION_UNIT_KEY
+    ).output_hash
+    verified_artifacts = _success_artifacts(db, successor_id)
+    verified_artifacts[STATEMENT_NORMALIZATION_UNIT_KEY] = (
+        "mismatched-statement-artifact"
+    )
+
+    resume_plan = jobs.resume(successor_id, verified_artifacts)
+
+    assert STATEMENT_NORMALIZATION_UNIT_KEY in resume_plan.pending_unit_keys
+    assert jobs.unit(
+        successor_id, STATEMENT_NORMALIZATION_UNIT_KEY
+    ).status is UnitStatus.PENDING
+    jobs.begin_unit(successor_id, STATEMENT_NORMALIZATION_UNIT_KEY)
+    assert StatementService(db).normalize_and_store(run.id) == ()
+    second_output_hash = jobs.unit(
+        successor_id, STATEMENT_NORMALIZATION_UNIT_KEY
+    ).output_hash
+    assert second_output_hash == first_output_hash
+
+    attempts = tuple(
+        tuple(row)
+        for row in db.execute(
+            """
+            SELECT attempt_no, result_status, output_hash
+            FROM job_unit_attempts
+            WHERE job_id=? AND unit_key=?
+            ORDER BY attempt_no
+            """,
+            (successor_id, STATEMENT_NORMALIZATION_UNIT_KEY),
+        )
+    )
+    assert attempts == (
+        (1, "success", first_output_hash),
+        (2, "success", second_output_hash),
+    )
+    events = tuple(
+        (row["event_kind"], json.loads(row["metadata_json"]))
+        for row in db.execute(
+            """
+            SELECT event_kind, metadata_json
+            FROM job_events
+            WHERE job_id=? AND unit_key=?
+            ORDER BY id
+            """,
+            (successor_id, STATEMENT_NORMALIZATION_UNIT_KEY),
+        )
+    )
+    assert tuple(kind for kind, _ in events) == (
+        "unit_started",
+        "unit_succeeded",
+        "unit_reset",
+        "unit_started",
+        "unit_succeeded",
+    )
+    assert events[2][1] == {
+        "attempt_no": 1,
+        "reason": "verification_mismatch",
+    }
+
+    jobs.begin_unit(successor_id, PERIOD_NORMALIZATION_UNIT_KEY)
+    periods = PeriodService(db).normalize_run(run.id)
+    jobs.begin_unit(successor_id, ASSET_MAPPING_UNIT_KEY)
+    mappings = AssetMappingService(db).map_run(run.id)
+    prepared = PreparedProjection(
+        run.id,
+        successor_id,
+        (),
+        tuple(row.id for row in periods),
+        tuple(row.id for row in mappings),
+        (),
+    )
+    batch = _project(db, prepared)
+
+    result = _replace(db, prepared, batch)
+
+    assert result.after.source_run_id == run.id
+    assert result.after.projection_batch_id == batch.id
+    assert result.after.statement_count == 0
+
+
 def _insert_raw_attempt(
     db,
     job_id,

@@ -610,7 +610,7 @@ class CurrentResultService:
                     )
                 continue
             if rows or not self._success_attempt_history_is_exact(
-                unit, unit.output_hash
+                unit, unit.output_hash, allow_prior_success=True
             ):
                 self._validation_failed(
                     "active successor unit has no valid success provenance"
@@ -689,7 +689,11 @@ class CurrentResultService:
         )
 
     def _success_attempt_history_is_exact(
-        self, unit, expected_output_hash: str
+        self,
+        unit,
+        expected_output_hash: str,
+        *,
+        allow_prior_success: bool = False,
     ) -> bool:
         rows = self._conn.execute(
             """
@@ -708,8 +712,15 @@ class CurrentResultService:
             and tuple(row["attempt_no"] for row in rows)
             == tuple(range(1, unit.attempt_count + 1))
             and all(
-                row["result_status"] in {"failed", "interrupted"}
-                and row["output_hash"] is None
+                (
+                    row["result_status"] in {"failed", "interrupted"}
+                    and row["output_hash"] is None
+                )
+                or (
+                    allow_prior_success
+                    and row["result_status"] == "success"
+                    and row["output_hash"] is not None
+                )
                 for row in rows[:-1]
             )
             and rows[-1]["result_status"] == "success"
