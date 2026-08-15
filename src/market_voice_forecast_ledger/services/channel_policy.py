@@ -81,9 +81,10 @@ class ChannelPolicyService:
         video_id: int,
         discovery_method: DiscoveryMethod,
     ) -> EligibilityDecision:
-        policy = self._sources.get_policy(subject_id)
-        video = self._sources.get_video(video_id)
-        return self._evaluate_and_persist(policy, video, discovery_method)
+        with transaction(self._conn):
+            policy = self._sources.get_policy(subject_id)
+            video = self._sources.get_video(video_id)
+            return self._evaluate_and_persist(policy, video, discovery_method)
 
     def evaluate_by_subject_name(
         self,
@@ -91,9 +92,10 @@ class ChannelPolicyService:
         video_id: int,
         discovery_method: DiscoveryMethod,
     ) -> EligibilityDecision:
-        policy = self._sources.get_policy_by_subject_name(name)
-        video = self._sources.get_video(video_id)
-        return self._evaluate_and_persist(policy, video, discovery_method)
+        with transaction(self._conn):
+            policy = self._sources.get_policy_by_subject_name(name)
+            video = self._sources.get_video(video_id)
+            return self._evaluate_and_persist(policy, video, discovery_method)
 
     def _evaluate_and_persist(
         self,
@@ -118,68 +120,67 @@ class ChannelPolicyService:
             "decided_at": utc_iso(decided_at),
         }
 
-        with transaction(self._conn):
-            existing = self._conn.execute(
-                """
-                SELECT
-                    subject_id,
-                    video_id,
-                    discovery_method,
-                    status,
-                    policy_id,
-                    policy_hash,
-                    decision_reason,
-                    decided_at
-                FROM subject_video_eligibility
-                WHERE subject_id = ? AND video_id = ?
-                """,
-                (policy.subject_id, video.id),
-            ).fetchone()
-            before = None if existing is None else dict(existing)
-            self._conn.execute(
-                """
-                INSERT INTO subject_video_eligibility(
-                    subject_id,
-                    video_id,
-                    discovery_method,
-                    status,
-                    policy_id,
-                    policy_hash,
-                    decision_reason,
-                    decided_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(subject_id, video_id) DO UPDATE SET
-                    discovery_method = excluded.discovery_method,
-                    status = excluded.status,
-                    policy_id = excluded.policy_id,
-                    policy_hash = excluded.policy_hash,
-                    decision_reason = excluded.decision_reason,
-                    decided_at = excluded.decided_at
-                """,
-                (
-                    policy.subject_id,
-                    video.id,
-                    discovery_method.value,
-                    decision.status.value,
-                    policy.id,
-                    policy.policy_hash,
-                    decision.reason,
-                    utc_iso(decided_at),
-                ),
+        existing = self._conn.execute(
+            """
+            SELECT
+                subject_id,
+                video_id,
+                discovery_method,
+                status,
+                policy_id,
+                policy_hash,
+                decision_reason,
+                decided_at
+            FROM subject_video_eligibility
+            WHERE subject_id = ? AND video_id = ?
+            """,
+            (policy.subject_id, video.id),
+        ).fetchone()
+        before = None if existing is None else dict(existing)
+        self._conn.execute(
+            """
+            INSERT INTO subject_video_eligibility(
+                subject_id,
+                video_id,
+                discovery_method,
+                status,
+                policy_id,
+                policy_hash,
+                decision_reason,
+                decided_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subject_id, video_id) DO UPDATE SET
+                discovery_method = excluded.discovery_method,
+                status = excluded.status,
+                policy_id = excluded.policy_id,
+                policy_hash = excluded.policy_hash,
+                decision_reason = excluded.decision_reason,
+                decided_at = excluded.decided_at
+            """,
+            (
+                policy.subject_id,
+                video.id,
+                discovery_method.value,
+                decision.status.value,
+                policy.id,
+                policy.policy_hash,
+                decision.reason,
+                utc_iso(decided_at),
+            ),
+        )
+        self._audit.append(
+            AuditEventInput(
+                entity_type="subject_video_eligibility",
+                entity_id=entity_id,
+                scope_id=None,
+                operation="create" if before is None else "update",
+                actor_kind="system",
+                reason_code=decision.reason,
+                reason_text="Channel eligibility evaluated",
+                before=before,
+                after=after,
+                created_at=decided_at,
             )
-            self._audit.append(
-                AuditEventInput(
-                    entity_type="subject_video_eligibility",
-                    entity_id=entity_id,
-                    scope_id=None,
-                    operation="create" if before is None else "update",
-                    actor_kind="system",
-                    reason_code=decision.reason,
-                    reason_text="Channel eligibility evaluated",
-                    before=before,
-                    after=after,
-                    created_at=decided_at,
-                )
-            )
+        )
 
         return decision

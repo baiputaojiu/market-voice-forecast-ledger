@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -128,6 +129,57 @@ def test_evaluation_persists_current_policy_snapshot_and_discovery_method(db):
     assert row["policy_hash"] == policy.policy_hash
     assert row["decision_reason"] == "FIXED_CHANNEL_MATCH"
     assert decided_at.utcoffset().total_seconds() == 0
+
+
+@pytest.mark.parametrize("by_subject_name", [False, True], ids=["subject-id", "name"])
+def test_evaluation_reads_video_after_acquiring_write_transaction(
+    db, by_subject_name
+):
+    bootstrap_reference_data(db)
+    repo = SourceRepository(db)
+    policy = repo.get_policy_by_subject_name("江守哲")
+    video_id = repo.upsert_video(
+        _video("synthetic-concurrent-channel-change", policy.youtube_channel_id)
+    )
+    database_path = Path(db.execute("PRAGMA database_list").fetchone()["file"])
+    concurrent_db = open_database(database_path)
+    updates = []
+    callback_errors = []
+
+    def update_channel_before_begin(statement):
+        if statement != "BEGIN IMMEDIATE" or updates:
+            return
+        try:
+            concurrent_db.execute(
+                "UPDATE videos SET youtube_channel_id=? WHERE id=?",
+                ("UC9999999999999999999999", video_id),
+            )
+            updates.append(concurrent_db.total_changes)
+        except Exception as error:  # pragma: no cover - asserted diagnostic path
+            callback_errors.append(error)
+
+    db.set_trace_callback(update_channel_before_begin)
+    try:
+        service = ChannelPolicyService(db)
+        if by_subject_name:
+            service.evaluate_by_subject_name(
+                "江守哲", video_id, DiscoveryMethod.AUTO_SEARCH
+            )
+        else:
+            service.evaluate(
+                policy.subject_id, video_id, DiscoveryMethod.AUTO_SEARCH
+            )
+    finally:
+        db.set_trace_callback(None)
+        concurrent_db.close()
+
+    row = db.execute(
+        "SELECT status, decision_reason FROM subject_video_eligibility"
+    ).fetchone()
+    assert callback_errors == []
+    assert updates == [1]
+    assert row["status"] == EligibilityStatus.CHANNEL_OUT_OF_SCOPE.value
+    assert row["decision_reason"] == "FIXED_CHANNEL_MISMATCH"
 
 
 def test_reevaluation_replaces_one_current_decision_without_merging_video(db):
