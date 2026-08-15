@@ -34,13 +34,19 @@ async def correct_speaker(
     conn: Annotated[sqlite3.Connection, Depends(get_connection)],
 ) -> SpeakerCorrectionResponse:
     identifier = parse_positive_path_id(segment_id)
+    assignment_kind = AssignmentKind(body.assignment_kind)
     stale_scope_count = PublicReadAdapter(
         conn
-    ).stale_scope_count_for_segment(identifier)
+    ).stale_scope_count_for_segment(
+        identifier,
+        body.assigned_subject_id
+        if assignment_kind is AssignmentKind.SUBJECT
+        else None,
+    )
     result = SpeakerCorrectionService(conn).correct(
         SpeakerCorrection(
             segment_id=identifier,
-            assignment_kind=AssignmentKind(body.assignment_kind),
+            assignment_kind=assignment_kind,
             assigned_subject_id=body.assigned_subject_id,
             actor="user",
             reason=body.reason,

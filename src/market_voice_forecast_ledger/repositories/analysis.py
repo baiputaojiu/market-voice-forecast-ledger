@@ -29,6 +29,7 @@ from market_voice_forecast_ledger.domain.sources import ChannelPolicy
 
 _SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 _SAFE_STALE_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_STALE_SCOPE_BATCH_SIZE = 500
 
 
 class AnalysisRepository:
@@ -219,13 +220,13 @@ class AnalysisRepository:
         subject_id: int,
         cutoff_day: date,
         cutoff_exclusive: datetime,
-    ) -> int:
+    ) -> tuple[int, int]:
         self._require_transaction()
         cutoff_day_text = cutoff_day.isoformat()
         cutoff_text = utc_iso(cutoff_exclusive)
         row = self._conn.execute(
             """
-            SELECT id, cutoff_exclusive_utc
+            SELECT id, cutoff_exclusive_utc, generation
             FROM analysis_scopes
             WHERE subject_id=? AND cutoff_day_jst=?
             """,
@@ -239,8 +240,9 @@ class AnalysisRepository:
                     cutoff_day_jst,
                     cutoff_exclusive_utc,
                     status,
-                    stale_reason
-                ) VALUES (?, ?, ?, ?, NULL)
+                    stale_reason,
+                    generation
+                ) VALUES (?, ?, ?, ?, NULL, 1)
                 """,
                 (
                     subject_id,
@@ -251,25 +253,34 @@ class AnalysisRepository:
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("analysis scope insert did not return an id")
-            return cursor.lastrowid
+            return cursor.lastrowid, 1
         if row["cutoff_exclusive_utc"] != cutoff_text:
             raise DomainError(
                 "ANALYSIS_SCOPE_CUTOFF_MISMATCH",
                 "stored scope cutoff does not match the fixed JST rule",
             )
-        self._conn.execute(
+        generation = _nonnegative_generation(
+            row["generation"], "ANALYSIS_SCOPE_STORED_INVALID"
+        )
+        updated = self._conn.execute(
             """
             UPDATE analysis_scopes
-            SET status=?, stale_reason=NULL
+            SET status=?, stale_reason=NULL, generation=generation+1
             WHERE id=?
             """,
             (ScopeStatus.RUNNING.value, row["id"]),
         )
-        return row["id"]
+        if updated.rowcount != 1:
+            raise DomainError(
+                "ANALYSIS_SCOPE_STORED_INVALID",
+                "analysis scope generation could not advance",
+            )
+        return row["id"], generation + 1
 
     def insert_run(
         self,
         scope_id: int,
+        scope_generation: int,
         settings: AnalysisRunSettings,
         frozen_input: FrozenAnalysisInput,
         started_at: datetime,
@@ -286,8 +297,9 @@ class AnalysisRepository:
                 information_boundary_version,
                 input_hash,
                 input_contract_hash,
-                started_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                started_at,
+                scope_generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scope_id,
@@ -299,6 +311,7 @@ class AnalysisRepository:
                 frozen_input.input_sha256,
                 frozen_input.input_contract_hash,
                 utc_iso(started_at),
+                scope_generation,
             ),
         )
         if cursor.lastrowid is None:
@@ -581,101 +594,151 @@ class AnalysisRepository:
             (run_id,),
         ).fetchone()[0]
 
-    def mark_scopes_using_segment_stale(
-        self, segment_id: int, reason: str
+    def scope_ids_affected_by_speaker_correction(
+        self,
+        segment_id: int,
+        assigned_subject_id: int | None,
     ) -> tuple[int, ...]:
-        self._validate_stale_input(segment_id, reason)
-        self._require_transaction()
-        scope_ids = tuple(
+        if (
+            type(segment_id) is not int
+            or segment_id <= 0
+            or (
+                assigned_subject_id is not None
+                and (
+                    type(assigned_subject_id) is not int
+                    or assigned_subject_id <= 0
+                )
+            )
+        ):
+            raise DomainError(
+                "STALE_TRANSITION_INVALID",
+                "speaker stale lookup requires valid segment and subject ids",
+            )
+        return tuple(
             row["id"]
             for row in self._conn.execute(
                 """
+                WITH corrected_segment AS (
+                    SELECT video_id
+                    FROM transcript_segments
+                    WHERE id=?
+                )
                 SELECT scope.id
                 FROM analysis_scopes AS scope
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM analysis_runs AS run
-                    JOIN analysis_run_segments AS run_segment
-                        ON run_segment.run_id=run.id
-                    WHERE run.scope_id=scope.id
-                        AND run_segment.segment_id=?
-                )
+                WHERE EXISTS (SELECT 1 FROM corrected_segment)
+                    AND (
+                        (? IS NOT NULL AND scope.subject_id=?)
+                        OR EXISTS (
+                            SELECT 1
+                            FROM analysis_runs AS run
+                            JOIN analysis_run_segments AS run_segment
+                                ON run_segment.run_id=run.id
+                            JOIN corrected_segment
+                                ON corrected_segment.video_id=run_segment.video_id
+                            WHERE run.scope_id=scope.id
+                        )
+                    )
                 ORDER BY scope.id
                 """,
-                (segment_id,),
+                (segment_id, assigned_subject_id, assigned_subject_id),
             )
         )
-        self._conn.execute(
-            """
-            UPDATE analysis_scopes AS scope
-            SET status=?, stale_reason=?
-            WHERE EXISTS (
-                SELECT 1
-                FROM analysis_runs AS run
-                JOIN analysis_run_segments AS run_segment
-                    ON run_segment.run_id=run.id
-                WHERE run.scope_id=scope.id
-                    AND run_segment.segment_id=?
+
+    def scope_ids_for_subject(self, subject_id: int) -> tuple[int, ...]:
+        if type(subject_id) is not int or subject_id <= 0:
+            raise DomainError(
+                "STALE_TRANSITION_INVALID",
+                "policy stale lookup requires a valid subject id",
             )
-            AND (scope.status IS NOT ? OR scope.stale_reason IS NOT ?)
-            """,
-            (
-                ScopeStatus.STALE.value,
-                reason,
-                segment_id,
-                ScopeStatus.STALE.value,
-                reason,
-            ),
+        return tuple(
+            row["id"]
+            for row in self._conn.execute(
+                """
+                SELECT id
+                FROM analysis_scopes
+                WHERE subject_id=?
+                ORDER BY id
+                """,
+                (subject_id,),
+            )
         )
-        return scope_ids
+
+    def mark_scope_ids_stale(
+        self, scope_ids: Sequence[int], reason: str
+    ) -> tuple[int, ...]:
+        self._require_transaction()
+        if (
+            type(reason) is not str
+            or _SAFE_STALE_REASON.fullmatch(reason) is None
+        ):
+            raise DomainError(
+                "STALE_TRANSITION_INVALID",
+                "stale transition requires positive ids and a safe reason code",
+            )
+        identifiers = tuple(scope_ids)
+        if any(type(scope_id) is not int or scope_id <= 0 for scope_id in identifiers):
+            raise DomainError(
+                "STALE_TRANSITION_INVALID",
+                "stale transition requires positive ids and a safe reason code",
+            )
+        deduplicated = tuple(sorted(set(identifiers)))
+        if not deduplicated:
+            return ()
+        variable_limit = self._conn.getlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER
+        )
+        batch_size = min(_STALE_SCOPE_BATCH_SIZE, variable_limit - 2)
+        if batch_size <= 0:
+            raise DomainError(
+                "ANALYSIS_SCOPE_STORED_INVALID",
+                "SQLite variable limit cannot support scope invalidation",
+            )
+        updated_count = 0
+        for start in range(0, len(deduplicated), batch_size):
+            batch = deduplicated[start : start + batch_size]
+            placeholders = ", ".join("?" for _ in batch)
+            updated = self._conn.execute(
+                f"""
+                UPDATE analysis_scopes
+                SET status=?, stale_reason=?, generation=generation+1
+                WHERE id IN ({placeholders})
+                """,
+                (ScopeStatus.STALE.value, reason, *batch),
+            )
+            updated_count += updated.rowcount
+        if updated_count != len(deduplicated):
+            raise DomainError(
+                "ANALYSIS_SCOPE_STORED_INVALID",
+                "affected analysis scopes changed during invalidation",
+            )
+        return deduplicated
+
+    def mark_scopes_using_segment_stale(
+        self,
+        segment_id: int,
+        reason: str,
+        assigned_subject_id: int | None = None,
+    ) -> tuple[int, ...]:
+        self._validate_stale_input(segment_id, reason)
+        self._require_transaction()
+        scope_ids = self.scope_ids_affected_by_speaker_correction(
+            segment_id, assigned_subject_id
+        )
+        return self.mark_scope_ids_stale(scope_ids, reason)
 
     def mark_scopes_using_policy_stale(
         self, policy_id: int, reason: str
     ) -> tuple[int, ...]:
         self._validate_stale_input(policy_id, reason)
         self._require_transaction()
-        scope_ids = tuple(
-            row["id"]
-            for row in self._conn.execute(
-                """
-                SELECT scope.id
-                FROM analysis_scopes AS scope
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM analysis_runs AS run
-                    JOIN analysis_run_segments AS run_segment
-                        ON run_segment.run_id=run.id
-                    WHERE run.scope_id=scope.id
-                        AND run_segment.policy_id=?
-                )
-                ORDER BY scope.id
-                """,
-                (policy_id,),
-            )
+        row = self._conn.execute(
+            "SELECT subject_id FROM subject_channel_policies WHERE id=?",
+            (policy_id,),
+        ).fetchone()
+        scope_ids = () if row is None else self.scope_ids_for_subject(
+            row["subject_id"]
         )
-        self._conn.execute(
-            """
-            UPDATE analysis_scopes AS scope
-            SET status=?, stale_reason=?
-            WHERE EXISTS (
-                SELECT 1
-                FROM analysis_runs AS run
-                JOIN analysis_run_segments AS run_segment
-                    ON run_segment.run_id=run.id
-                WHERE run.scope_id=scope.id
-                    AND run_segment.policy_id=?
-            )
-            AND (scope.status IS NOT ? OR scope.stale_reason IS NOT ?)
-            """,
-            (
-                ScopeStatus.STALE.value,
-                reason,
-                policy_id,
-                ScopeStatus.STALE.value,
-                reason,
-            ),
-        )
-        return scope_ids
+        return self.mark_scope_ids_stale(scope_ids, reason)
 
     @staticmethod
     def _validate_stale_input(identifier: int, reason: str) -> None:
@@ -730,6 +793,9 @@ def _scope_from_row(row: sqlite3.Row) -> AnalysisScope:
         cutoff_exclusive_utc=_parse_utc(row["cutoff_exclusive_utc"]),
         status=ScopeStatus(row["status"]),
         stale_reason=row["stale_reason"],
+        generation=_nonnegative_generation(
+            row["generation"], "ANALYSIS_SCOPE_STORED_INVALID"
+        ),
     )
 
 
@@ -737,6 +803,9 @@ def _run_from_row(row: sqlite3.Row) -> AnalysisRun:
     return AnalysisRun(
         id=row["id"],
         scope_id=row["scope_id"],
+        scope_generation=_nonnegative_generation(
+            row["scope_generation"], "ANALYSIS_RUN_STORED_INVALID"
+        ),
         model=row["model"],
         reasoning_effort=row["reasoning_effort"],
         prompt_version=row["prompt_version"],
@@ -747,6 +816,12 @@ def _run_from_row(row: sqlite3.Row) -> AnalysisRun:
         started_at=_parse_utc(row["started_at"]),
         active_job_id=row["active_job_id"],
     )
+
+
+def _nonnegative_generation(value: object, error_code: str) -> int:
+    if type(value) is not int or value < 0:
+        raise DomainError(error_code, "stored analysis generation is invalid")
+    return value
 
 
 def _attempt_from_row(row: sqlite3.Row) -> AnalysisRunJobAttempt:

@@ -177,9 +177,9 @@ class CurrentResultService:
                 """
                 UPDATE analysis_scopes
                 SET status='current', stale_reason=NULL
-                WHERE id=? AND status='running'
+                WHERE id=? AND status='running' AND generation=?
                 """,
-                (run.scope_id,),
+                (run.scope_id, run.scope_generation),
             )
             if updated.rowcount != 1:
                 raise DomainError(
@@ -320,10 +320,14 @@ class CurrentResultService:
         final = self._jobs.get_unit(
             run.active_job_id, FINAL_PROMOTION_UNIT_KEY
         )
-        if scope.status is not ScopeStatus.RUNNING or final.status is not UnitStatus.RUNNING:
+        if (
+            scope.status is not ScopeStatus.RUNNING
+            or final.status is not UnitStatus.RUNNING
+            or run.scope_generation != scope.generation
+        ):
             raise DomainError(
                 "CURRENT_PROMOTION_NOT_ALLOWED",
-                "initial promotion requires a running scope and final unit",
+                "initial promotion requires the current running scope generation",
             )
         validated = self._validate_complete_projection(
             run_id, projection_batch_id

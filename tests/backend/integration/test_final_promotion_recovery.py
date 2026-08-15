@@ -9,6 +9,7 @@ from market_voice_forecast_ledger.db.connection import open_database, transactio
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.enums import (
     AnalysisRunStatus,
+    AssignmentKind,
     HeatmapGranularity,
     JobStatus,
     ScopeStatus,
@@ -17,9 +18,19 @@ from market_voice_forecast_ledger.domain.enums import (
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.jobs import FINAL_PROMOTION_UNIT_KEY
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
+from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
+from market_voice_forecast_ledger.services.corrections import (
+    SpeakerCorrection,
+    SpeakerCorrectionService,
+)
 from market_voice_forecast_ledger.services.current_results import CurrentResultService
 from market_voice_forecast_ledger.services.heatmap import HeatmapService
 from market_voice_forecast_ledger.services.job_state import JobStateService
+from tests.backend.e2e.synthetic_fixture import (
+    SYNTHETIC_CUTOFF,
+    _execute_analysis,
+    create_crash_promotion_fixture,
+)
 from tests.backend.integration.test_atomic_result_replacement import (
     _completed_run,
     _scope_id,
@@ -77,6 +88,18 @@ def _durable_state(db, scope_id, run_id, job_id):
     return tuple(
         (name, tuple(tuple(row) for row in db.execute(sql, params)))
         for name, sql, params in queries
+    )
+
+
+def _complete_newer_empty_run(db, fixture, label):
+    return _execute_analysis(
+        db,
+        role=label,
+        subject_id=fixture.pending_run.prepared.subject_id,
+        cutoff_day=SYNTHETIC_CUTOFF,
+        specs=(),
+        sources=(),
+        promote=False,
     )
 
 
@@ -317,6 +340,109 @@ def test_stale_during_run_rejects_promotion_and_preserves_old_display(db):
     assert JobStateService(db).unit(
         prepared.job_id, FINAL_PROMOTION_UNIT_KEY
     ).status is UnitStatus.RUNNING
+
+
+def test_corrected_projected_run_cannot_promote_after_new_generation_begins(db):
+    fixture = create_crash_promotion_fixture(db)
+    old_display = CurrentResultService(db).get_scope(fixture.scope_id)
+    stale_run = AnalysisRepository(db).get_run(fixture.run_id)
+    corrected_segment_id = fixture.pending_run.sources[0].segment_id
+
+    SpeakerCorrectionService(db).correct(
+        SpeakerCorrection(
+            corrected_segment_id,
+            AssignmentKind.HOLD,
+            None,
+            "user",
+            "supersede projected input before a replacement run begins",
+        )
+    )
+    current_contract = AnalysisRunService(db).preview_input_contract(
+        fixture.pending_run.prepared.subject_id,
+        SYNTHETIC_CUTOFF,
+        stale_run.settings,
+    )
+    assert stale_run.input_contract_hash != current_contract
+    newer = _complete_newer_empty_run(db, fixture, "newer-after-correction")
+    JobStateService(db).begin_unit(fixture.job_id, FINAL_PROMOTION_UNIT_KEY)
+
+    with pytest.raises(DomainError) as error:
+        CurrentResultService(db).promote_completed_run(
+            fixture.run_id, fixture.projection_batch_id
+        )
+
+    assert error.value.code == "CURRENT_PROMOTION_NOT_ALLOWED"
+    assert CurrentResultService(db).get_scope(fixture.scope_id) == old_display
+    scope = AnalysisRepository(db).get_scope(fixture.scope_id)
+    newer_run = AnalysisRepository(db).get_run(newer.prepared.run_id)
+    assert stale_run.scope_generation == 2
+    assert newer_run.scope_generation == scope.generation == 4
+
+
+def test_older_projected_run_is_rejected_when_newer_run_begins_without_correction(db):
+    fixture = create_crash_promotion_fixture(db)
+    old_display = CurrentResultService(db).get_scope(fixture.scope_id)
+    newer = _complete_newer_empty_run(db, fixture, "newer-without-correction")
+    JobStateService(db).begin_unit(fixture.job_id, FINAL_PROMOTION_UNIT_KEY)
+
+    with pytest.raises(DomainError) as error:
+        CurrentResultService(db).promote_completed_run(
+            fixture.run_id, fixture.projection_batch_id
+        )
+
+    assert error.value.code == "CURRENT_PROMOTION_NOT_ALLOWED"
+    assert CurrentResultService(db).get_scope(fixture.scope_id) == old_display
+    JobStateService(db).begin_unit(
+        newer.prepared.job_id, FINAL_PROMOTION_UNIT_KEY
+    )
+    promoted = CurrentResultService(db).promote_completed_run(
+        newer.prepared.run_id, newer.batch.id
+    )
+    assert promoted.source_run_id == newer.prepared.run_id
+    assert AnalysisRepository(db).get_run(fixture.run_id).scope_generation == 2
+    assert AnalysisRepository(db).get_scope(
+        fixture.scope_id
+    ).generation == AnalysisRepository(db).get_run(
+        newer.prepared.run_id
+    ).scope_generation == 3
+
+
+@pytest.mark.parametrize("first_operation", ("correction", "promotion"))
+def test_correction_and_promotion_orders_preserve_serialized_generation_state(
+    db, first_operation
+):
+    fixture = create_crash_promotion_fixture(db)
+    repository = AnalysisRepository(db)
+    starting_generation = repository.get_scope(fixture.scope_id).generation
+    corrected_segment_id = fixture.pending_run.sources[0].segment_id
+    correction = SpeakerCorrection(
+        corrected_segment_id,
+        AssignmentKind.HOLD,
+        None,
+        "user",
+        "serialize correction against initial promotion",
+    )
+    JobStateService(db).begin_unit(fixture.job_id, FINAL_PROMOTION_UNIT_KEY)
+
+    if first_operation == "correction":
+        SpeakerCorrectionService(db).correct(correction)
+        with pytest.raises(DomainError) as error:
+            CurrentResultService(db).promote_completed_run(
+                fixture.run_id, fixture.projection_batch_id
+            )
+        assert error.value.code == "CURRENT_PROMOTION_NOT_ALLOWED"
+    else:
+        CurrentResultService(db).promote_completed_run(
+            fixture.run_id, fixture.projection_batch_id
+        )
+        SpeakerCorrectionService(db).correct(correction)
+
+    scope = repository.get_scope(fixture.scope_id)
+    assert scope.generation == starting_generation + 1
+    assert (scope.status, scope.stale_reason) == (
+        ScopeStatus.STALE,
+        "SPEAKER_ASSIGNMENT_CHANGED",
+    )
 
 
 def test_promotion_requires_final_exactly_running_and_exact_bound_input(db):

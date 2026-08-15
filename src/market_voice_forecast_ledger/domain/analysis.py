@@ -50,6 +50,7 @@ class AnalysisScope:
     cutoff_exclusive_utc: datetime
     status: ScopeStatus
     stale_reason: str | None
+    generation: int
 
     @property
     def cutoff_day(self) -> date:
@@ -60,6 +61,7 @@ class AnalysisScope:
 class AnalysisRun:
     id: int
     scope_id: int
+    scope_generation: int
     model: str
     reasoning_effort: str
     prompt_version: str

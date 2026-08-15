@@ -217,6 +217,51 @@ def test_speaker_correction_calls_real_service_and_leaves_results_stale(
         conn.close()
 
 
+def test_speaker_correction_precount_matches_empty_new_subject_scope_mutation(
+    client: TestClient, settings: Settings
+):
+    conn = open_database(settings.database_path)
+    try:
+        fixture = create_speaker_correction_fixture(conn, AssignmentKind.HOLD)
+        before = {
+            row["id"]: row["generation"]
+            for row in conn.execute(
+                "SELECT id, generation FROM analysis_scopes ORDER BY id"
+            )
+        }
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/speakers/{fixture.segment_id}/corrections",
+        json={
+            "assignment_kind": "subject",
+            "assigned_subject_id": fixture.subject_id,
+            "reason": "Synthetic API empty-scope correction",
+        },
+    )
+
+    assert response.status_code == 200
+    conn = open_database(settings.database_path)
+    try:
+        changed = tuple(
+            row["id"]
+            for row in conn.execute(
+                "SELECT id, generation FROM analysis_scopes ORDER BY id"
+            )
+            if row["generation"] == before[row["id"]] + 1
+        )
+        assert response.json()["stale_scope_count"] == len(changed) == 1
+        assert changed == (fixture.scope_id,)
+        scope = conn.execute(
+            "SELECT status, stale_reason FROM analysis_scopes WHERE id=?",
+            (fixture.scope_id,),
+        ).fetchone()
+        assert tuple(scope) == ("stale", "SPEAKER_ASSIGNMENT_CHANGED")
+    finally:
+        conn.close()
+
+
 def test_speaker_correction_read_failure_does_not_escape_atomic_write(
     client: TestClient, settings: Settings, monkeypatch
 ):
@@ -243,7 +288,7 @@ def test_speaker_correction_read_failure_does_not_escape_atomic_write(
     finally:
         conn.close()
 
-    def fail_count(_self, _segment_id):
+    def fail_count(_self, _segment_id, _assigned_subject_id):
         raise sqlite3.OperationalError(
             "C:/private/ledger.sqlite3 stale count failure"
         )

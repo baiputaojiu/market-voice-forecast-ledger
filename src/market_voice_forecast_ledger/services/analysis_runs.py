@@ -151,13 +151,17 @@ class AnalysisRunService:
                 )
 
             started_at = self._clock()
-            scope_id = self._analysis.get_or_create_scope(
+            scope_id, scope_generation = self._analysis.get_or_create_scope(
                 command.subject_id,
                 command.cutoff_day,
                 cutoff_exclusive_utc(command.cutoff_day),
             )
             run_id = self._analysis.insert_run(
-                scope_id, command.settings, frozen_input, started_at
+                scope_id,
+                scope_generation,
+                command.settings,
+                frozen_input,
+                started_at,
             )
             self._analysis.insert_job_attempt(
                 run_id,

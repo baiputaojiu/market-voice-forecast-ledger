@@ -40,6 +40,7 @@ from market_voice_forecast_ledger.services.corrections import (
 )
 from market_voice_forecast_ledger.services.current_results import CurrentResultService
 from market_voice_forecast_ledger.services.job_state import JobStateService
+from tests.backend.e2e.synthetic_fixture import create_speaker_correction_fixture
 
 
 FIXED_UTC = datetime(2026, 8, 15, 1, 2, 3, 456789, tzinfo=timezone.utc)
@@ -512,6 +513,40 @@ def test_fixed_channel_change_reevaluates_audits_stales_and_stops_only_safe_jobs
         assert forbidden not in serialized
 
 
+def test_policy_change_stales_accepted_empty_scope_without_run_segments(db):
+    fixture = create_speaker_correction_fixture(db, AssignmentKind.HOLD)
+    assert db.execute(
+        "SELECT COUNT(*) FROM analysis_run_segments AS run_segment "
+        "JOIN analysis_runs AS run ON run.id=run_segment.run_id "
+        "WHERE run.scope_id=?",
+        (fixture.scope_id,),
+    ).fetchone()[0] == 0
+    video = db.execute(
+        "SELECT youtube_channel_id, channel_display_name FROM videos WHERE id=?",
+        (fixture.video_id,),
+    ).fetchone()
+    before = AnalysisRepository(db).get_scope(fixture.scope_id)
+
+    ChannelPolicyCorrectionService(db).change(
+        ChannelPolicyChange(
+            fixture.subject_id,
+            PolicyKind.FIXED_CHANNEL,
+            ConfigurationStatus.CONFIGURED,
+            video["youtube_channel_id"],
+            video["channel_display_name"],
+            "user",
+            "bind the subject to the verified channel",
+        )
+    )
+
+    after = AnalysisRepository(db).get_scope(fixture.scope_id)
+    assert (after.status, after.stale_reason) == (
+        ScopeStatus.STALE,
+        "CHANNEL_POLICY_CHANGED",
+    )
+    assert after.generation == before.generation + 1
+
+
 def test_policy_stop_converges_every_active_state_and_requires_fresh_successor(db):
     subject_id, _ = _create_subject_policy(
         db,
@@ -948,7 +983,7 @@ def test_channel_failure_rolls_back_policy_eligibility_audit_stale_and_job_stop(
 ):
     fixture = _full_fixture(db)
     before = _state_bytes(db)
-    original_stale = AnalysisRepository.mark_scopes_using_policy_stale
+    original_stale = AnalysisRepository.mark_scope_ids_stale
 
     if failure_point == "audit":
         def fail_audit(self, event):
@@ -956,13 +991,13 @@ def test_channel_failure_rolls_back_policy_eligibility_audit_stale_and_job_stop(
 
         monkeypatch.setattr(AuditRepository, "append", fail_audit)
     else:
-        def update_then_fail(self, policy_id, reason):
-            original_stale(self, policy_id, reason)
+        def update_then_fail(self, scope_ids, reason):
+            original_stale(self, scope_ids, reason)
             raise RuntimeError("synthetic stale failure")
 
         monkeypatch.setattr(
             AnalysisRepository,
-            "mark_scopes_using_policy_stale",
+            "mark_scope_ids_stale",
             update_then_fail,
         )
 

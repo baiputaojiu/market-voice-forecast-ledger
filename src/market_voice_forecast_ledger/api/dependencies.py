@@ -25,6 +25,7 @@ from market_voice_forecast_ledger.domain.jobs import (
     JobManifest,
     ManifestUnit,
 )
+from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.repositories.jobs import JobRepository
 from market_voice_forecast_ledger.api.models import (
     JobResponse,
@@ -294,30 +295,17 @@ class PublicReadAdapter:
                 "JOB_STORED_INVALID", "stored job progress is invalid"
             ) from cause
 
-    def stale_scope_count_for_segment(self, segment_id: int) -> int:
+    def stale_scope_count_for_segment(
+        self, segment_id: int, assigned_subject_id: int | None = None
+    ) -> int:
         if type(segment_id) is not int or segment_id <= 0:
             raise DomainError("SEGMENT_ID_INVALID", "segment id is invalid")
-        row = self._conn.execute(
-            """
-            SELECT COUNT(DISTINCT scope.id)
-            FROM analysis_scopes AS scope
-            WHERE EXISTS (
-                    SELECT 1
-                    FROM analysis_runs AS run
-                    JOIN analysis_run_segments AS run_segment
-                        ON run_segment.run_id=run.id
-                    WHERE run.scope_id=scope.id
-                        AND run_segment.segment_id=?
-                )
-            """,
-            (segment_id,),
-        ).fetchone()
-        if row is None or type(row[0]) is not int or row[0] < 0:
-            raise DomainError(
-                "SPEAKER_CORRECTION_STORED_INVALID",
-                "speaker correction state is invalid",
-            )
-        return row[0]
+        scope_ids = AnalysisRepository(
+            self._conn
+        ).scope_ids_affected_by_speaker_correction(
+            segment_id, assigned_subject_id
+        )
+        return len(scope_ids)
 
 
 def _positive_int(value: object) -> int:

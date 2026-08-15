@@ -125,6 +125,13 @@ class SpeakerCorrectionService:
                         "subject assignment requires an active eligible subject",
                     )
 
+            affected_scope_ids = (
+                self._analysis.scope_ids_affected_by_speaker_correction(
+                    command.segment_id,
+                    command.assigned_subject_id,
+                )
+            )
+
             assigned_at = self._clock()
             evidence_hash = sha256_text(
                 canonical_json(
@@ -163,8 +170,8 @@ class SpeakerCorrectionService:
                     created_at=assigned_at,
                 )
             )
-            self._analysis.mark_scopes_using_segment_stale(
-                command.segment_id, "SPEAKER_ASSIGNMENT_CHANGED"
+            self._analysis.mark_scope_ids_stale(
+                affected_scope_ids, "SPEAKER_ASSIGNMENT_CHANGED"
             )
         return after
 
@@ -242,6 +249,10 @@ class ChannelPolicyCorrectionService:
                     "CHANNEL_POLICY_NO_CHANGE",
                     "channel policy correction must change current metadata",
                 )
+
+            affected_scope_ids = self._analysis.scope_ids_for_subject(
+                command.subject_id
+            )
 
             changed_at = self._clock()
             after = self._sources.replace_policy(
@@ -341,8 +352,8 @@ class ChannelPolicyCorrectionService:
                     self._job_state.request_stop_in_transaction(job_id)
 
             if before.policy_hash != after.policy_hash:
-                self._analysis.mark_scopes_using_policy_stale(
-                    before.id, "CHANNEL_POLICY_CHANGED"
+                self._analysis.mark_scope_ids_stale(
+                    affected_scope_ids, "CHANNEL_POLICY_CHANGED"
                 )
         return after
 

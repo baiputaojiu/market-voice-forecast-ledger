@@ -10,12 +10,19 @@ from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     AssignmentOrigin,
+    ConfigurationStatus,
+    DiscoveryMethod,
+    PolicyKind,
     ScopeStatus,
+    SubjectKind,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.domain.sources import ChannelPolicy
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.repositories.audit import AuditRepository
 from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
+from market_voice_forecast_ledger.repositories.sources import SourceRepository
+from market_voice_forecast_ledger.services.channel_policy import ChannelPolicyService
 from market_voice_forecast_ledger.services.corrections import (
     SpeakerCorrection,
     SpeakerCorrectionService,
@@ -23,6 +30,10 @@ from market_voice_forecast_ledger.services.corrections import (
 from market_voice_forecast_ledger.services.current_results import CurrentResultService
 from tests.backend.e2e.synthetic_fixture import (
     create_speaker_correction_fixture,
+)
+from tests.backend.integration.test_analysis_input_boundaries import (
+    _begin,
+    _prepare_personal_analysis,
 )
 
 
@@ -69,6 +80,53 @@ def _assignment_row(db, segment_id):
             "SELECT * FROM speaker_assignments WHERE segment_id=?", (segment_id,)
         ).fetchone()
     )
+
+
+def _insert_frozen_same_video_scope(
+    db, *, subject_id, cutoff_day, run_segment, segment_id
+):
+    scope_id = db.execute(
+        """
+        INSERT INTO analysis_scopes(
+            subject_id, cutoff_day_jst, cutoff_exclusive_utc,
+            status, stale_reason
+        ) VALUES (?, ?, '2026-08-14T15:00:00.000000Z', 'current', NULL)
+        """,
+        (subject_id, cutoff_day),
+    ).lastrowid
+    run_id = db.execute(
+        """
+        INSERT INTO analysis_runs(
+            scope_id, model, reasoning_effort, prompt_version, schema_version,
+            information_boundary_version, input_hash, input_contract_hash,
+            started_at
+        ) VALUES (?, 'gpt-5.6-sol', 'max', 'm2-core-prompt-contract-v1',
+                  'm2-analysis-output-v1', 'stored-statements-only-v1',
+                  'same-video-input', 'same-video-contract', ?)
+        """,
+        (scope_id, run_segment["assignment_updated_at"]),
+    ).lastrowid
+    db.execute(
+        """
+        INSERT INTO analysis_run_segments(
+            run_id, segment_id, ordinal, video_id, published_at, policy_id,
+            policy_hash, assignment_kind, assigned_subject_id,
+            assignment_updated_at, assignment_evidence_hash
+        ) VALUES (?, ?, 1, ?, ?, ?, ?, 'subject', ?, ?,
+                  'historical-same-video-assignment')
+        """,
+        (
+            run_id,
+            segment_id,
+            run_segment["video_id"],
+            run_segment["published_at"],
+            run_segment["policy_id"],
+            run_segment["policy_hash"],
+            subject_id,
+            run_segment["assignment_updated_at"],
+        ),
+    )
+    return scope_id
 
 
 def test_speaker_subject_to_hold_is_audited_stale_and_non_destructive(db):
@@ -152,6 +210,12 @@ def test_speaker_subject_to_hold_is_audited_stale_and_non_destructive(db):
 )
 def test_interviewer_or_hold_can_be_corrected_to_valid_subject(db, initial_kind):
     fixture = create_speaker_correction_fixture(db, initial_kind)
+    assert db.execute(
+        "SELECT COUNT(*) FROM analysis_run_segments AS run_segment "
+        "JOIN analysis_runs AS run ON run.id=run_segment.run_id "
+        "WHERE run.scope_id=?",
+        (fixture.scope_id,),
+    ).fetchone()[0] == 0
 
     result = SpeakerCorrectionService(db).correct(
         SpeakerCorrection(
@@ -166,6 +230,146 @@ def test_interviewer_or_hold_can_be_corrected_to_valid_subject(db, initial_kind)
     assert result.assignment_kind is AssignmentKind.SUBJECT
     assert result.assigned_subject_id == fixture.subject_id
     assert result.assignment_origin is AssignmentOrigin.MANUAL
+    scope = AnalysisRepository(db).get_scope(fixture.scope_id)
+    assert (scope.status, scope.stale_reason) == (
+        ScopeStatus.STALE,
+        "SPEAKER_ASSIGNMENT_CHANGED",
+    )
+    assert scope.generation == 2
+
+
+def test_interviewer_context_correction_stales_scope_using_subject_from_same_video(db):
+    prepared = _prepare_personal_analysis(db)
+    run = _begin(db, prepared)
+    interviewer = db.execute(
+        """
+        SELECT assignment.segment_id
+        FROM speaker_assignments AS assignment
+        JOIN transcript_segments AS segment ON segment.id=assignment.segment_id
+        JOIN analysis_run_segments AS run_segment
+            ON run_segment.video_id=segment.video_id
+        WHERE run_segment.run_id=?
+            AND assignment.assignment_kind='interviewer'
+        LIMIT 1
+        """,
+        (run.id,),
+    ).fetchone()
+    assert interviewer is not None
+    assert db.execute(
+        "SELECT 1 FROM analysis_run_segments WHERE run_id=? AND segment_id=?",
+        (run.id, interviewer["segment_id"]),
+    ).fetchone() is None
+
+    SpeakerCorrectionService(db).correct(
+        SpeakerCorrection(
+            interviewer["segment_id"],
+            AssignmentKind.HOLD,
+            None,
+            "user",
+            "interviewer context changed for the source video",
+        )
+    )
+
+    scope = AnalysisRepository(db).get_scope(run.scope_id)
+    assert (scope.status, scope.stale_reason) == (
+        ScopeStatus.STALE,
+        "SPEAKER_ASSIGNMENT_CHANGED",
+    )
+    assert scope.generation == 2
+
+
+def test_subject_reassignment_stales_old_same_video_and_new_subject_scopes_once(db):
+    prepared = _prepare_personal_analysis(db)
+    run = _begin(db, prepared)
+    corrected_segment_id = prepared.expected_segment_ids[0]
+    run_segment = db.execute(
+        "SELECT * FROM analysis_run_segments WHERE run_id=? AND segment_id=?",
+        (run.id, corrected_segment_id),
+    ).fetchone()
+    assert run_segment is not None
+    same_video_segment_id = db.execute(
+        """
+        SELECT segment.id
+        FROM transcript_segments AS segment
+        WHERE segment.video_id=? AND segment.id!=?
+        ORDER BY segment.id DESC
+        LIMIT 1
+        """,
+        (run_segment["video_id"], corrected_segment_id),
+    ).fetchone()[0]
+    same_video_scope_id = _insert_frozen_same_video_scope(
+        db,
+        subject_id=prepared.subject_id,
+        cutoff_day="2026-08-13",
+        run_segment=run_segment,
+        segment_id=same_video_segment_id,
+    )
+
+    sources = SourceRepository(db)
+    new_subject_id = sources.create_subject(
+        "Synthetic reassignment target", SubjectKind.PERSON
+    )
+    sources.create_policy(
+        new_subject_id,
+        ChannelPolicy(
+            policy_kind=PolicyKind.ALL_CHANNELS,
+            configuration_status=ConfigurationStatus.CONFIGURED,
+        ),
+    )
+    ChannelPolicyService(db).evaluate(
+        new_subject_id,
+        run_segment["video_id"],
+        DiscoveryMethod.MANUAL_URL,
+    )
+    new_subject_scope_id = db.execute(
+        """
+        INSERT INTO analysis_scopes(
+            subject_id, cutoff_day_jst, cutoff_exclusive_utc,
+            status, stale_reason
+        ) VALUES (?, '2026-08-14', '2026-08-14T15:00:00.000000Z',
+                  'current', NULL)
+        """,
+        (new_subject_id,),
+    ).lastrowid
+
+    SpeakerCorrectionService(db).correct(
+        SpeakerCorrection(
+            corrected_segment_id,
+            AssignmentKind.SUBJECT,
+            new_subject_id,
+            "user",
+            "move the segment to the verified subject",
+        )
+    )
+
+    scopes = {
+        scope_id: AnalysisRepository(db).get_scope(scope_id)
+        for scope_id in (run.scope_id, same_video_scope_id, new_subject_scope_id)
+    }
+    assert {
+        scope_id: (scope.status, scope.stale_reason)
+        for scope_id, scope in scopes.items()
+    } == {
+        run.scope_id: (
+            ScopeStatus.STALE,
+            "SPEAKER_ASSIGNMENT_CHANGED",
+        ),
+        same_video_scope_id: (
+            ScopeStatus.STALE,
+            "SPEAKER_ASSIGNMENT_CHANGED",
+        ),
+        new_subject_scope_id: (
+            ScopeStatus.STALE,
+            "SPEAKER_ASSIGNMENT_CHANGED",
+        ),
+    }
+    assert {
+        scope_id: scope.generation for scope_id, scope in scopes.items()
+    } == {
+        run.scope_id: 2,
+        same_video_scope_id: 1,
+        new_subject_scope_id: 1,
+    }
 
 
 def test_speaker_correction_command_is_frozen_and_slotted(db):
@@ -380,7 +584,7 @@ def test_speaker_failure_rolls_back_assignment_audit_and_stale(
     fixture = create_speaker_correction_fixture(db)
     before_assignment = _assignment_row(db, fixture.segment_id)
     before_audit_count = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
-    original_stale = AnalysisRepository.mark_scopes_using_segment_stale
+    original_stale = AnalysisRepository.mark_scope_ids_stale
 
     if failure_point == "audit":
         def fail_audit(self, event):
@@ -388,13 +592,13 @@ def test_speaker_failure_rolls_back_assignment_audit_and_stale(
 
         monkeypatch.setattr(AuditRepository, "append", fail_audit)
     else:
-        def update_then_fail(self, segment_id, reason):
-            original_stale(self, segment_id, reason)
+        def update_then_fail(self, scope_ids, reason):
+            original_stale(self, scope_ids, reason)
             raise RuntimeError("synthetic stale failure")
 
         monkeypatch.setattr(
             AnalysisRepository,
-            "mark_scopes_using_segment_stale",
+            "mark_scope_ids_stale",
             update_then_fail,
         )
 
