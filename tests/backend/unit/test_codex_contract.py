@@ -116,6 +116,24 @@ def _valid_receipt() -> CodexRunReceipt:
             "CODEX_TOOL_CALL_DETECTED",
         ),
         (
+            CodexRunReceipt(
+                "gpt-5.6-sol", "max", False, "stored_statements_only"
+            ),
+            "CODEX_TOOL_CALL_DETECTED",
+        ),
+        (
+            CodexRunReceipt(
+                "gpt-5.6-sol", "max", 0.0, "stored_statements_only"
+            ),
+            "CODEX_TOOL_CALL_DETECTED",
+        ),
+        (
+            CodexRunReceipt(
+                "gpt-5.6-sol", "max", "0", "stored_statements_only"
+            ),
+            "CODEX_TOOL_CALL_DETECTED",
+        ),
+        (
             CodexRunReceipt("gpt-5.6-sol", "max", 0, "augmented"),
             "CODEX_BOUNDARY_MISMATCH",
         ),
@@ -152,6 +170,28 @@ def test_invalid_receipt_fails_the_running_batch_without_storing_output(
         (started_run.id,),
     ).fetchone()
     assert tuple(failure) == ("failed", code)
+
+
+def test_exact_integer_zero_receipt_is_accepted(
+    db, started_run, valid_output_json
+):
+    receipt = CodexRunReceipt(
+        "gpt-5.6-sol", "max", 0, "stored_statements_only"
+    )
+
+    stored = CodexContractService(db).validate_and_store(
+        started_run.id,
+        started_run.running_codex_unit_key,
+        valid_output_json,
+        receipt,
+    )
+
+    assert type(stored.receipt.tool_call_count) is int
+    assert stored.receipt.tool_call_count == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM analysis_run_outputs WHERE run_id=?",
+        (started_run.id,),
+    ).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize(

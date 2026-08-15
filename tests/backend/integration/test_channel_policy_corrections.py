@@ -1009,3 +1009,25 @@ def test_channel_failure_rolls_back_policy_eligibility_audit_stale_and_job_stop(
         AnalysisRepository(db).get_scope(fixture.scope_id).status
         is ScopeStatus.CURRENT
     )
+
+
+def test_private_transcript_reason_rolls_back_entire_channel_correction(db):
+    fixture = _full_fixture(db)
+    before = _state_bytes(db)
+    command = _change_to_b(fixture)
+
+    with pytest.raises(DomainError) as error:
+        ChannelPolicyCorrectionService(db).change(
+            ChannelPolicyChange(
+                command.subject_id,
+                command.policy_kind,
+                command.configuration_status,
+                command.youtube_channel_id,
+                command.channel_display_name,
+                command.actor,
+                "Private channel transcript body must remain immutable.",
+            )
+        )
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert _state_bytes(db) == before

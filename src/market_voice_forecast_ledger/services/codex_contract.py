@@ -248,7 +248,7 @@ class CodexContractService:
                 "CODEX_REASONING_MISMATCH",
                 "Codex reasoning effort does not match the contract",
             )
-        if receipt.tool_call_count != 0:
+        if type(receipt.tool_call_count) is not int or receipt.tool_call_count != 0:
             raise DomainError(
                 "CODEX_TOOL_CALL_DETECTED",
                 "Codex output used a prohibited external tool",

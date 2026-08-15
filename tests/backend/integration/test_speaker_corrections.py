@@ -205,6 +205,29 @@ def test_speaker_subject_to_hold_is_audited_stale_and_non_destructive(db):
         assert forbidden not in serialized
 
 
+def test_private_transcript_reason_rolls_back_speaker_assignment_stale_and_audit(db):
+    fixture = create_speaker_correction_fixture(db)
+    before_assignment = _assignment_row(db, fixture.segment_id)
+    before_scope = AnalysisRepository(db).get_scope(fixture.scope_id)
+    audit_before = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+
+    with pytest.raises(DomainError) as error:
+        SpeakerCorrectionService(db).correct(
+            SpeakerCorrection(
+                fixture.segment_id,
+                AssignmentKind.HOLD,
+                None,
+                "user",
+                PRIVATE_TRANSCRIPT,
+            )
+        )
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert _assignment_row(db, fixture.segment_id) == before_assignment
+    assert AnalysisRepository(db).get_scope(fixture.scope_id) == before_scope
+    assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == audit_before
+
+
 @pytest.mark.parametrize(
     "initial_kind", [AssignmentKind.INTERVIEWER, AssignmentKind.HOLD]
 )

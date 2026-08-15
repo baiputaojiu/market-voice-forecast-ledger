@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 
 from market_voice_forecast_ledger.domain.common import canonical_json, utc_iso
 from market_voice_forecast_ledger.domain.errors import DomainError
-from market_voice_forecast_ledger.services.audit import validate_audit_payload
+from market_voice_forecast_ledger.services.audit import (
+    validate_audit_payload,
+    validate_audit_reason,
+    validate_audit_scalars,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +66,21 @@ class AuditRepository:
                 "AUDIT_TRANSACTION_REQUIRED",
                 "audit append requires an active caller transaction",
             )
+        if type(event) is not AuditEventInput:
+            raise DomainError(
+                "AUDIT_SCALAR_INVALID",
+                "audit metadata has an invalid scalar shape",
+            )
+        validate_audit_scalars(
+            entity_type=event.entity_type,
+            entity_id=event.entity_id,
+            scope_id=event.scope_id,
+            operation=event.operation,
+            actor_kind=event.actor_kind,
+            reason_code=event.reason_code,
+            created_at=event.created_at,
+        )
+        validate_audit_reason(self._conn, event.reason_text)
         validate_audit_payload(event.before)
         validate_audit_payload(event.after)
         cursor = self._conn.execute(

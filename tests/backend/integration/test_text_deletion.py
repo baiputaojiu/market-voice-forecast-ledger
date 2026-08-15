@@ -6,11 +6,15 @@ from pathlib import Path
 import pytest
 
 from market_voice_forecast_ledger.config import Settings
-from market_voice_forecast_ledger.db.connection import open_database
+from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.enums import HeatmapGranularity
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
+from market_voice_forecast_ledger.repositories.audit import (
+    AuditEventInput,
+    AuditRepository,
+)
 from market_voice_forecast_ledger.repositories.retention import RetentionRepository
 from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
 from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
@@ -134,6 +138,39 @@ def test_preview_is_nonmutating_and_delete_preserves_public_history(db, tmp_path
     assert fixture.settings.temp_audio_dir.as_posix() not in serialized_audit
     assert fixture.source_body not in repr(preview)
     assert fixture.source_body not in repr(result)
+
+
+def test_deleted_private_body_hash_still_blocks_audit_reason(db, tmp_path):
+    fixture = create_retained_forecast_fixture(db, tmp_path)
+    service = RetentionService(db, fixture.settings, clock=lambda: NOW)
+    command = DeleteTextCommand(cutoff=NOW)
+    preview = service.preview_text_deletion(command)
+    service.delete_text(
+        DeleteTextCommand(cutoff=NOW, preview_token=preview.token)
+    )
+    assert SpeakerRepository(db).get_segment(fixture.segment_id).text_body is None
+
+    event = AuditEventInput(
+        entity_type="synthetic_entity",
+        entity_id="deleted-private-reason",
+        scope_id=fixture.scope_id,
+        operation="review",
+        actor_kind="user",
+        reason_code="synthetic_test",
+        reason_text=fixture.source_body,
+        before=None,
+        after={"safe": True},
+        created_at=NOW,
+    )
+    audit_before = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+
+    with pytest.raises(DomainError) as error:
+        with transaction(db):
+            AuditRepository(db).append(event)
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert fixture.source_body not in error.value.message
+    assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == audit_before
 
 
 def test_delete_requires_the_exact_current_preview_token(db, tmp_path):

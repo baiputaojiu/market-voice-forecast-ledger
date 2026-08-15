@@ -369,6 +369,42 @@ def test_review_and_safe_audit_event_commit_together(db, unknown_period):
     assert "path" not in serialized
 
 
+def test_private_transcript_reason_rolls_back_period_review_and_audit(
+    db, unknown_period
+):
+    private_body = db.execute(
+        """
+        SELECT segment.text_body
+        FROM analysis_statement_periods AS period
+        JOIN analysis_statement_evidence_links AS evidence
+            ON evidence.statement_id=period.statement_id
+        JOIN analysis_run_segments AS run_segment
+            ON run_segment.id=evidence.run_segment_id
+        JOIN transcript_segments AS segment
+            ON segment.id=run_segment.segment_id
+        WHERE period.id=?
+        ORDER BY evidence.ordinal
+        LIMIT 1
+        """,
+        (unknown_period.id,),
+    ).fetchone()[0]
+    assert private_body is not None
+
+    with pytest.raises(DomainError) as error:
+        PeriodReviewService(db).review(
+            unknown_period.id,
+            PeriodReviewDecision.REJECT,
+            "user",
+            private_body,
+        )
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert db.execute("SELECT COUNT(*) FROM period_reviews").fetchone()[0] == 0
+    assert AuditRepository(db).list_for_entity(
+        "analysis_statement_period", str(unknown_period.id)
+    ) == ()
+
+
 def test_audit_insert_failure_rolls_back_period_review(db, unknown_period):
     db.execute(
         """

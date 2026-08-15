@@ -138,6 +138,52 @@ def test_mapping_review_uses_atomic_review_application_service(
         conn.close()
 
 
+def test_mapping_review_api_rejects_private_transcript_reason_atomically(
+    client: TestClient, settings: Settings
+):
+    label = "api-private-reason"
+    private_body = (
+        f"{label} Synthetic projection evidence. "
+        "Private synthetic low-mapping continuation."
+    )
+    conn = open_database(settings.database_path)
+    try:
+        prepared, _, scope_id = create_accepted_low_mapping_fixture(conn, label)
+        mapping_id = prepared.mapping_ids[0]
+        current_before = tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM current_result_sets WHERE scope_id=?", (scope_id,)
+            )
+        )
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/mappings/{mapping_id}/reviews",
+        json={"decision": "approve", "reason": private_body},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "AUDIT_REASON_PRIVATE"}
+    assert private_body not in response.text
+    conn = open_database(settings.database_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM mapping_reviews").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_events "
+            "WHERE entity_type='analysis_asset_mapping'"
+        ).fetchone()[0] == 0
+        assert tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM current_result_sets WHERE scope_id=?", (scope_id,)
+            )
+        ) == current_before
+    finally:
+        conn.close()
+
+
 def test_period_review_uses_atomic_review_application_service(
     client: TestClient, settings: Settings
 ):

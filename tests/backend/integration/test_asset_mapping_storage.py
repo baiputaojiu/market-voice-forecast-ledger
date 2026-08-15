@@ -666,9 +666,7 @@ def test_mapping_rows_reject_raw_update_delete_and_replace(db):
             "DELETE FROM analysis_asset_mappings WHERE id=?",
             (mapping_id,),
         )
-    with pytest.raises(
-        sqlite3.IntegrityError, match="ASSET_MAPPING_UNIT_NOT_RUNNING"
-    ):
+    with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
         db.execute(
             """
             INSERT OR REPLACE INTO analysis_asset_mappings(

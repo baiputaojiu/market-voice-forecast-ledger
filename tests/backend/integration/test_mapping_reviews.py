@@ -416,6 +416,61 @@ def test_review_and_safe_audit_event_commit_together(db, low_mapping):
         assert forbidden not in serialized
 
 
+def test_private_transcript_reason_rolls_back_mapping_review_and_audit(
+    db, low_mapping
+):
+    private_body = db.execute(
+        """
+        SELECT segment.text_body
+        FROM analysis_asset_mappings AS mapping
+        JOIN analysis_statements AS statement ON statement.id=mapping.statement_id
+        JOIN analysis_statement_evidence_links AS evidence
+            ON evidence.statement_id=statement.id
+        JOIN analysis_run_segments AS run_segment
+            ON run_segment.id=evidence.run_segment_id
+        JOIN transcript_segments AS segment
+            ON segment.id=run_segment.segment_id
+        WHERE mapping.id=?
+        ORDER BY evidence.ordinal
+        LIMIT 1
+        """,
+        (low_mapping.id,),
+    ).fetchone()[0]
+    assert private_body is not None
+
+    with pytest.raises(DomainError) as error:
+        _service(db).review(
+            _command(
+                low_mapping.id,
+                MappingReviewDecision.APPROVE,
+                reason=private_body,
+            )
+        )
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert db.execute("SELECT COUNT(*) FROM mapping_reviews").fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM audit_events WHERE entity_type='analysis_asset_mapping'"
+    ).fetchone()[0] == 0
+
+
+def test_oversized_direct_service_reason_rolls_back_mapping_review(db, low_mapping):
+    with pytest.raises(DomainError) as error:
+        _service(db).review(
+            _command(
+                low_mapping.id,
+                MappingReviewDecision.APPROVE,
+                reason="合" * 7_200,
+            )
+        )
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert db.execute("SELECT COUNT(*) FROM mapping_reviews").fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM audit_events WHERE entity_type='analysis_asset_mapping'"
+    ).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("failure_target", ["review", "audit"])
 def test_review_or_audit_insert_failure_rolls_back_both_rows(
     db, low_mapping, failure_target

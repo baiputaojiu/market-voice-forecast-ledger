@@ -1180,7 +1180,7 @@ def test_projection_tables_are_append_only_and_cross_run_links_fail(db):
                 stable_selection_key, heatmap_eligible, exclusion_reason
             )
             SELECT
-                ?, run_id, asset, mapping_kind,
+                ?, run_id, 'xau_usd', mapping_kind,
                 period_start, period_end, unknown_period,
                 condition_kind, condition_text, view_relation,
                 primary_direction, directions_json, confidence,
@@ -1354,7 +1354,7 @@ def test_schema_prevents_duplicate_comparison_group_in_one_batch(db):
     prepared = _prepare_upstream(db, (StatementSpec("duplicate-group", NEWER),))
     batch = _project(db, prepared)
 
-    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+    with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
         db.execute(
             """
             INSERT INTO analysis_forecasts(

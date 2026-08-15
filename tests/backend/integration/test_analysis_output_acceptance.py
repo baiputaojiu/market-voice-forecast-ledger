@@ -158,7 +158,7 @@ def test_output_row_is_one_per_run_unit_and_append_only(
         )
     with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
         db.execute("DELETE FROM analysis_run_outputs WHERE id=?", (row_id,))
-    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+    with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
         db.execute(
             """
             INSERT INTO analysis_run_outputs(
