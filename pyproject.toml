@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1.0", "pydantic>=2.10,<3.0", "uvicorn>=0.32,<1.0"]
 
 [project.optional-dependencies]
-dev = ["httpx>=0.28,<1.0", "pytest>=8.3,<10.0", "pytest-cov>=6.0,<8.0"]
+dev = ["httpx>=0.28,<1.0", "pytest>=8.3,<10.0", "pytest-cov>=6.0,<8.0", "setuptools>=75"]
 
 [tool.setuptools.package-data]
 "market_voice_forecast_ledger.db.migrations" = ["*.sql"]

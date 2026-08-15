@@ -1,6 +1,6 @@
 # 相場見通し発言台帳
 
-YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19は実装段階の最終確認中で、投資判断に利用できる完成版ではありません。
+YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19とwhole-branch監査修正はローカルで実装・検証済みで、現在はユーザー受け入れ待ちです。実YouTube・音声・Codex adapterとUIを含む完成版ではなく、投資判断には利用できません。
 
 ## 現在の状態
 
@@ -31,6 +31,10 @@ python -m venv .venv
 .venv\Scripts\python -m pip install -e ".[dev]"
 .venv\Scripts\python -m pytest tests/backend -q
 ```
+
+`.[dev]` のbootstrap後に行うwheel回帰は、package indexを無効にし、
+`--no-build-isolation --no-deps`で埋め込みmigrationを検証します。これは
+未bootstrapのfresh machineで依存packageまでoffline導入できるという主張ではありません。
 
 バックエンド全件、compileall、既存の作業状態検査、公開安全性検査、
 `git diff --check`を一度に実行する入口は次です。このscriptはrepositoryの

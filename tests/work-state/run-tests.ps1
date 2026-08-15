@@ -252,6 +252,53 @@ function Test-Scripts {
         Invoke-Git -WorkingDirectory $source -Arguments @('remote', 'add', 'origin', $remote) | Out-Null
         Invoke-Git -WorkingDirectory $source -Arguments @('push', '-u', 'origin', 'main') | Out-Null
 
+        $fixtureHead = Invoke-Git -WorkingDirectory $source -Arguments @('rev-parse', 'HEAD')
+        Invoke-Git -WorkingDirectory $source -Arguments @('branch', '--unset-upstream') | Out-Null
+
+        $noUpstreamInspect = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $source, '-Json')
+        $noUpstreamState = if ($noUpstreamInspect.ExitCode -eq 0) {
+            $noUpstreamInspect.Output | ConvertFrom-Json
+        }
+        else {
+            $null
+        }
+        Assert-True ($noUpstreamInspect.ExitCode -eq 0 -and $null -ne $noUpstreamState) 'inspect-git-state emits valid JSON without an upstream'
+        if ($null -ne $noUpstreamState) {
+            Assert-True ($noUpstreamState.branch -eq 'main') 'inspect-git-state preserves the branch without an upstream'
+            Assert-True ($noUpstreamState.head -eq $fixtureHead) 'inspect-git-state preserves HEAD without an upstream'
+            Assert-True ($null -eq $noUpstreamState.upstream -and $null -eq $noUpstreamState.ahead -and $null -eq $noUpstreamState.behind) 'inspect-git-state reports null upstream counts without an upstream'
+        }
+        Assert-True ($noUpstreamInspect.Output -notmatch '(?i)fatal|NativeCommandError') 'inspect-git-state suppresses raw expected Git errors without an upstream'
+
+        $noUpstreamVerify = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $source)
+        Assert-True ($noUpstreamVerify.ExitCode -eq 4) 'verify-remote-head returns exit 4 without an upstream'
+        Assert-True ($noUpstreamVerify.Output -match 'Current branch has no upstream\.') 'verify-remote-head reports the controlled no-upstream message'
+        Assert-True ($noUpstreamVerify.Output -notmatch '(?i)fatal|NativeCommandError') 'verify-remote-head suppresses raw expected Git errors without an upstream'
+
+        Invoke-Git -WorkingDirectory $source -Arguments @('checkout', '--detach', $fixtureHead) | Out-Null
+        $detachedInspect = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $source, '-Json')
+        $detachedState = if ($detachedInspect.ExitCode -eq 0) {
+            $detachedInspect.Output | ConvertFrom-Json
+        }
+        else {
+            $null
+        }
+        Assert-True ($detachedInspect.ExitCode -eq 0 -and $null -ne $detachedState) 'inspect-git-state emits valid JSON for detached HEAD'
+        if ($null -ne $detachedState) {
+            Assert-True ($null -eq $detachedState.branch) 'inspect-git-state reports a null branch for detached HEAD'
+            Assert-True ($detachedState.head -eq $fixtureHead) 'inspect-git-state preserves detached HEAD'
+            Assert-True ($null -eq $detachedState.upstream -and $null -eq $detachedState.ahead -and $null -eq $detachedState.behind) 'inspect-git-state reports null upstream counts for detached HEAD'
+        }
+        Assert-True ($detachedInspect.Output -notmatch '(?i)fatal|NativeCommandError') 'inspect-git-state suppresses raw expected Git errors for detached HEAD'
+
+        $detachedVerify = Invoke-ScriptProcess -ScriptPath $scriptPaths.Remote -Arguments @('-RepositoryPath', $source)
+        Assert-True ($detachedVerify.ExitCode -eq 4) 'verify-remote-head returns exit 4 for detached HEAD'
+        Assert-True ($detachedVerify.Output -match 'Current branch has no upstream\.') 'verify-remote-head reports the controlled detached-HEAD message'
+        Assert-True ($detachedVerify.Output -notmatch '(?i)fatal|NativeCommandError') 'verify-remote-head suppresses raw expected Git errors for detached HEAD'
+
+        Invoke-Git -WorkingDirectory $source -Arguments @('checkout', 'main') | Out-Null
+        Invoke-Git -WorkingDirectory $source -Arguments @('branch', '--set-upstream-to', 'origin/main', 'main') | Out-Null
+
         $cleanState = Invoke-ScriptProcess -ScriptPath $scriptPaths.Inspect -Arguments @('-RepositoryPath', $source, '-Json')
         Assert-True ($cleanState.ExitCode -eq 0) 'inspect-git-state accepts a Git repository'
         if ($cleanState.ExitCode -eq 0) {

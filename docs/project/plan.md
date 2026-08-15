@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### M2中核バックエンド: Task 19最終確認
+### M2中核バックエンド: ユーザー受け入れと次subproject選択
 
-M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2中核バックエンドは隔離branch `feature/m2-core-backend` でTask 1～18をcommit済みで、Task 19の合成E2E、子process crash回復、Windows一括検証入口も自動検証まで実装した。Task 19の初回独立reviewで受け入れた5 findingsはREDから修正し、fresh一括検証を通過した。最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）で、post-review最終検証と限定commitだけが未完了である。番号付きTaskの完了後にもwhole-branch最終監査・統合確認が別に必要で、次のsubprojectはユーザー承認前に開始しない。
+M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2中核バックエンドは隔離branch `feature/m2-core-backend` でTask 1～19、whole-branch最終監査、Fix A・B・Cの監査修正をローカル実装・検証済みである。現在の判断事項は中核バックエンドのユーザー受け入れと次subprojectの選択であり、実YouTube・音声・Codex adapter、実HTTP server、React UIは未実装・未受け入れのため、アプリ全体の完成とはしない。
 
 ## 完了済み（Completed）
 
@@ -52,19 +52,20 @@ M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M
 - M2 Task 13～16で将来予想、見解相違・変更、原子的な現在行置換、修正監査とstale化、週・月16行heatmap cacheを実装した。
 - M2 Task 17～18で保持・削除と安全な音声清掃、loopback-only FastAPIのread/write・private response境界を実装した。
 - M2 Task 19の合成4主体×4資産E2E、review・競合、SQLite crash rollback/recovery、Windows一括検証入口を実装し、自動検証を通過させた。
+- whole-branch最終監査で、scope generation競合とstale伝播をFix A、追記専用identity・audit/Codex境界をFix B、offline wheel・基盤characterization・no-upstream/detached作業状態をFix Cとして修正した。
+- Fix Cの凍結非文書treeは独立read-only reviewでAPPROVEされ、観測済みの検証結果と未検証境界をas-built文書へ反映した。
 
 ## 作業中（In Progress）
 
-- 初回独立reviewのCritical 0・Important 4・Minor 1をすべて受け入れ、各findingを実行可能なREDから順番に修正した。
-- 最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）。この状態更新後にfresh一括検証し、approved pathだけを限定commitする。
+- ローカル検証済みM2中核バックエンドのユーザー受け入れ。
+- 受け入れ後に着手する次subprojectの選択。ユーザーの明示承認前には開始しない。
 
 ## 未着手（Not Started）
 
 ### M2中核バックエンドの完了確認
 
-1. Task 19のpost-review fresh verificationと限定commitを完了する。
-2. `/root` がTasks 1～19のwhole-branch最終監査・統合確認を別工程で行う。
-3. 中核バックエンドの受け入れと次subprojectについてユーザー判断を受ける。番号付きTaskの実装だけでM2全体完了とはしない。
+1. 中核バックエンドの受け入れ可否についてユーザー判断を受ける。
+2. 次subprojectをユーザーが選択する。監査完了だけで自動的に次工程へ進めない。
 
 ### M2後続・M3以降
 

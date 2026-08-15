@@ -6,15 +6,17 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～18をcommit済みで、Task 19の合成E2E、子process crash回復、Windows一括検証入口も自動検証まで実装した。Task 19の初回独立reviewで受け入れた5 findingsはREDから修正し、fresh一括検証を通過した。最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）で、現在はpost-review最終検証と限定commit前である。番号付きTasks 1～19の後にもwhole-branch最終監査・統合確認が必要であり、M2全体の完了や次subprojectの開始はまだ承認されていない。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～19、whole-branch最終監査、Fix A・B・Cの監査修正をローカル実装・検証済みである。中核バックエンドはユーザー受け入れ待ちで、次subprojectは未承認である。実YouTube・音声・Codex adapter、実HTTP server、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
 - 実装worktree branch: `feature/m2-core-backend`
-- Task 19開始HEAD: `932a97e0cceef6f33dd4812331343e7875e9308d` (`feat: expose loopback forecast ledger api`)
-- Task 19 commit: 未作成。独立再reviewはAPPROVE済みで、post-review fresh verification後に承認済みpathだけをcommitする。
-- upstream: なし。このTaskではpush・merge・rebaseもlive remote検証も行っていない。
+- Task 19 commit: `3267968d67a70ecee0b6f68e13d241a73e7b634f` (`test: verify synthetic core backend flow`)
+- whole-branch Fix A: `9ba560c4db1a795479d831198f04cc3aa5b496f4` (`fix: prevent superseded analysis promotion`)
+- whole-branch Fix B: `55ccd07c680bbdaa0e532194305f776e04102f0f` (`fix: harden append-only audit boundaries`)
+- whole-branch Fix C: この文書を含むcommit (`test: finalize core backend verification`)。SHAは本文へ固定せずGitから取得する。
+- upstream: なし。Fix A・B・Cではpush・merge・rebaseもlive remote検証も行っていない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
 - 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
@@ -74,11 +76,13 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - M2 Task 13～16で予想と見解相違・変更、原子的な現在行、修正監査・stale化、週・月heatmapを実装した。
 - M2 Task 17～18で保持・削除・安全な音声清掃とloopback-only FastAPI境界を実装した。
 - M2 Task 19で完全合成の4主体×4資産E2E、公開review経路、crash rollback/recovery、一括検証scriptを実装した。成功状態はrepository/serviceと実際の`promote_completed_run`だけで構築し、非active negative controlの作成に限ってtest helperのparameterized SQLを1回使用する。
+- whole-branch Fix Aでscope generation、superseded run promotion拒否、話者・channel修正の完全なstale伝播を追加した。
+- whole-branch Fix Bでmigration 0017、追記専用logical identityのplain-connection collision guard、audit reason/private-data境界、Codex tool-call件数の厳密な整数型検査を追加した。
+- whole-branch Fix Cでno-upstream・detached HEADの作業状態script、Task 1/5の永続characterization、18 migrationのoffline wheel回帰、as-built文書を追加・修正した。
 
 ## 作業中（In Progress）
 
-- Task 19の初回独立read-only reviewはREQUEST_CHANGES（Critical 0、Important 4、Minor 1）。第2構築SQL、短い根拠proof、privacy sentinel、Python選択、固定clockの全5件を受け入れ、順次REDから修正した。
-- 最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）。この状態更新後にfresh一括検証し、承認済みpathだけを限定commitする。
+- ローカル検証済みM2中核バックエンドのユーザー受け入れと、次subprojectの選択。
 - 実YouTube、実音声、実Codex/model/tool、実server/socket、UIの統合検証は行っていない。
 
 ## 未着手（Not Started）
@@ -87,7 +91,7 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
 - MVPで固定する音声モデル名・バージョン、具体的な生スコア尺度・閾値値、閾値設定バージョンの初期値、保留話者の手動レビュー手順。
-- Tasks 1～19のwhole-branch最終監査・統合確認とユーザー受け入れ。
+- M2中核バックエンドのユーザー受け入れ。
 - 次subproject。候補は収集・音声・Codex adapter・UI・常駐workerで、ユーザーの明示承認までは着手しない。
 
 ## 検証結果（Verification Results）
@@ -114,6 +118,12 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - 合成E2Eは2 passed、crash回復とWindows検証入口のintegration moduleは5 passed、Task 18のAPI/private境界focused suiteは74 passed、E2Eとfixture移行対象4 moduleの合計は97 passedだった。
 - `scripts/test-backend.ps1` はexit 0で、backend全件、`compileall`、work-state 119 passed・0 failed、状態文書検査、working-tree公開安全性、`git diff --check`を順番に完走した。
 - Task 19の初回独立reviewはCritical 0・Important 4・Minor 1で、全findingを実行可能なREDから修正した。最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）。実際の外部call、server/socket、repository内runtime artifactは発生していない。
+- whole-branch Fix Aはbackend 782 passed・1 capability skip、work-state 119 passed・0 failedで、独立rereviewはCritical 0・Important 0・Minor 0だった。
+- whole-branch Fix Bはbackend 889件を収集し、888 passed・1 capability skip、work-state 119 passed・0 failedだった。独立最終rereviewはCritical 0・Important 0・Minor 0だった。
+- as-built migration manifestは18ファイル: `0001_foundation`, `0002_audit`, `0003_sources`, `0004_speakers`, `0005_jobs`, `0006_analysis_runs`, `0007_analysis_outputs`, `0008_statements`, `0009_periods`, `0010_asset_mappings`, `0011_mapping_reviews`, `0012_forecast_projections`, `0013_current_results`, `0013_video_pipeline_bindings`, `0014_heatmap`, `0015_retention`, `0016_scope_generations`, `0017_append_only_guards`。
+- whole-branch Fix Cはbackend 898件を収集し、897 passed・1 capability skipだった。skipは既存のWindows symlink作成権限向けtestだけで、既存のStarlette TestClient deprecation warning以外のwarningはなかった。基盤・話者focusedは22 passed、work-state Allは135 passed・0 failed、compileall、working-tree公開安全166ファイル、`git diff --check`が成功した。
+- Fix Cのwheel回帰はdev bootstrap後、`PIP_NO_INDEX=1`、`PIP_DISABLE_PIP_VERSION_CHECK=1`、`--no-build-isolation --no-deps`で成功し、18 migrationのarchive名・適用順・ledger順、Task 2 audit列・trigger・raw UPDATE/DELETEの`APPEND_ONLY`をwheel-only childで確認した。fresh machineの未bootstrap offline installは検証していない。
+- Fix Cの凍結非文書treeに対する独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）で、PowerShell 5.1と7.6のno-upstream動作も独立確認された。
 
 ### ユーザー報告のスモールテスト結果
 
@@ -147,9 +157,8 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. Task 19のpost-review fresh verificationと限定commitを完了する。
-2. `/root` がTasks 1～19のwhole-branch最終監査・統合確認を別工程で行う。
-3. 中核バックエンドの受け入れと次subprojectについてユーザー判断を受ける。次工程は自動承認しない。
+1. 中核バックエンドの受け入れ可否についてユーザー判断を受ける。
+2. 受け入れ後に着手する次subprojectをユーザーが選択する。次工程は自動承認しない。
 
 ## 重要ファイル（Important Files）
 

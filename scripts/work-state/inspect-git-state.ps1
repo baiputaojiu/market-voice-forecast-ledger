@@ -9,9 +9,17 @@ $ErrorActionPreference = 'Stop'
 function Invoke-GitCapture {
     param([string[]]$Arguments)
 
-    $output = & git -C $RepositoryPath @Arguments 2>&1 | Out-String
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & git -C $RepositoryPath @Arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
     [PSCustomObject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $exitCode
         Output = $output.Trim()
     }
 }

@@ -2472,3 +2472,99 @@ git commit -m "test: verify synthetic core backend flow"
 - API responses exclude private body/path fields, state changes use POST, and server host validation accepts only `127.0.0.1` while documenting the absence of authentication.
 - Synthetic E2E produces 16 subject/asset rows, reviewed unknown and disagreement states, independent repost evidence, and empty XAU/USD when no evidence exists.
 - `scripts/test-backend.ps1`, `git diff --check`, state-document checks, and public-safety checks all pass before M2中核バックエンド完了を報告する。
+
+---
+
+## 2026-08-16 JST as-built addendum
+
+この節は実装・whole-branch監査後の実ファイルと検証境界を記録する。上の
+Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistorical plan
+として書き換えずに残す。実装済みという意味でcheckboxを事後更新せず、現在の
+受け入れ状態は `docs/project/status.md` を正本とする。
+
+### 実装と最終hardening
+
+- Task 1～19は隔離branch `feature/m2-core-backend` へローカル実装された。
+  Task 19 commitは `3267968d67a70ecee0b6f68e13d241a73e7b634f`
+  (`test: verify synthetic core backend flow`) である。
+- whole-branch Fix Aはscope generationを追加し、新しいrun開始後のsuperseded
+  promotionを拒否し、話者・channel policy修正のstale伝播を完全化した。
+- Fix Bはmigration 0017で追記専用tableのprimary・logical identity collisionを
+  plain connectionでも拒否し、audit reason/private-data境界とCodex receiptの
+  tool-call件数型を厳密化した。
+- Fix CはTask 1 foundationとTask 5 file-DB persistenceのcharacterization、
+  18 migrationのoffline wheel回帰、no-upstream・detached HEADの作業状態script、
+  as-built文書を追加・修正した。characterization testは既存挙動を記録するため
+  immediate GREENであり、REDを捏造していない。
+
+### As-built migration manifest
+
+実際のpackage内SQLは次の18ファイルで、この順に適用される。Task 14とTask 15の
+間にはreviewで追加された別目的のduplicate `0013` が存在する。
+
+1. `0001_foundation`
+2. `0002_audit`
+3. `0003_sources`
+4. `0004_speakers`
+5. `0005_jobs`
+6. `0006_analysis_runs`
+7. `0007_analysis_outputs`
+8. `0008_statements`
+9. `0009_periods`
+10. `0010_asset_mappings`
+11. `0011_mapping_reviews`
+12. `0012_forecast_projections`
+13. `0013_current_results`
+14. `0013_video_pipeline_bindings`
+15. `0014_heatmap`
+16. `0015_retention`
+17. `0016_scope_generations`
+18. `0017_append_only_guards`
+
+`0013_video_pipeline_bindings` はpolicy修正後に新しい動画作業を安全に停止するため、
+`0016_scope_generations` はrun開始とcurrent promotionの競合を閉じるため、
+`0017_append_only_guards` は `INSERT OR REPLACE` 型collisionを追記専用境界で
+拒否するために追加された。既に適用済みmigrationを書き換えず、cumulative SQLを
+追加する方針を維持した。
+
+### Review-driven path deviations
+
+- Task 2ではcumulative migrationを保つため、Task 1の
+  `tests/backend/integration/test_database_foundation.py` をmigration総数へ固定しない
+  assertionへ変更した。
+- Task 15では動画jobとeligibilityの永続bindingが必要になり、計画外だった
+  `0013_video_pipeline_bindings.sql` とjob repository/service、focused binding testを
+  承認済みscopeへ追加した。
+- Task 19ではTask 18から持ち越したtest fixture ownershipを解消するため、
+  `test_api_writes.py`, `test_review_application.py`, `test_speaker_corrections.py`,
+  `test_text_deletion.py` を承認済みscopeへ追加した。inactive negative controlだけは
+  rowcountを検査するparameterized SQLを1回使用し、成功pipelineをraw SQLで構築して
+  いない。
+- Fix Aでは新subject IDを同じaffected-scope queryへ渡すため、計画外だった
+  `src/market_voice_forecast_ledger/api/routes/corrections.py` を承認後に追加した。
+- Fix Cのtracked scopeはbriefどおり `pyproject.toml`、foundation/speaker test、
+  2つのwork-state helper、work-state test、README、project status/plan、このplanの
+  10ファイルで、追加のpath deviationはない。
+
+完全なtask別rulingとreview roundは、Git-ignoredの
+`.superpowers/sdd/2026-08-14-core-data-model/progress.md` と各reportに残す。
+
+### 実測した最終境界
+
+- Fix C treeではbackend 898件を収集し、897 passed、1 skippedだった。skipは
+  Windowsでsymlinkを作成できない場合の既存capability testだけである。
+- foundation/speaker focusedは22 passed、work-state Allは135 passed・0 failed。
+  compileall、working-tree公開安全166ファイル、`git diff --check`も成功した。
+- dev dependency bootstrap後のwheel回帰は `PIP_NO_INDEX=1` と
+  `PIP_DISABLE_PIP_VERSION_CHECK=1` を設定し、
+  `pip wheel . --no-build-isolation --no-deps` で作成したwheelだけから全18 migration、
+  ledger順、Task 2 audit列・trigger、raw UPDATE/DELETEの `APPEND_ONLY` を検証した。
+  fresh machineでbootstrap dependencyまでoffline導入できることは検証していない。
+- Fix A・BとFix Cの凍結非文書treeは独立read-only rereviewでCritical 0、
+  Important 0、Minor 0となった。
+- 実YouTube検索・音声・全文文字起こし、実Codex/model/tool call、実HTTP
+  server/socket、React UI、電源断・disk failure、live remote、push・merge・rebaseは
+  この最終検証で実行していない。process crashは合成temporary DBとtest-only childで
+  検証した範囲だけを主張する。
+- M2中核バックエンドはローカル実装・検証済みだが、ユーザー受け入れ前である。
+  次subprojectとアプリ全体の完成は別の明示承認を必要とする。

@@ -96,34 +96,47 @@ def test_transcript_round_trips_hash_and_fixed_utc_metadata(db):
     assert segment.expires_at == FIXED_UTC + timedelta(days=365)
 
 
-def test_personal_assignment_persists_raw_score_model_contract_and_evidence(db):
-    subject_id, segment_id = _personal_segment(db)
-
-    assignment = SpeakerAssignmentService(db).record_personal(
-        PersonalAssignmentCommand(
-            segment_id=segment_id,
-            subject_id=subject_id,
-            raw_match_score=1.73,
-            model_name="synthetic-fixed-model",
-            model_version="1.0",
-            threshold_config_version="synthetic-threshold-v1",
-            evidence_hash="synthetic-personal-evidence-hash",
-            assigned_at=FIXED_UTC,
+def test_personal_assignment_persists_raw_score_model_contract_and_evidence(tmp_path):
+    database_path = tmp_path / "ledger.sqlite3"
+    writer = open_database(database_path)
+    try:
+        apply_migrations(writer)
+        subject_id, segment_id = _personal_segment(writer)
+        SpeakerAssignmentService(writer).record_personal(
+            PersonalAssignmentCommand(
+                segment_id=segment_id,
+                subject_id=subject_id,
+                raw_match_score=1.73,
+                model_name="synthetic-fixed-model",
+                model_version="1.0",
+                threshold_config_version="synthetic-threshold-v1",
+                evidence_hash="synthetic-personal-evidence-hash",
+                assigned_at=FIXED_UTC,
+            )
         )
-    )
+    finally:
+        writer.close()
 
-    assert assignment.assignment_kind is AssignmentKind.SUBJECT
-    assert assignment.assigned_subject_id == subject_id
-    assert assignment.assignment_origin is AssignmentOrigin.AUTO_VOICE
-    assert assignment.raw_match_score == 1.73
-    assert assignment.model_name == "synthetic-fixed-model"
-    assert assignment.model_version == "1.0"
-    assert assignment.threshold_config_version == "synthetic-threshold-v1"
-    assert assignment.evidence_hash == "synthetic-personal-evidence-hash"
-    columns = {
-        row[1] for row in db.execute("PRAGMA table_info(speaker_assignments)")
-    }
-    assert "normalized_match_score" not in columns
+    reader = open_database(database_path)
+    try:
+        assignment = SpeakerRepository(reader).get_assignment(segment_id)
+        assert assignment.segment_id == segment_id
+        assert assignment.assignment_kind is AssignmentKind.SUBJECT
+        assert assignment.assigned_subject_id == subject_id
+        assert assignment.assignment_origin is AssignmentOrigin.AUTO_VOICE
+        assert assignment.raw_match_score == 1.73
+        assert assignment.model_name == "synthetic-fixed-model"
+        assert assignment.model_version == "1.0"
+        assert assignment.threshold_config_version == "synthetic-threshold-v1"
+        assert assignment.evidence_hash == "synthetic-personal-evidence-hash"
+        assert assignment.assigned_at == FIXED_UTC
+        columns = {
+            row[1]
+            for row in reader.execute("PRAGMA table_info(speaker_assignments)")
+        }
+        assert "normalized_match_score" not in columns
+    finally:
+        reader.close()
 
 
 def test_personal_middle_band_is_hold_and_not_attributed_to_subject(db):

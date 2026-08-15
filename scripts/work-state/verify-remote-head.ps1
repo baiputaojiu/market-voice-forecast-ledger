@@ -8,9 +8,17 @@ $ErrorActionPreference = 'Stop'
 function Invoke-GitCapture {
     param([string[]]$Arguments)
 
-    $output = & git -C $RepositoryPath @Arguments 2>&1 | Out-String
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & git -C $RepositoryPath @Arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
     [PSCustomObject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $exitCode
         Output = $output.Trim()
     }
 }
@@ -30,7 +38,7 @@ $localHead = $localResult.Output
 
 $upstreamResult = Invoke-GitCapture @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}')
 if ($upstreamResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($upstreamResult.Output)) {
-    Write-Error 'Current branch has no upstream.'
+    Write-Host 'Current branch has no upstream.'
     exit 4
 }
 
