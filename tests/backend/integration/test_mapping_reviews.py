@@ -24,6 +24,40 @@ from tests.backend.integration.test_asset_mapping_storage import (
 
 
 FIXED_UTC = datetime(2026, 8, 15, 6, 7, 8, 901234, tzinfo=timezone.utc)
+PRACTICAL_PYTHON_WHITESPACE = "".join(
+    chr(codepoint)
+    for codepoint in (
+        9,
+        10,
+        11,
+        12,
+        13,
+        28,
+        29,
+        30,
+        31,
+        32,
+        133,
+        160,
+        5760,
+        8192,
+        8193,
+        8194,
+        8195,
+        8196,
+        8197,
+        8198,
+        8199,
+        8200,
+        8201,
+        8202,
+        8232,
+        8233,
+        8239,
+        8287,
+        12288,
+    )
+)
 
 
 @pytest.fixture
@@ -451,6 +485,143 @@ def test_raw_sql_constraints_reject_invalid_review_rows(db, low_mapping):
             )
 
     assert db.execute("SELECT COUNT(*) FROM mapping_reviews").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "reason", ["\u3000", "\u00a0", PRACTICAL_PYTHON_WHITESPACE]
+)
+def test_raw_sql_rejects_unicode_whitespace_only_reason(
+    db, low_mapping, reason
+):
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """
+            INSERT INTO mapping_reviews(
+                mapping_id, decision, actor, reason,
+                before_asset, after_asset, created_at
+            ) VALUES (?, 'approve', 'user', ?, 'nikkei_225', 'nikkei_225', ?)
+            """,
+            (
+                low_mapping.id,
+                reason,
+                "2026-08-15T06:07:08.901234Z",
+            ),
+        )
+
+    assert db.execute("SELECT COUNT(*) FROM mapping_reviews").fetchone()[0] == 0
+
+
+def test_raw_sql_accepts_unicode_whitespace_around_reason_content(
+    db, low_mapping
+):
+    reason = "\u3000Synthetic review content\u00a0"
+
+    db.execute(
+        """
+        INSERT INTO mapping_reviews(
+            mapping_id, decision, actor, reason,
+            before_asset, after_asset, created_at
+        ) VALUES (?, 'approve', 'user', ?, 'nikkei_225', 'nikkei_225', ?)
+        """,
+        (
+            low_mapping.id,
+            reason,
+            "2026-08-15T06:07:08.901234Z",
+        ),
+    )
+
+    assert db.execute(
+        "SELECT reason FROM mapping_reviews WHERE mapping_id=?",
+        (low_mapping.id,),
+    ).fetchone()[0] == reason
+
+
+def test_raw_sql_rejects_nonpositive_review_id(db, low_mapping):
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """
+            INSERT INTO mapping_reviews(
+                id, mapping_id, decision, actor, reason,
+                before_asset, after_asset, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                0,
+                low_mapping.id,
+                "reject",
+                "user",
+                "Synthetic zero ID rejection",
+                "nikkei_225",
+                "nikkei_225",
+                "2026-08-15T06:07:08.901234Z",
+            ),
+        )
+
+    assert db.execute("SELECT COUNT(*) FROM mapping_reviews").fetchone()[0] == 0
+
+
+def test_raw_sql_rejects_review_id_older_than_existing_mapping_history(
+    db, low_mapping
+):
+    rows = (
+        (10, "Synthetic newest review"),
+        (5, "Synthetic backdated review"),
+    )
+    db.execute(
+        """
+        INSERT INTO mapping_reviews(
+            id, mapping_id, decision, actor, reason,
+            before_asset, after_asset, created_at
+        ) VALUES (?, ?, 'reject', 'user', ?, 'nikkei_225', 'nikkei_225', ?)
+        """,
+        (
+            rows[0][0],
+            low_mapping.id,
+            rows[0][1],
+            "2026-08-15T06:07:08.901234Z",
+        ),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """
+            INSERT INTO mapping_reviews(
+                id, mapping_id, decision, actor, reason,
+                before_asset, after_asset, created_at
+            ) VALUES (?, ?, 'reject', 'user', ?, 'nikkei_225', 'nikkei_225', ?)
+            """,
+            (
+                rows[1][0],
+                low_mapping.id,
+                rows[1][1],
+                "2026-08-15T06:07:09.901234Z",
+            ),
+        )
+
+    assert [row["id"] for row in db.execute(
+        "SELECT id FROM mapping_reviews WHERE mapping_id=? ORDER BY id",
+        (low_mapping.id,),
+    )] == [10]
+
+
+def test_service_auto_ids_remain_increasing_and_latest(db, low_mapping):
+    service = _service(db)
+
+    rejected_id = service.review(
+        _command(low_mapping.id, MappingReviewDecision.REJECT)
+    )
+    approved_id = service.review(
+        _command(low_mapping.id, MappingReviewDecision.APPROVE)
+    )
+
+    assert 0 < rejected_id < approved_id
+    assert db.execute(
+        "SELECT MAX(id) FROM mapping_reviews WHERE mapping_id=?",
+        (low_mapping.id,),
+    ).fetchone()[0] == approved_id
+    effective = service.effective(low_mapping.id)
+    assert effective.heatmap_eligible is True
+    assert effective.reason_code == "REVIEW_APPROVED"
 
 
 def test_review_rows_and_calculated_mapping_reject_raw_mutation_and_replace(

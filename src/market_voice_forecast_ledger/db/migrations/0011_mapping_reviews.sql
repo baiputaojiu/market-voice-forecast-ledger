@@ -1,5 +1,5 @@
 CREATE TABLE mapping_reviews (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY CHECK (id > 0),
     mapping_id INTEGER NOT NULL REFERENCES analysis_asset_mappings(id),
     decision TEXT NOT NULL CHECK (decision IN (
         'approve', 'correct', 'reject'
@@ -8,7 +8,14 @@ CREATE TABLE mapping_reviews (
     reason TEXT NOT NULL CHECK (
         length(trim(
             reason,
-            char(9) || char(10) || char(11) || char(12) || char(13) || ' '
+            char(
+                9, 10, 11, 12, 13,
+                28, 29, 30, 31, 32,
+                133, 160, 5760,
+                8192, 8193, 8194, 8195, 8196, 8197,
+                8198, 8199, 8200, 8201, 8202,
+                8232, 8233, 8239, 8287, 12288
+            )
         )) > 0
     ),
     before_asset TEXT NOT NULL CHECK (before_asset IN (
@@ -75,6 +82,16 @@ BEFORE INSERT ON mapping_reviews
 WHEN NEW.id IS NOT NULL
     AND EXISTS (SELECT 1 FROM mapping_reviews WHERE id = NEW.id)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
+
+CREATE TRIGGER mapping_reviews_require_latest_id
+AFTER INSERT ON mapping_reviews
+WHEN EXISTS (
+    SELECT 1
+    FROM mapping_reviews
+    WHERE mapping_id = NEW.mapping_id
+        AND id > NEW.id
+)
+BEGIN SELECT RAISE(ABORT, 'MAPPING_REVIEW_INVALID'); END;
 
 CREATE TRIGGER mapping_reviews_no_update
 BEFORE UPDATE ON mapping_reviews
