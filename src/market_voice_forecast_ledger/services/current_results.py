@@ -1,8 +1,11 @@
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
+from market_voice_forecast_ledger.db.connection import transaction
 from market_voice_forecast_ledger.domain.analysis import AnalysisRun
 from market_voice_forecast_ledger.domain.common import (
     canonical_json,
@@ -15,6 +18,7 @@ from market_voice_forecast_ledger.domain.enums import (
     JobKind,
     JobStage,
     JobStatus,
+    ScopeStatus,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -35,6 +39,10 @@ from market_voice_forecast_ledger.domain.jobs import (
     effective_input_hash,
 )
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
+from market_voice_forecast_ledger.repositories.audit import (
+    AuditEventInput,
+    AuditRepository,
+)
 from market_voice_forecast_ledger.repositories.forecasts import ForecastRepository
 from market_voice_forecast_ledger.repositories.jobs import JobRepository
 from market_voice_forecast_ledger.repositories.mappings import MappingRepository
@@ -45,6 +53,7 @@ from market_voice_forecast_ledger.services.codex_contract import AnalysisEnvelop
 from market_voice_forecast_ledger.services.forecast_projection import (
     ForecastProjectionService,
 )
+from market_voice_forecast_ledger.services.heatmap import HeatmapService
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from market_voice_forecast_ledger.services.mapping_review import (
     MappingReviewService,
@@ -126,9 +135,15 @@ class CurrentResultDelta:
 
 
 class CurrentResultService:
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._conn = conn
         self._analysis = AnalysisRepository(conn)
+        self._audit = AuditRepository(conn)
         self._jobs = JobRepository(conn)
         self._job_state = JobStateService(conn)
         self._statements = StatementRepository(conn)
@@ -136,10 +151,104 @@ class CurrentResultService:
         self._mappings = MappingRepository(conn)
         self._mapping_reviews = MappingReviewService(conn)
         self._forecasts = ForecastRepository(conn)
+        self._heatmap = HeatmapService(conn)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def get_scope(self, scope_id: int) -> CurrentResultSummary:
         self._analysis.get_scope(scope_id)
         return self._summarize_scope(scope_id)
+
+    def promote_completed_run(
+        self, run_id: int, projection_batch_id: int
+    ) -> CurrentResultSummary:
+        self._validate_promotion_ids(run_id, projection_batch_id)
+        self._validate_initial_promotion(run_id, projection_batch_id)
+        with transaction(self._conn):
+            run = self._validate_initial_promotion(
+                run_id, projection_batch_id
+            )
+            delta = self._replace_scope_rows_in_transaction(
+                run_id, projection_batch_id
+            )
+            cell_count = self._heatmap._rebuild_scope_in_transaction(
+                run.scope_id
+            )
+            updated = self._conn.execute(
+                """
+                UPDATE analysis_scopes
+                SET status='current', stale_reason=NULL
+                WHERE id=? AND status='running'
+                """,
+                (run.scope_id,),
+            )
+            if updated.rowcount != 1:
+                raise DomainError(
+                    "CURRENT_PROMOTION_NOT_ALLOWED",
+                    "analysis scope is no longer running",
+                )
+            created_at = self._clock()
+            self._validate_acceptance_time(run.id, created_at)
+            self._analysis.append_run_event(
+                run.id,
+                AnalysisRunStatus.ACCEPTED,
+                None,
+                created_at=created_at,
+            )
+            self._append_result_replacement_audit(
+                run.scope_id,
+                delta.before,
+                delta.after,
+                cell_count,
+                "initial_promotion",
+                created_at,
+            )
+            artifact_hash = sha256_text(
+                canonical_json(
+                    {
+                        "current": self._summary_payload(delta.after),
+                        "heatmap": self._heatmap._artifact_payload(
+                            run.scope_id
+                        ),
+                    }
+                )
+            )
+            self._job_state.complete_unit_in_transaction(
+                run.active_job_id,
+                FINAL_PROMOTION_UNIT_KEY,
+                artifact_hash,
+            )
+            self._job_state.succeed_job_in_transaction(run.active_job_id)
+            return delta.after
+
+    def _validate_acceptance_time(
+        self, run_id: int, accepted_at: datetime
+    ) -> None:
+        row = self._conn.execute(
+            """
+            SELECT created_at
+            FROM analysis_run_events
+            WHERE run_id=? AND status='transport_validated'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        try:
+            if row is None:
+                raise ValueError
+            transport_at = datetime.fromisoformat(
+                row["created_at"].replace("Z", "+00:00")
+            )
+            normalized_accepted = datetime.fromisoformat(
+                utc_iso(accepted_at).replace("Z", "+00:00")
+            )
+            if normalized_accepted < transport_at:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "CURRENT_PROMOTION_NOT_ALLOWED",
+                "acceptance time cannot precede transport validation",
+            ) from cause
 
     def _replace_scope_rows_in_transaction(
         self, run_id: int, projection_batch_id: int
@@ -153,13 +262,155 @@ class CurrentResultService:
         before = self._summarize_scope(
             run.scope_id, require_current_semantics=False
         )
+        return self._replace_validated_rows(
+            run, projection_batch_id, before
+        )
+
+    def _replace_accepted_review_rows_in_transaction(
+        self,
+        run_id: int,
+        projection_batch_id: int,
+        previous_batch_id: int,
+        trigger: ProjectionTrigger,
+    ) -> CurrentResultDelta:
+        if not self._conn.in_transaction:
+            raise DomainError(
+                "CURRENT_REPLACEMENT_TRANSACTION_REQUIRED",
+                "current rows may change only inside a caller-owned transaction",
+            )
+        run = self._validate_accepted_review_projection(
+            run_id,
+            projection_batch_id,
+            previous_batch_id,
+            trigger,
+        )
+        before = self._summarize_scope(
+            run.scope_id, require_current_semantics=False
+        )
+        if (
+            before.source_run_id != run.id
+            or before.projection_batch_id != previous_batch_id
+        ):
+            self._validation_failed(
+                "review application current header changed concurrently"
+            )
+        return self._replace_validated_rows(
+            run, projection_batch_id, before
+        )
+
+    def _replace_validated_rows(
+        self,
+        run: AnalysisRun,
+        projection_batch_id: int,
+        before: CurrentResultSummary,
+    ) -> CurrentResultDelta:
         self._delete_scope_rows(run.scope_id)
-        self._insert_result_set(run.scope_id, run_id, projection_batch_id)
-        self._copy_statements(run_id, run.scope_id)
-        self._copy_mappings(run_id, run.scope_id)
-        self._copy_forecasts(projection_batch_id, run_id, run.scope_id)
+        self._insert_result_set(run.scope_id, run.id, projection_batch_id)
+        self._copy_statements(run.id, run.scope_id)
+        self._copy_mappings(run.id, run.scope_id)
+        self._copy_forecasts(projection_batch_id, run.id, run.scope_id)
         after = self._summarize_scope(run.scope_id)
         return CurrentResultDelta(before, after)
+
+    def _validate_initial_promotion(
+        self, run_id: int, projection_batch_id: int
+    ) -> AnalysisRun:
+        run = self._analysis.get_run(run_id)
+        scope = self._analysis.get_scope(run.scope_id)
+        final = self._jobs.get_unit(
+            run.active_job_id, FINAL_PROMOTION_UNIT_KEY
+        )
+        if scope.status is not ScopeStatus.RUNNING or final.status is not UnitStatus.RUNNING:
+            raise DomainError(
+                "CURRENT_PROMOTION_NOT_ALLOWED",
+                "initial promotion requires a running scope and final unit",
+            )
+        validated = self._validate_complete_projection(
+            run_id, projection_batch_id
+        )
+        batch = self._forecasts.get_batch(projection_batch_id)
+        if batch.trigger_kind is not ProjectionTrigger.INITIAL:
+            raise DomainError(
+                "CURRENT_PROMOTION_NOT_ALLOWED",
+                "initial promotion requires the unique initial projection",
+            )
+        return validated
+
+    def _validate_accepted_review_projection(
+        self,
+        run_id: int,
+        projection_batch_id: int,
+        previous_batch_id: int,
+        trigger: ProjectionTrigger,
+    ) -> AnalysisRun:
+        if (
+            not self._positive_int(run_id)
+            or not self._positive_int(projection_batch_id)
+            or not self._positive_int(previous_batch_id)
+            or trigger not in {
+                ProjectionTrigger.MAPPING_REVIEW,
+                ProjectionTrigger.PERIOD_REVIEW,
+            }
+        ):
+            self._validation_failed("accepted review identifiers are invalid")
+        run = self._analysis.get_run(run_id)
+        scope = self._analysis.get_scope(run.scope_id)
+        if scope.status not in {
+            ScopeStatus.CURRENT,
+            ScopeStatus.STALE,
+            ScopeStatus.RUNNING,
+        }:
+            self._validation_failed(
+                "accepted review scope is not currently displayable"
+            )
+        header = self._conn.execute(
+            "SELECT * FROM current_result_sets WHERE scope_id=?",
+            (run.scope_id,),
+        ).fetchone()
+        if (
+            header is None
+            or header["source_run_id"] != run.id
+            or header["projection_batch_id"] != previous_batch_id
+        ):
+            self._validation_failed(
+                "accepted review does not target the displayed run"
+            )
+        previous = self._conn.execute(
+            """
+            SELECT MAX(id)
+            FROM forecast_projection_batches
+            WHERE run_id=? AND id<?
+            """,
+            (run.id, projection_batch_id),
+        ).fetchone()[0]
+        if previous != previous_batch_id:
+            self._validation_failed(
+                "accepted review did not advance directly from current"
+            )
+        attempts = self._validate_terminal_attempt_chain(run)
+        units = self._validate_active_manifest(run)
+        transport_created_at = self._validate_accepted_run_events(run.id)
+        self._validate_input_artifact(run, units[0])
+        self._validate_codex_artifacts(run, units[1], transport_created_at)
+        self._validate_statement_artifact(run, units[2])
+        self._validate_period_artifact(run, units[3])
+        self._validate_mapping_artifact(run, units[4])
+        batch = self._validate_projection_artifact(
+            run, projection_batch_id, units[5]
+        )
+        if batch.trigger_kind is not trigger:
+            self._validation_failed(
+                "accepted review projection trigger is invalid"
+            )
+        self._validate_terminal_final_unit(units[6])
+        if attempts.attempt_ordinal > 1:
+            self._validate_successor_reuse(
+                attempts.source_job_id,
+                run.active_job_id,
+                units[:-1],
+            )
+        self._validate_batch_contents(run, batch)
+        return run
 
     def _validate_complete_projection(
         self, run_id: int, projection_batch_id: int
@@ -211,6 +462,33 @@ class CurrentResultService:
             previous_job_id = attempt.job_id
         if self._jobs.get(run.active_job_id).status not in _RUNNABLE_JOB_STATUSES:
             self._validation_failed("active analysis job is not promotable")
+        return attempts[-1]
+
+    def _validate_terminal_attempt_chain(self, run: AnalysisRun):
+        attempts = self._analysis.list_job_attempts(run.id)
+        if (
+            not attempts
+            or tuple(item.attempt_ordinal for item in attempts)
+            != tuple(range(1, len(attempts) + 1))
+            or attempts[-1].job_id != run.active_job_id
+        ):
+            self._validation_failed(
+                "accepted run has an invalid active attempt"
+            )
+        previous_job_id = None
+        for attempt in attempts:
+            job = self._jobs.get(attempt.job_id)
+            if (
+                job.kind is not JobKind.ANALYSIS_SCOPE
+                or attempt.source_job_id != previous_job_id
+                or job.source_job_id != previous_job_id
+            ):
+                self._validation_failed(
+                    "accepted run attempt ancestry is invalid"
+                )
+            previous_job_id = attempt.job_id
+        if self._jobs.get(run.active_job_id).status is not JobStatus.SUCCEEDED:
+            self._validation_failed("accepted run job is not succeeded")
         return attempts[-1]
 
     def _validate_active_manifest(self, run: AnalysisRun):
@@ -281,6 +559,54 @@ class CurrentResultService:
                 "analysis run event history is not promotable"
             )
         return rows[-1]["created_at"]
+
+    def _validate_accepted_run_events(self, run_id: int) -> str:
+        rows = self._conn.execute(
+            """
+            SELECT status, safe_error_code, created_at
+            FROM analysis_run_events
+            WHERE run_id=?
+            ORDER BY id
+            """,
+            (run_id,),
+        ).fetchall()
+        if (
+            len(rows) < 3
+            or rows[0]["status"] != AnalysisRunStatus.STARTED.value
+            or rows[0]["safe_error_code"] is not None
+            or rows[-2]["status"]
+            != AnalysisRunStatus.TRANSPORT_VALIDATED.value
+            or rows[-2]["safe_error_code"] is not None
+            or rows[-1]["status"] != AnalysisRunStatus.ACCEPTED.value
+            or rows[-1]["safe_error_code"] is not None
+            or any(
+                row["status"] != AnalysisRunStatus.FAILED.value
+                or not isinstance(row["safe_error_code"], str)
+                or not row["safe_error_code"]
+                for row in rows[1:-2]
+            )
+        ):
+            self._validation_failed(
+                "accepted analysis run event history is invalid"
+            )
+        try:
+            timestamps = tuple(
+                datetime.fromisoformat(
+                    row["created_at"].replace("Z", "+00:00")
+                )
+                for row in rows
+            )
+            if any(
+                utc_iso(timestamp) != row["created_at"]
+                for timestamp, row in zip(timestamps, rows, strict=True)
+            ) or timestamps[-1] < timestamps[-2]:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "CURRENT_REPLACEMENT_VALIDATION_FAILED",
+                "accepted analysis event timestamps are invalid",
+            ) from cause
+        return rows[-2]["created_at"]
 
     def _validate_input_artifact(self, run: AnalysisRun, unit) -> None:
         snapshot = self._analysis.get_snapshot(run.id)
@@ -560,6 +886,29 @@ class CurrentResultService:
             )
         ):
             self._validation_failed("final promotion unit input is invalid")
+
+    def _validate_terminal_final_unit(self, unit) -> None:
+        dependency = self._jobs.get_unit(
+            unit.job_id, FORECAST_PROJECTION_UNIT_KEY
+        )
+        expected = effective_input_hash(
+            unit.declared_input_hash,
+            (dependency.output_hash,),
+            None,
+        )
+        if (
+            unit.status is not UnitStatus.SUCCESS
+            or not isinstance(unit.output_hash, str)
+            or not unit.output_hash
+            or unit.external_input_hash is not None
+            or unit.bound_input_hash != expected
+            or not self._success_attempt_history_is_exact(
+                unit, unit.output_hash
+            )
+        ):
+            self._validation_failed(
+                "accepted run final promotion artifact is invalid"
+            )
 
     def _validate_successor_reuse(
         self, source_job_id: int | None, active_job_id: int, units
@@ -1046,6 +1395,73 @@ class CurrentResultService:
             """,
             (scope_id, projection_batch_id, run_id),
         )
+
+    def _append_result_replacement_audit(
+        self,
+        scope_id: int,
+        before: CurrentResultSummary,
+        after: CurrentResultSummary,
+        cell_count: int,
+        reason_code: str,
+        created_at: datetime,
+    ) -> int:
+        return self._audit.append(
+            AuditEventInput(
+                entity_type="analysis_scope",
+                entity_id=str(scope_id),
+                scope_id=scope_id,
+                operation="result_replaced",
+                actor_kind="system",
+                reason_code=reason_code,
+                reason_text="Atomic current result replacement",
+                before=self._summary_payload(before),
+                after={
+                    **self._summary_payload(after),
+                    "heatmap_cell_count": cell_count,
+                },
+                created_at=created_at,
+            )
+        )
+
+    @staticmethod
+    def _summary_payload(summary: CurrentResultSummary) -> dict[str, object]:
+        return {
+            "scope_id": summary.scope_id,
+            "source_run_id": summary.source_run_id,
+            "projection_batch_id": summary.projection_batch_id,
+            "statement_count": summary.statement_count,
+            "mapping_count": summary.mapping_count,
+            "eligible_mapping_count": summary.eligible_mapping_count,
+            "forecast_count": summary.forecast_count,
+            "statement_ids": list(summary.statement_ids),
+            "mapping_ids": list(summary.mapping_ids),
+            "eligible_mapping_ids": list(summary.eligible_mapping_ids),
+            "forecast_ids": list(summary.forecast_ids),
+            "effective_mappings": [
+                {
+                    "mapping_id": item.mapping_id,
+                    "effective_asset": item.effective_asset.value,
+                    "effective_eligibility": item.effective_eligibility,
+                }
+                for item in summary.effective_mappings
+            ],
+        }
+
+    @classmethod
+    def _validate_promotion_ids(
+        cls, run_id: int, projection_batch_id: int
+    ) -> None:
+        if not cls._positive_int(run_id) or not cls._positive_int(
+            projection_batch_id
+        ):
+            raise DomainError(
+                "CURRENT_PROMOTION_INVALID",
+                "promotion identifiers must be positive integers",
+            )
+
+    @staticmethod
+    def _positive_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
     @staticmethod
     def _stored_bool(value: object) -> bool:

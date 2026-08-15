@@ -351,15 +351,16 @@ def test_get_scope_recomputes_every_effective_mapping_reference(
 def test_get_scope_rejects_a_review_head_not_applied_to_current(db):
     prepared, _, _ = _reviewed_current(db, "unapplied-review")
     scope_id = AnalysisRepository(db).get_run(prepared.run_id).scope_id
-    MappingReviewService(db).review(
-        MappingReviewCommand(
-            prepared.mapping_ids[0],
-            MappingReviewDecision.REJECT,
-            "user",
-            "Synthetic review not yet applied to current",
-            None,
+    with transaction(db):
+        MappingReviewService(db)._review_in_transaction(
+            MappingReviewCommand(
+                prepared.mapping_ids[0],
+                MappingReviewDecision.REJECT,
+                "user",
+                "Synthetic review not yet applied to current",
+                None,
+            )
         )
-    )
 
     with pytest.raises(DomainError) as error:
         CurrentResultService(db).get_scope(scope_id)

@@ -216,17 +216,7 @@ class PeriodReviewService:
         actor: str,
         reason: str,
     ) -> int:
-        if (
-            not isinstance(decision, PeriodReviewDecision)
-            or not isinstance(actor, str)
-            or not actor.strip()
-            or not isinstance(reason, str)
-            or not reason.strip()
-        ):
-            raise DomainError(
-                "PERIOD_REVIEW_INVALID",
-                "period review requires a decision, actor, and reason",
-            )
+        self._validate_command(period_id, decision, actor, reason)
         period = self._periods.get(period_id)
         if (
             decision is PeriodReviewDecision.APPROVE_UNKNOWN
@@ -239,45 +229,14 @@ class PeriodReviewService:
 
         try:
             with transaction(self._conn):
-                current_period = self._periods.get(period_id)
-                if (
-                    decision is PeriodReviewDecision.APPROVE_UNKNOWN
-                    and not current_period.is_unknown
-                ):
+                if self._requires_application(period_id):
                     raise DomainError(
-                        "PERIOD_REVIEW_INVALID",
-                        "only an unknown period can use the unknown column",
+                        "REVIEW_APPLICATION_REQUIRED",
+                        "a displayed period review requires atomic application",
                     )
-                created_at = self._clock()
-                review_id = self._periods.insert_review(
-                    period_id,
-                    decision,
-                    actor,
-                    reason,
-                    created_at,
+                return self._review_in_transaction(
+                    period_id, decision, actor, reason
                 )
-                self._audit.append(
-                    AuditEventInput(
-                        entity_type="analysis_statement_period",
-                        entity_id=str(period_id),
-                        scope_id=self._periods.scope_id(period_id),
-                        operation="review",
-                        actor_kind=(
-                            actor if actor in {"user", "system"} else "user"
-                        ),
-                        reason_code=decision.value,
-                        reason_text=reason,
-                        before=None,
-                        after={
-                            "period_id": period_id,
-                            "decision": decision.value,
-                            "actor": actor,
-                            "reason": reason,
-                        },
-                        created_at=created_at,
-                    )
-                )
-                return review_id
         except DomainError:
             raise
         except (sqlite3.DatabaseError, RuntimeError) as cause:
@@ -286,7 +245,97 @@ class PeriodReviewService:
                 "period review could not be stored",
             ) from cause
 
+    def _review_in_transaction(
+        self,
+        period_id: int,
+        decision: PeriodReviewDecision,
+        actor: str,
+        reason: str,
+    ) -> int:
+        self._validate_command(period_id, decision, actor, reason)
+        if not self._conn.in_transaction:
+            raise DomainError(
+                "REVIEW_TRANSACTION_REQUIRED",
+                "review insertion requires a caller-owned transaction",
+            )
+        current_period = self._periods.get(period_id)
+        if (
+            decision is PeriodReviewDecision.APPROVE_UNKNOWN
+            and not current_period.is_unknown
+        ):
+            raise DomainError(
+                "PERIOD_REVIEW_INVALID",
+                "only an unknown period can use the unknown column",
+            )
+        created_at = self._clock()
+        review_id = self._periods.insert_review(
+            period_id,
+            decision,
+            actor,
+            reason,
+            created_at,
+        )
+        self._audit.append(
+            AuditEventInput(
+                entity_type="analysis_statement_period",
+                entity_id=str(period_id),
+                scope_id=self._periods.scope_id(period_id),
+                operation="review",
+                actor_kind=(actor if actor in {"user", "system"} else "user"),
+                reason_code=decision.value,
+                reason_text=reason,
+                before=None,
+                after={
+                    "period_id": period_id,
+                    "decision": decision.value,
+                    "actor": actor,
+                    "reason": reason,
+                },
+                created_at=created_at,
+            )
+        )
+        return review_id
+
     def effective(
         self, period_id: int
     ) -> EffectivePeriodReview | None:
         return self._periods.latest_review(period_id)
+
+    @staticmethod
+    def _validate_command(
+        period_id: int,
+        decision: PeriodReviewDecision,
+        actor: str,
+        reason: str,
+    ) -> None:
+        if (
+            not isinstance(period_id, int)
+            or isinstance(period_id, bool)
+            or period_id <= 0
+            or not isinstance(decision, PeriodReviewDecision)
+            or not isinstance(actor, str)
+            or not actor.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise DomainError(
+                "PERIOD_REVIEW_INVALID",
+                "period review requires a period, decision, actor, and reason",
+            )
+
+    def _requires_application(self, period_id: int) -> bool:
+        return (
+            self._conn.execute(
+                """
+                SELECT 1
+                FROM analysis_statement_periods AS period
+                JOIN analysis_statements AS statement
+                    ON statement.id=period.statement_id
+                JOIN current_result_sets AS current
+                    ON current.source_run_id=statement.run_id
+                WHERE period.id=?
+                """,
+                (period_id,),
+            ).fetchone()
+            is not None
+        )

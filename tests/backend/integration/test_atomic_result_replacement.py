@@ -1373,15 +1373,16 @@ def test_review_batch_uses_initial_unit_hash_and_must_be_newest_current_head(db)
                 prepared.run_id, initial.id
             )
 
-    MappingReviewService(db).review(
-        MappingReviewCommand(
-            prepared.mapping_ids[0],
-            MappingReviewDecision.REJECT,
-            "user",
-            "Synthetic newer rejection",
-            None,
+    with transaction(db):
+        MappingReviewService(db)._review_in_transaction(
+            MappingReviewCommand(
+                prepared.mapping_ids[0],
+                MappingReviewDecision.REJECT,
+                "user",
+                "Synthetic newer rejection",
+                None,
+            )
         )
-    )
     with pytest.raises(DomainError):
         with transaction(db):
             CurrentResultService(db)._replace_scope_rows_in_transaction(
@@ -1449,7 +1450,7 @@ def test_summary_is_deterministic_safe_and_contains_no_private_text(db):
     assert "input_text" not in serialized
 
 
-def test_task_14_exposes_no_public_current_result_mutation():
+def test_task_16_exposes_only_atomic_public_current_result_mutation():
     public_callables = {
         name
         for name in dir(CurrentResultService)
@@ -1457,4 +1458,4 @@ def test_task_14_exposes_no_public_current_result_mutation():
         and callable(getattr(CurrentResultService, name))
     }
 
-    assert public_callables == {"get_scope"}
+    assert public_callables == {"get_scope", "promote_completed_run"}

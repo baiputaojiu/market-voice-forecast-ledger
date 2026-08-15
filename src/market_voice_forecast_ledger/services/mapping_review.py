@@ -64,62 +64,12 @@ class MappingReviewService:
         try:
             with transaction(self._conn):
                 mapping = self._mapping_for_command(command.mapping_id)
-                if mapping.final_confidence not in _REVIEWABLE_CONFIDENCES:
-                    self._raise_invalid(
-                        "only low or unresolved mappings can be reviewed"
+                if self._requires_application(mapping.run_id):
+                    raise DomainError(
+                        "REVIEW_APPLICATION_REQUIRED",
+                        "a displayed mapping review requires atomic application",
                     )
-                before = self._effective_for_mapping(mapping)
-                after_asset = self._after_asset(command, mapping, before.asset)
-                created_at = self._clock()
-                cursor = self._conn.execute(
-                    """
-                    INSERT INTO mapping_reviews(
-                        mapping_id,
-                        decision,
-                        actor,
-                        reason,
-                        before_asset,
-                        after_asset,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        command.mapping_id,
-                        command.decision.value,
-                        command.actor,
-                        command.reason,
-                        before.asset.value,
-                        after_asset.value,
-                        utc_iso(created_at),
-                    ),
-                )
-                if cursor.lastrowid is None:
-                    raise RuntimeError("mapping review insert did not return an id")
-                review_id = cursor.lastrowid
-                self._audit.append(
-                    AuditEventInput(
-                        entity_type="analysis_asset_mapping",
-                        entity_id=str(command.mapping_id),
-                        scope_id=self._scope_id(mapping.run_id),
-                        operation="review",
-                        actor_kind=command.actor,
-                        reason_code=command.decision.value,
-                        reason_text=command.reason,
-                        before={
-                            "asset": before.asset.value,
-                            "mapping_id": command.mapping_id,
-                        },
-                        after={
-                            "actor": command.actor,
-                            "asset": after_asset.value,
-                            "decision": command.decision.value,
-                            "mapping_id": command.mapping_id,
-                            "reason": command.reason,
-                        },
-                        created_at=created_at,
-                    )
-                )
-                return review_id
+                return self._review_in_transaction(command)
         except DomainError:
             raise
         except (sqlite3.DatabaseError, RuntimeError, TypeError, ValueError) as cause:
@@ -127,6 +77,71 @@ class MappingReviewService:
                 "MAPPING_REVIEW_STORAGE_FAILED",
                 "mapping review could not be stored",
             ) from cause
+
+    def _review_in_transaction(self, command: MappingReviewCommand) -> int:
+        self._validate_command(command)
+        if not self._conn.in_transaction:
+            raise DomainError(
+                "REVIEW_TRANSACTION_REQUIRED",
+                "review insertion requires a caller-owned transaction",
+            )
+        mapping = self._mapping_for_command(command.mapping_id)
+        if mapping.final_confidence not in _REVIEWABLE_CONFIDENCES:
+            self._raise_invalid(
+                "only low or unresolved mappings can be reviewed"
+            )
+        before = self._effective_for_mapping(mapping)
+        after_asset = self._after_asset(command, mapping, before.asset)
+        created_at = self._clock()
+        cursor = self._conn.execute(
+            """
+            INSERT INTO mapping_reviews(
+                mapping_id,
+                decision,
+                actor,
+                reason,
+                before_asset,
+                after_asset,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                command.mapping_id,
+                command.decision.value,
+                command.actor,
+                command.reason,
+                before.asset.value,
+                after_asset.value,
+                utc_iso(created_at),
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("mapping review insert did not return an id")
+        review_id = cursor.lastrowid
+        self._audit.append(
+            AuditEventInput(
+                entity_type="analysis_asset_mapping",
+                entity_id=str(command.mapping_id),
+                scope_id=self._scope_id(mapping.run_id),
+                operation="review",
+                actor_kind=command.actor,
+                reason_code=command.decision.value,
+                reason_text=command.reason,
+                before={
+                    "asset": before.asset.value,
+                    "mapping_id": command.mapping_id,
+                },
+                after={
+                    "actor": command.actor,
+                    "asset": after_asset.value,
+                    "decision": command.decision.value,
+                    "mapping_id": command.mapping_id,
+                    "reason": command.reason,
+                },
+                created_at=created_at,
+            )
+        )
+        return review_id
 
     def effective(self, mapping_id: int) -> EffectiveMappingDecision:
         if (
@@ -288,6 +303,15 @@ class MappingReviewService:
         if row is None:
             raise RuntimeError("mapping run does not have a scope")
         return row["scope_id"]
+
+    def _requires_application(self, run_id: int) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM current_result_sets WHERE source_run_id=?",
+                (run_id,),
+            ).fetchone()
+            is not None
+        )
 
     @classmethod
     def _validate_command(cls, command: MappingReviewCommand) -> None:
