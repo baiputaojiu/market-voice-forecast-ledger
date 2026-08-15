@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from dataclasses import asdict
 
@@ -6,9 +7,9 @@ import pytest
 from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.enums import (
-    AnalysisRunStatus,
     Confidence,
     MappingReviewDecision,
+    PeriodReviewDecision,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -23,6 +24,7 @@ from market_voice_forecast_ledger.domain.jobs import (
 )
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
+from market_voice_forecast_ledger.services.asset_mapping import AssetMappingService
 from market_voice_forecast_ledger.services.current_results import (
     CurrentResultDelta,
     CurrentResultService,
@@ -36,16 +38,29 @@ from market_voice_forecast_ledger.services.mapping_review import (
     MappingReviewCommand,
     MappingReviewService,
 )
-from market_voice_forecast_ledger.services.codex_contract import CODEX_BATCH_UNIT_KEY
+from market_voice_forecast_ledger.services.codex_contract import (
+    CODEX_BATCH_UNIT_KEY,
+    CodexContractService,
+    CodexRunReceipt,
+)
+from market_voice_forecast_ledger.services.periods import (
+    PeriodReviewService,
+    PeriodService,
+)
+from market_voice_forecast_ledger.services.statements import StatementService
 from tests.backend.integration.test_analysis_input_boundaries import (
     _analysis_manifest,
+    _begin,
+    _prepare_personal_analysis,
 )
 from tests.backend.integration.test_forecast_projection import (
     NEWER,
+    PreparedProjection,
     StatementSpec,
     _prepare_upstream,
     _project,
 )
+from tests.backend.integration.test_statement_evidence import _valid_receipt
 
 
 @pytest.fixture
@@ -85,6 +100,83 @@ def _completed_run(db, *, confidence=Confidence.HIGH, label="current"):
                 confidence=confidence,
             ),
         ),
+    )
+    return prepared, _project(db, prepared)
+
+
+def _completed_run_after_actual_codex_retry(db):
+    prepared_input = _prepare_personal_analysis(db)
+    run = _begin(db, prepared_input)
+    jobs = JobStateService(db)
+    segment = AnalysisRepository(db).get_input_segments(run.id)[0]
+    output_json = json.dumps(
+        {
+            "run_id": run.id,
+            "batch_key": CODEX_BATCH_UNIT_KEY,
+            "statements": [
+                {
+                    "statement_type": "future_forecast",
+                    "forecast_basis": "direct",
+                    "condition_kind": "unconditional",
+                    "condition_text": None,
+                    "direction_kind": "up",
+                    "turning_point_kind": None,
+                    "target_expression": "日経平均",
+                    "period_expression": "来週",
+                    "codex_asset_hints": [
+                        {
+                            "expression": "日経平均",
+                            "suggested_asset": "nikkei_225",
+                            "confidence": "high",
+                        }
+                    ],
+                    "evidence": [
+                        {
+                            "segment_id": segment.segment_id,
+                            "excerpt": "Synthetic subject evidence.",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    jobs.begin_unit(prepared_input.job_id, CODEX_BATCH_UNIT_KEY)
+    with pytest.raises(DomainError) as failed:
+        CodexContractService(db).validate_and_store(
+            run.id,
+            CODEX_BATCH_UNIT_KEY,
+            output_json,
+            CodexRunReceipt(
+                "gpt-5.6-sol", "max", 1, "stored_statements_only"
+            ),
+        )
+    assert failed.value.code == "CODEX_TOOL_CALL_DETECTED"
+    input_hash = jobs.unit(
+        prepared_input.job_id, ANALYSIS_INPUT_UNIT_KEY
+    ).output_hash
+    jobs.resume(
+        prepared_input.job_id, {ANALYSIS_INPUT_UNIT_KEY: input_hash}
+    )
+    jobs.begin_unit(prepared_input.job_id, CODEX_BATCH_UNIT_KEY)
+    CodexContractService(db).validate_and_store(
+        run.id,
+        CODEX_BATCH_UNIT_KEY,
+        output_json,
+        _valid_receipt(),
+    )
+    jobs.begin_unit(prepared_input.job_id, STATEMENT_NORMALIZATION_UNIT_KEY)
+    statements = StatementService(db).normalize_and_store(run.id)
+    jobs.begin_unit(prepared_input.job_id, PERIOD_NORMALIZATION_UNIT_KEY)
+    periods = PeriodService(db).normalize_run(run.id)
+    jobs.begin_unit(prepared_input.job_id, ASSET_MAPPING_UNIT_KEY)
+    mappings = AssetMappingService(db).map_run(run.id)
+    prepared = PreparedProjection(
+        run.id,
+        prepared_input.job_id,
+        tuple(row.id for row in statements),
+        tuple(row.id for row in periods),
+        tuple(row.id for row in mappings),
+        (segment.video_id,),
     )
     return prepared, _project(db, prepared)
 
@@ -454,32 +546,187 @@ def test_missing_codex_transport_output_is_rejected_before_deletion(
             service._replace_scope_rows_in_transaction(prepared.run_id, batch.id)
 
 
-def test_newest_failed_run_event_is_rejected_but_older_failure_after_retry_is_allowed(
-    db, monkeypatch
-):
-    prepared, batch = _completed_run(db, label="run-events")
-    _replace(db, prepared, batch)
-    repository = AnalysisRepository(db)
-    with transaction(db):
-        repository.append_run_event(
-            prepared.run_id, AnalysisRunStatus.FAILED, "synthetic_failure"
+def test_actual_codex_failure_then_retry_has_valid_promotion_provenance(db):
+    prepared, batch = _completed_run_after_actual_codex_retry(db)
+
+    result = _replace(db, prepared, batch)
+
+    assert result.after.source_run_id == prepared.run_id
+    assert tuple(
+        row["status"]
+        for row in db.execute(
+            """
+            SELECT status
+            FROM analysis_run_events
+            WHERE run_id=?
+            ORDER BY id
+            """,
+            (prepared.run_id,),
         )
+    ) == ("started", "failed", "transport_validated")
+
+
+def _append_raw_run_statuses(db, run_id, statuses):
+    output_created_at = db.execute(
+        "SELECT created_at FROM analysis_run_outputs WHERE run_id=?",
+        (run_id,),
+    ).fetchone()[0]
+    for status in statuses:
+        db.execute(
+            """
+            INSERT INTO analysis_run_events(
+                run_id, status, safe_error_code, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                status,
+                "synthetic_failure" if status == "failed" else None,
+                output_created_at,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    (
+        pytest.param(("failed", "started"), id="failed-then-started"),
+        pytest.param(
+            ("started", "transport_validated"),
+            id="duplicate-started-before-transport",
+        ),
+        pytest.param(
+            ("accepted", "transport_validated"),
+            id="accepted-before-transport",
+        ),
+        pytest.param(("transport_validated",), id="extra-transport"),
+    ),
+)
+def test_noncanonical_run_event_history_is_rejected_before_deletion(
+    db, monkeypatch, statuses
+):
+    prepared, batch = _completed_run(db, label=f"run-history-{statuses[0]}")
+    _append_raw_run_statuses(db, prepared.run_id, statuses)
     service = CurrentResultService(db)
     monkeypatch.setattr(
         service,
         "_delete_scope_rows",
-        lambda *args: pytest.fail("failed run reached deletion"),
+        lambda *args: pytest.fail("invalid run history reached deletion"),
     )
+
     with pytest.raises(DomainError):
         with transaction(db):
-            service._replace_scope_rows_in_transaction(prepared.run_id, batch.id)
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, batch.id
+            )
 
-    monkeypatch.undo()
-    with transaction(db):
-        repository.append_run_event(
-            prepared.run_id, AnalysisRunStatus.TRANSPORT_VALIDATED, None
+
+def test_transport_event_time_must_match_the_immutable_output(
+    db, monkeypatch
+):
+    prepared, batch = _completed_run(db, label="transport-time")
+    db.execute("DROP TRIGGER analysis_run_events_no_update")
+    db.execute(
+        """
+        UPDATE analysis_run_events
+        SET created_at='2000-01-01T00:00:00.000000Z'
+        WHERE run_id=? AND status='transport_validated'
+        """,
+        (prepared.run_id,),
+    )
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("mismatched transport time reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, batch.id
+            )
+
+
+def _tamper_codex_success_attempts(db, prepared, tamper_kind):
+    if tamper_kind == "missing":
+        db.execute("DROP TRIGGER job_unit_attempts_no_delete")
+        db.execute(
+            """
+            DELETE FROM job_unit_attempts
+            WHERE job_id=? AND unit_key=?
+            """,
+            (prepared.job_id, CODEX_BATCH_UNIT_KEY),
         )
-    _replace(db, prepared, batch)
+        return
+    if tamper_kind in {"gap", "hash"}:
+        db.execute("DROP TRIGGER job_unit_attempts_no_update")
+        column = "attempt_no" if tamper_kind == "gap" else "output_hash"
+        value = 2 if tamper_kind == "gap" else "f" * 64
+        db.execute(
+            f"""
+            UPDATE job_unit_attempts
+            SET {column}=?
+            WHERE job_id=? AND unit_key=?
+            """,
+            (value, prepared.job_id, CODEX_BATCH_UNIT_KEY),
+        )
+        return
+
+    db.execute(
+        """
+        UPDATE job_units
+        SET attempt_count=2
+        WHERE job_id=? AND unit_key=?
+        """,
+        (prepared.job_id, CODEX_BATCH_UNIT_KEY),
+    )
+    output_hash = JobStateService(db).unit(
+        prepared.job_id, CODEX_BATCH_UNIT_KEY
+    ).output_hash
+    is_success = tamper_kind == "multiple_success"
+    db.execute(
+        """
+        INSERT INTO job_unit_attempts(
+            job_id, unit_key, attempt_no, result_status, output_hash,
+            error_code, started_at, finished_at
+        ) VALUES (?, ?, 2, ?, ?, ?, ?, ?)
+        """,
+        (
+            prepared.job_id,
+            CODEX_BATCH_UNIT_KEY,
+            "success" if is_success else "failed",
+            output_hash if is_success else None,
+            None if is_success else "synthetic_failure",
+            "2026-08-15T00:00:00.000000Z",
+            "2026-08-15T00:00:01.000000Z",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ("missing", "gap", "hash", "multiple_success", "success_not_final"),
+)
+def test_codex_output_origin_requires_exact_success_attempt_history(
+    db, monkeypatch, tamper_kind
+):
+    prepared, batch = _completed_run(
+        db, label=f"codex-attempt-{tamper_kind}"
+    )
+    _tamper_codex_success_attempts(db, prepared, tamper_kind)
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("invalid Codex attempt reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, batch.id
+            )
 
 
 def _success_artifacts(db, job_id):
@@ -527,9 +774,9 @@ def test_valid_active_successor_can_promote_reused_durable_outputs(db):
     assert result.after.source_run_id == prepared.run_id
 
 
-def test_valid_successor_can_finish_a_pending_upstream_unit_then_replace(db):
+def _successor_executes_projection(db, label):
     prepared = _prepare_upstream(
-        db, (StatementSpec("successor-finishes-projection", NEWER),)
+        db, (StatementSpec(label, NEWER),)
     )
     successor_id, plan = _attach_reusing_successor(db, prepared)
     projection = ForecastProjectionService(db)
@@ -541,12 +788,171 @@ def test_valid_successor_can_finish_a_pending_upstream_unit_then_replace(db):
     batch = projection.project_run(
         prepared.run_id, ProjectionTrigger.INITIAL
     )
+    return prepared, successor_id, plan, batch
+
+
+def test_valid_successor_can_finish_a_pending_upstream_unit_then_replace(db):
+    prepared, _, plan, batch = _successor_executes_projection(
+        db, "successor-finishes-projection"
+    )
 
     result = _replace(db, prepared, batch)
 
     assert FORECAST_PROJECTION_UNIT_KEY not in plan.reused_unit_keys
     assert result.after.source_run_id == prepared.run_id
     assert result.after.projection_batch_id == batch.id
+
+
+def _insert_raw_attempt(
+    db,
+    job_id,
+    unit_key,
+    attempt_no,
+    result_status,
+    output_hash=None,
+):
+    db.execute(
+        """
+        INSERT INTO job_unit_attempts(
+            job_id, unit_key, attempt_no, result_status, output_hash,
+            error_code, started_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            unit_key,
+            attempt_no,
+            result_status,
+            output_hash,
+            "synthetic_failure" if result_status == "failed" else None,
+            "2026-08-15T00:00:00.000000Z",
+            "2026-08-15T00:00:01.000000Z",
+        ),
+    )
+
+
+def test_predecessor_success_requires_reuse_not_fabricated_active_execution(
+    db, monkeypatch
+):
+    prepared, batch = _completed_run(db, label="predecessor-success")
+    successor_id, _ = _attach_reusing_successor(db, prepared)
+    output_hash = JobStateService(db).unit(
+        successor_id, FORECAST_PROJECTION_UNIT_KEY
+    ).output_hash
+    db.execute("DROP TRIGGER job_events_no_delete")
+    db.execute(
+        """
+        DELETE FROM job_events
+        WHERE job_id=? AND unit_key=? AND event_kind='unit_reused'
+        """,
+        (successor_id, FORECAST_PROJECTION_UNIT_KEY),
+    )
+    db.execute(
+        """
+        UPDATE job_units
+        SET attempt_count=1
+        WHERE job_id=? AND unit_key=?
+        """,
+        (successor_id, FORECAST_PROJECTION_UNIT_KEY),
+    )
+    _insert_raw_attempt(
+        db,
+        successor_id,
+        FORECAST_PROJECTION_UNIT_KEY,
+        1,
+        "success",
+        output_hash,
+    )
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("fabricated execution reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, batch.id
+            )
+
+
+def test_reused_successor_unit_requires_zero_attempt_rows(db, monkeypatch):
+    prepared, batch = _completed_run(db, label="reuse-attempt-row")
+    successor_id, _ = _attach_reusing_successor(db, prepared)
+    _insert_raw_attempt(
+        db,
+        successor_id,
+        FORECAST_PROJECTION_UNIT_KEY,
+        1,
+        "failed",
+    )
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("reused unit attempt row reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, batch.id
+            )
+
+
+@pytest.mark.parametrize("tamper_kind", ("extra_after_success", "gap"))
+def test_active_successor_execution_requires_complete_attempt_history(
+    db, monkeypatch, tamper_kind
+):
+    prepared, successor_id, _, batch = _successor_executes_projection(
+        db, f"active-attempts-{tamper_kind}"
+    )
+    if tamper_kind == "extra_after_success":
+        _insert_raw_attempt(
+            db,
+            successor_id,
+            FORECAST_PROJECTION_UNIT_KEY,
+            2,
+            "failed",
+        )
+    else:
+        db.execute("DROP TRIGGER job_unit_attempts_no_update")
+        db.execute(
+            """
+            UPDATE job_unit_attempts
+            SET attempt_no=3
+            WHERE job_id=? AND unit_key=?
+            """,
+            (successor_id, FORECAST_PROJECTION_UNIT_KEY),
+        )
+        db.execute(
+            """
+            UPDATE job_units
+            SET attempt_count=3
+            WHERE job_id=? AND unit_key=?
+            """,
+            (successor_id, FORECAST_PROJECTION_UNIT_KEY),
+        )
+        _insert_raw_attempt(
+            db,
+            successor_id,
+            FORECAST_PROJECTION_UNIT_KEY,
+            1,
+            "failed",
+        )
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("invalid active attempts reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, batch.id
+            )
 
 
 def test_successor_reuse_requires_the_exact_immediate_predecessor_output(
@@ -683,6 +1089,147 @@ def test_projection_batch_must_be_run_owned_latest_and_link_complete(
             CurrentResultService(db)._replace_scope_rows_in_transaction(
                 first.run_id, first_batch.id
             )
+
+
+@pytest.mark.parametrize("after_review", (False, True))
+def test_review_trigger_requires_its_review_head_to_advance(
+    db, monkeypatch, after_review
+):
+    prepared, initial = _completed_run(
+        db,
+        confidence=(Confidence.LOW if after_review else Confidence.HIGH),
+        label=f"duplicate-review-{after_review}",
+    )
+    if after_review:
+        MappingReviewService(db).review(
+            MappingReviewCommand(
+                prepared.mapping_ids[0],
+                MappingReviewDecision.APPROVE,
+                "user",
+                "Synthetic first mapping review",
+                None,
+            )
+        )
+        with transaction(db):
+            ForecastProjectionService(db)._project_run_in_transaction(
+                prepared.run_id, ProjectionTrigger.MAPPING_REVIEW
+            )
+    with transaction(db):
+        duplicate = ForecastProjectionService(db)._project_run_in_transaction(
+            prepared.run_id, ProjectionTrigger.MAPPING_REVIEW
+        )
+    assert duplicate.id > initial.id
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("duplicate review batch reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, duplicate.id
+            )
+
+
+def test_review_batch_trigger_must_match_the_head_that_advanced(
+    db, monkeypatch
+):
+    prepared, _ = _completed_run(
+        db, confidence=Confidence.LOW, label="wrong-review-trigger"
+    )
+    MappingReviewService(db).review(
+        MappingReviewCommand(
+            prepared.mapping_ids[0],
+            MappingReviewDecision.APPROVE,
+            "user",
+            "Synthetic mapping review under wrong trigger",
+            None,
+        )
+    )
+    with transaction(db):
+        wrong_trigger = (
+            ForecastProjectionService(db)._project_run_in_transaction(
+                prepared.run_id, ProjectionTrigger.PERIOD_REVIEW
+            )
+        )
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("wrong review trigger reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, wrong_trigger.id
+            )
+
+
+@pytest.mark.parametrize(
+    "trigger_kind",
+    (ProjectionTrigger.MAPPING_REVIEW, ProjectionTrigger.PERIOD_REVIEW),
+)
+def test_one_review_batch_cannot_advance_both_review_heads(
+    db, monkeypatch, trigger_kind
+):
+    prepared, _ = _completed_run(
+        db, confidence=Confidence.LOW, label=f"two-heads-{trigger_kind.value}"
+    )
+    MappingReviewService(db).review(
+        MappingReviewCommand(
+            prepared.mapping_ids[0],
+            MappingReviewDecision.APPROVE,
+            "user",
+            "Synthetic simultaneous mapping review",
+            None,
+        )
+    )
+    PeriodReviewService(db).review(
+        prepared.period_ids[0],
+        PeriodReviewDecision.REJECT,
+        "user",
+        "Synthetic simultaneous period review",
+    )
+    with transaction(db):
+        simultaneous = (
+            ForecastProjectionService(db)._project_run_in_transaction(
+                prepared.run_id, trigger_kind
+            )
+        )
+    service = CurrentResultService(db)
+    monkeypatch.setattr(
+        service,
+        "_delete_scope_rows",
+        lambda *args: pytest.fail("two review heads reached deletion"),
+    )
+
+    with pytest.raises(DomainError):
+        with transaction(db):
+            service._replace_scope_rows_in_transaction(
+                prepared.run_id, simultaneous.id
+            )
+
+
+def test_period_review_batch_with_only_a_period_head_advance_is_valid(db):
+    prepared, _ = _completed_run(db, label="valid-period-lineage")
+    PeriodReviewService(db).review(
+        prepared.period_ids[0],
+        PeriodReviewDecision.REJECT,
+        "user",
+        "Synthetic valid period review",
+    )
+    with transaction(db):
+        reviewed = ForecastProjectionService(db)._project_run_in_transaction(
+            prepared.run_id, ProjectionTrigger.PERIOD_REVIEW
+        )
+
+    result = _replace(db, prepared, reviewed)
+
+    assert result.after.projection_batch_id == reviewed.id
+    assert result.after.forecast_count == 0
 
 
 def _reviewed_batch(db):

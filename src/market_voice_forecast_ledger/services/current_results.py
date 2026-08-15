@@ -150,7 +150,9 @@ class CurrentResultService:
                 "current rows may change only inside a caller-owned transaction",
             )
         run = self._validate_complete_projection(run_id, projection_batch_id)
-        before = self._summarize_scope(run.scope_id)
+        before = self._summarize_scope(
+            run.scope_id, require_current_semantics=False
+        )
         self._delete_scope_rows(run.scope_id)
         self._insert_result_set(run.scope_id, run_id, projection_batch_id)
         self._copy_statements(run_id, run.scope_id)
@@ -165,9 +167,11 @@ class CurrentResultService:
         run = self._analysis.get_run(run_id)
         active_attempt = self._validate_attempt_chain(run)
         units = self._validate_active_manifest(run)
-        self._validate_run_event(run_id)
+        transport_created_at = self._validate_run_event(run_id)
         self._validate_input_artifact(run, units[0])
-        self._validate_codex_artifacts(run, units[1])
+        self._validate_codex_artifacts(
+            run, units[1], transport_created_at
+        )
         self._validate_statement_artifact(run, units[2])
         self._validate_period_artifact(run, units[3])
         self._validate_mapping_artifact(run, units[4])
@@ -249,12 +253,34 @@ class CurrentResultService:
         )
         return units
 
-    def _validate_run_event(self, run_id: int) -> None:
+    def _validate_run_event(self, run_id: int) -> str:
+        rows = self._conn.execute(
+            """
+            SELECT status, safe_error_code, created_at
+            FROM analysis_run_events
+            WHERE run_id=?
+            ORDER BY id
+            """,
+            (run_id,),
+        ).fetchall()
         if (
-            self._analysis.get_effective_run_status(run_id)
-            is AnalysisRunStatus.FAILED
+            len(rows) < 2
+            or rows[0]["status"] != AnalysisRunStatus.STARTED.value
+            or rows[0]["safe_error_code"] is not None
+            or rows[-1]["status"]
+            != AnalysisRunStatus.TRANSPORT_VALIDATED.value
+            or rows[-1]["safe_error_code"] is not None
+            or any(
+                row["status"] != AnalysisRunStatus.FAILED.value
+                or not isinstance(row["safe_error_code"], str)
+                or not row["safe_error_code"]
+                for row in rows[1:-1]
+            )
         ):
-            self._validation_failed("newest analysis run event is failed")
+            self._validation_failed(
+                "analysis run event history is not promotable"
+            )
+        return rows[-1]["created_at"]
 
     def _validate_input_artifact(self, run: AnalysisRun, unit) -> None:
         snapshot = self._analysis.get_snapshot(run.id)
@@ -271,7 +297,9 @@ class CurrentResultService:
         ):
             self._validation_failed("immutable analysis input artifact is invalid")
 
-    def _validate_codex_artifacts(self, run: AnalysisRun, unit) -> None:
+    def _validate_codex_artifacts(
+        self, run: AnalysisRun, unit, transport_created_at: str
+    ) -> None:
         rows = self._conn.execute(
             """
             SELECT *
@@ -315,10 +343,17 @@ class CurrentResultService:
             or row["receipt_reasoning_effort"] != run.reasoning_effort
             or row["receipt_tool_call_count"] != 0
             or row["receipt_boundary_mode"] != "stored_statements_only"
+            or row["created_at"] != transport_created_at
             or origin_unit.status is not UnitStatus.SUCCESS
             or origin_unit.output_hash != row["output_sha256"]
         ):
             self._validation_failed("stored Codex output is not sealed to its unit")
+        if not self._success_attempt_history_is_exact(
+            origin_unit, row["output_sha256"]
+        ):
+            self._validation_failed(
+                "stored Codex output has invalid success-attempt provenance"
+            )
 
     def _validate_statement_artifact(self, run: AnalysisRun, unit) -> None:
         statements = self._statements.list_run_statements(run.id)
@@ -443,7 +478,59 @@ class CurrentResultService:
             ProjectionTrigger.PERIOD_REVIEW,
         }:
             self._validation_failed("projection trigger is invalid")
+        if not self._review_batch_lineage_is_valid(batch):
+            self._validation_failed(
+                "projection trigger does not match its review-head advance"
+            )
         return batch
+
+    def _review_batch_lineage_is_valid(
+        self, batch: ForecastProjectionBatch
+    ) -> bool:
+        previous = self._conn.execute(
+            """
+            SELECT latest_mapping_review_id, latest_period_review_id
+            FROM forecast_projection_batches
+            WHERE run_id=? AND id<?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (batch.run_id, batch.id),
+        ).fetchone()
+        if batch.trigger_kind is ProjectionTrigger.INITIAL:
+            return previous is None
+        if previous is None:
+            return False
+
+        mapping_advanced = self._review_head_advanced(
+            previous["latest_mapping_review_id"],
+            batch.latest_mapping_review_id,
+        )
+        period_advanced = self._review_head_advanced(
+            previous["latest_period_review_id"],
+            batch.latest_period_review_id,
+        )
+        mapping_unchanged = (
+            previous["latest_mapping_review_id"]
+            == batch.latest_mapping_review_id
+        )
+        period_unchanged = (
+            previous["latest_period_review_id"]
+            == batch.latest_period_review_id
+        )
+        return (
+            batch.trigger_kind is ProjectionTrigger.MAPPING_REVIEW
+            and mapping_advanced
+            and period_unchanged
+        ) or (
+            batch.trigger_kind is ProjectionTrigger.PERIOD_REVIEW
+            and period_advanced
+            and mapping_unchanged
+        )
+
+    @staticmethod
+    def _review_head_advanced(before: int | None, after: int | None) -> bool:
+        return after is not None and (before is None or after > before)
 
     def _validate_final_unit(self, unit) -> None:
         if (
@@ -480,6 +567,7 @@ class CurrentResultService:
         if source_job_id is None:
             self._validation_failed("successor attempt has no source job")
         for unit in units:
+            source = self._jobs.get_unit(source_job_id, unit.unit_key)
             rows = self._conn.execute(
                 """
                 SELECT metadata_json
@@ -489,8 +577,15 @@ class CurrentResultService:
                 """,
                 (active_job_id, unit.unit_key),
             ).fetchall()
-            if rows:
-                source = self._jobs.get_unit(source_job_id, unit.unit_key)
+            attempt_row_count = self._conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM job_unit_attempts
+                WHERE job_id=? AND unit_key=?
+                """,
+                (active_job_id, unit.unit_key),
+            ).fetchone()[0]
+            if source.status is UnitStatus.SUCCESS:
                 if (
                     len(rows) != 1
                     or not self._reuse_event_matches(
@@ -499,7 +594,7 @@ class CurrentResultService:
                         unit.output_hash,
                     )
                     or unit.attempt_count != 0
-                    or source.status is not UnitStatus.SUCCESS
+                    or attempt_row_count != 0
                     or source.stage is not unit.stage
                     or source.ordinal != unit.ordinal
                     or source.declared_input_hash != unit.declared_input_hash
@@ -514,20 +609,8 @@ class CurrentResultService:
                         "active successor reuse provenance is invalid"
                     )
                 continue
-
-            attempts = self._conn.execute(
-                """
-                SELECT attempt_no, output_hash
-                FROM job_unit_attempts
-                WHERE job_id=? AND unit_key=? AND result_status='success'
-                ORDER BY attempt_no
-                """,
-                (active_job_id, unit.unit_key),
-            ).fetchall()
-            if (
-                len(attempts) != 1
-                or attempts[0]["attempt_no"] != unit.attempt_count
-                or attempts[0]["output_hash"] != unit.output_hash
+            if rows or not self._success_attempt_history_is_exact(
+                unit, unit.output_hash
             ):
                 self._validation_failed(
                     "active successor unit has no valid success provenance"
@@ -605,6 +688,34 @@ class CurrentResultService:
             {"output_hash": output_hash, "source_job_id": source_job_id}
         )
 
+    def _success_attempt_history_is_exact(
+        self, unit, expected_output_hash: str
+    ) -> bool:
+        rows = self._conn.execute(
+            """
+            SELECT attempt_no, result_status, output_hash
+            FROM job_unit_attempts
+            WHERE job_id=? AND unit_key=?
+            ORDER BY attempt_no
+            """,
+            (unit.job_id, unit.unit_key),
+        ).fetchall()
+        return (
+            unit.status is UnitStatus.SUCCESS
+            and unit.output_hash == expected_output_hash
+            and unit.attempt_count > 0
+            and len(rows) == unit.attempt_count
+            and tuple(row["attempt_no"] for row in rows)
+            == tuple(range(1, unit.attempt_count + 1))
+            and all(
+                row["result_status"] in {"failed", "interrupted"}
+                and row["output_hash"] is None
+                for row in rows[:-1]
+            )
+            and rows[-1]["result_status"] == "success"
+            and rows[-1]["output_hash"] == expected_output_hash
+        )
+
     def _require_unit_artifact_hash(self, unit, payload, label: str) -> None:
         artifact_hash = sha256_text(canonical_json(payload))
         if (
@@ -616,7 +727,9 @@ class CurrentResultService:
                 f"stored {label} artifact does not match its successful unit"
             )
 
-    def _summarize_scope(self, scope_id: int) -> CurrentResultSummary:
+    def _summarize_scope(
+        self, scope_id: int, *, require_current_semantics: bool = True
+    ) -> CurrentResultSummary:
         self._analysis.get_scope(scope_id)
         headers = self._conn.execute(
             "SELECT * FROM current_result_sets WHERE scope_id=?", (scope_id,)
@@ -665,6 +778,10 @@ class CurrentResultService:
         ).fetchone()
         if owner is None:
             self._state_invalid("current result header ownership is invalid")
+        if require_current_semantics:
+            self._validate_current_header_semantics(
+                source_run_id, projection_batch_id
+            )
 
         statement_rows = self._conn.execute(
             """
@@ -756,6 +873,29 @@ class CurrentResultService:
                 "CURRENT_RESULT_STATE_INVALID",
                 "current mapping references are invalid",
             ) from cause
+        if require_current_semantics:
+            try:
+                expected_effective_mappings = []
+                for item in effective_mappings:
+                    effective = self._mapping_reviews.effective(
+                        item.mapping_id
+                    )
+                    expected_effective_mappings.append(
+                        CurrentMappingReference(
+                            item.mapping_id,
+                            effective.asset,
+                            effective.heatmap_eligible,
+                        )
+                    )
+            except (DomainError, TypeError, ValueError) as cause:
+                raise DomainError(
+                    "CURRENT_RESULT_STATE_INVALID",
+                    "current mapping review state is invalid",
+                ) from cause
+            if effective_mappings != tuple(expected_effective_mappings):
+                self._state_invalid(
+                    "current mapping references do not match effective reviews"
+                )
         eligible_mapping_ids = tuple(
             item.mapping_id
             for item in effective_mappings
@@ -775,6 +915,47 @@ class CurrentResultService:
             forecast_ids=forecast_ids,
             effective_mappings=effective_mappings,
         )
+
+    def _validate_current_header_semantics(
+        self, source_run_id: int, projection_batch_id: int
+    ) -> None:
+        try:
+            batch = self._forecasts.get_batch(projection_batch_id)
+            latest_batch_id = self._conn.execute(
+                """
+                SELECT MAX(id)
+                FROM forecast_projection_batches
+                WHERE run_id=?
+                """,
+                (source_run_id,),
+            ).fetchone()[0]
+            review_state = ForecastProjectionService(
+                self._conn
+            )._review_state(source_run_id)
+            lineage_is_valid = self._review_batch_lineage_is_valid(batch)
+        except (
+            DomainError,
+            KeyError,
+            LookupError,
+            TypeError,
+            ValueError,
+        ) as cause:
+            raise DomainError(
+                "CURRENT_RESULT_STATE_INVALID",
+                "current result header semantics are invalid",
+            ) from cause
+        if (
+            batch.run_id != source_run_id
+            or latest_batch_id != projection_batch_id
+            or batch.latest_mapping_review_id
+            != review_state.latest_mapping_review_id
+            or batch.latest_period_review_id
+            != review_state.latest_period_review_id
+            or not lineage_is_valid
+        ):
+            self._state_invalid(
+                "current result header is stale or has invalid lineage"
+            )
 
     def _delete_scope_rows(self, scope_id: int) -> None:
         self._conn.execute("DELETE FROM current_forecasts WHERE scope_id=?", (scope_id,))

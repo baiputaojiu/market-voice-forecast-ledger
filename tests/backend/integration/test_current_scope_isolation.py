@@ -84,6 +84,29 @@ def _replace(db, prepared, batch):
         )
 
 
+def _reviewed_current(db, label):
+    prepared = _prepare_upstream(
+        db,
+        (StatementSpec(label, NEWER, confidence=Confidence.LOW),),
+    )
+    initial = _project(db, prepared)
+    MappingReviewService(db).review(
+        MappingReviewCommand(
+            prepared.mapping_ids[0],
+            MappingReviewDecision.APPROVE,
+            "user",
+            "Synthetic current mapping approval",
+            None,
+        )
+    )
+    with transaction(db):
+        reviewed = ForecastProjectionService(db)._project_run_in_transaction(
+            prepared.run_id, ProjectionTrigger.MAPPING_REVIEW
+        )
+    _replace(db, prepared, reviewed)
+    return prepared, initial, reviewed
+
+
 def _prepare_for_existing_subject(db, subject_id, label):
     video_id, segment_ids = _add_video_with_segments(
         db,
@@ -252,6 +275,132 @@ def test_all_empty_child_sets_keep_the_validated_run_and_batch_identity(db):
         "SELECT COUNT(*) FROM current_result_sets WHERE scope_id=?",
         (result.after.scope_id,),
     ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "table",
+    (
+        "current_result_sets",
+        "current_statements",
+        "current_asset_mappings",
+        "current_forecasts",
+    ),
+)
+def test_every_current_cache_table_rejects_even_a_noop_update(db, table):
+    prepared = _prepare_upstream(db, (StatementSpec("no-update", NEWER),))
+    batch = _project(db, prepared)
+    summary = _replace(db, prepared, batch).after
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            f"UPDATE {table} SET scope_id=scope_id WHERE scope_id=?",
+            (summary.scope_id,),
+        )
+
+
+def test_get_scope_rejects_a_header_rewritten_to_an_old_empty_initial(db):
+    prepared, initial, reviewed = _reviewed_current(db, "old-empty-initial")
+    assert initial.forecasts == ()
+    assert reviewed.forecasts
+    scope_id = AnalysisRepository(db).get_run(prepared.run_id).scope_id
+    db.execute("DELETE FROM current_forecasts WHERE scope_id=?", (scope_id,))
+    db.execute("DROP TRIGGER current_result_sets_validate_update")
+    db.execute(
+        """
+        UPDATE current_result_sets
+        SET projection_batch_id=?
+        WHERE scope_id=?
+        """,
+        (initial.id, scope_id),
+    )
+
+    with pytest.raises(DomainError) as error:
+        CurrentResultService(db).get_scope(scope_id)
+
+    assert error.value.code == "CURRENT_RESULT_STATE_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (("effective_asset", "topix"), ("effective_eligibility", 0)),
+)
+def test_get_scope_recomputes_every_effective_mapping_reference(
+    db, column, value
+):
+    prepared = _prepare_upstream(
+        db, (StatementSpec(f"mapping-cache-{column}", NEWER),)
+    )
+    batch = _project(db, prepared)
+    scope_id = _replace(db, prepared, batch).after.scope_id
+    db.execute("DROP TRIGGER current_asset_mappings_validate_update")
+    db.execute(
+        f"""
+        UPDATE current_asset_mappings
+        SET {column}=?
+        WHERE scope_id=?
+        """,
+        (value, scope_id),
+    )
+
+    with pytest.raises(DomainError) as error:
+        CurrentResultService(db).get_scope(scope_id)
+
+    assert error.value.code == "CURRENT_RESULT_STATE_INVALID"
+
+
+def test_get_scope_rejects_a_review_head_not_applied_to_current(db):
+    prepared, _, _ = _reviewed_current(db, "unapplied-review")
+    scope_id = AnalysisRepository(db).get_run(prepared.run_id).scope_id
+    MappingReviewService(db).review(
+        MappingReviewCommand(
+            prepared.mapping_ids[0],
+            MappingReviewDecision.REJECT,
+            "user",
+            "Synthetic review not yet applied to current",
+            None,
+        )
+    )
+
+    with pytest.raises(DomainError) as error:
+        CurrentResultService(db).get_scope(scope_id)
+
+    assert error.value.code == "CURRENT_RESULT_STATE_INVALID"
+
+
+def test_get_scope_rejects_latest_batch_with_invalid_review_lineage(db):
+    prepared, _, _ = _reviewed_current(db, "invalid-current-lineage")
+    scope_id = AnalysisRepository(db).get_run(prepared.run_id).scope_id
+    with transaction(db):
+        duplicate = ForecastProjectionService(db)._project_run_in_transaction(
+            prepared.run_id, ProjectionTrigger.MAPPING_REVIEW
+        )
+    db.execute("DELETE FROM current_forecasts WHERE scope_id=?", (scope_id,))
+    db.execute("DROP TRIGGER current_result_sets_validate_update")
+    db.execute(
+        """
+        UPDATE current_result_sets
+        SET projection_batch_id=?
+        WHERE scope_id=?
+        """,
+        (duplicate.id, scope_id),
+    )
+    db.execute(
+        """
+        INSERT INTO current_forecasts(
+            scope_id, analysis_forecast_id, source_run_id,
+            projection_batch_id
+        )
+        SELECT ?, id, run_id, projection_batch_id
+        FROM analysis_forecasts
+        WHERE projection_batch_id=?
+        """,
+        (scope_id, duplicate.id),
+    )
+
+    with pytest.raises(DomainError) as error:
+        CurrentResultService(db).get_scope(scope_id)
+
+    assert error.value.code == "CURRENT_RESULT_STATE_INVALID"
 
 
 def test_raw_current_rows_reject_cross_scope_run_statement_mapping_and_batch(db):
