@@ -160,6 +160,42 @@ def test_normally_failed_active_job_cannot_attach_successor(db):
     assert error.value.code == "SUCCESSOR_SOURCE_NOT_SAFE"
 
 
+def test_recovered_ordinary_failure_after_reopen_cannot_attach_successor(
+    tmp_path,
+):
+    db_path = tmp_path / "ledger.sqlite3"
+    first = open_database(db_path)
+    apply_migrations(first)
+    prepared = _prepare_personal_analysis(first)
+    run = _begin(first, prepared)
+    service = JobStateService(first)
+    service.begin_unit(prepared.job_id, "codex:batch:1")
+    service.fail_unit(prepared.job_id, "codex:batch:1", "synthetic_failure")
+    first.close()
+
+    reopened = open_database(db_path)
+    try:
+        service = JobStateService(reopened)
+        recovery = service.recover_interrupted(
+            prepared.job_id, _source_artifacts(reopened, prepared.job_id)
+        )
+        assert service.status(prepared.job_id) is JobStatus.FAILED
+        assert "codex:batch:1" in recovery.pending_unit_keys
+
+        successor_id, _ = _create_successor(reopened, prepared)
+        with pytest.raises(DomainError) as error:
+            AnalysisRunService(reopened).attach_successor(
+                run.id, successor_id
+            )
+
+        assert error.value.code == "SUCCESSOR_SOURCE_NOT_SAFE"
+        assert AnalysisRepository(reopened).get_active_job_id(run.id) == (
+            prepared.job_id
+        )
+    finally:
+        reopened.close()
+
+
 def test_stopped_source_must_have_no_running_unit_to_be_safe(db):
     prepared = _prepare_personal_analysis(db)
     run = _begin(db, prepared)
@@ -181,13 +217,18 @@ def test_stopped_source_must_have_no_running_unit_to_be_safe(db):
     assert error.value.code == "SUCCESSOR_SOURCE_NOT_SAFE"
 
 
-def test_input_changed_failed_job_can_attach_compatible_successor(db):
-    prepared = _prepare_personal_analysis(db)
-    run = _begin(db, prepared)
-    service = JobStateService(db)
+def test_input_changed_failure_proof_survives_reopen_for_successor(tmp_path):
+    db_path = tmp_path / "ledger.sqlite3"
+    first = open_database(db_path)
+    apply_migrations(first)
+    prepared = _prepare_personal_analysis(first)
+    run = _begin(first, prepared)
+    service = JobStateService(first)
     service.begin_unit(prepared.job_id, "codex:batch:1")
     service.fail_unit(prepared.job_id, "codex:batch:1", "synthetic_retryable")
-    service.resume(prepared.job_id, _source_artifacts(db, prepared.job_id))
+    service.resume(
+        prepared.job_id, _source_artifacts(first, prepared.job_id)
+    )
     with pytest.raises(DomainError) as changed:
         service.begin_unit(
             prepared.job_id, "codex:batch:1", "changed-external-input"
@@ -197,13 +238,23 @@ def test_input_changed_failed_job_can_attach_compatible_successor(db):
     assert service.unit(
         prepared.job_id, "codex:batch:1"
     ).status is UnitStatus.PENDING
+    first.close()
 
-    successor_id, plan = _create_successor(db, prepared)
-    attempt = AnalysisRunService(db).attach_successor(run.id, successor_id)
+    reopened = open_database(db_path)
+    try:
+        successor_id, plan = _create_successor(reopened, prepared)
+        attempt = AnalysisRunService(reopened).attach_successor(
+            run.id, successor_id
+        )
 
-    assert ANALYSIS_INPUT_UNIT_KEY in plan.reused_unit_keys
-    assert attempt.source_job_id == prepared.job_id
-    assert AnalysisRepository(db).get_active_job_id(run.id) == successor_id
+        assert ANALYSIS_INPUT_UNIT_KEY in plan.reused_unit_keys
+        assert attempt.source_job_id == prepared.job_id
+        assert (
+            AnalysisRepository(reopened).get_active_job_id(run.id)
+            == successor_id
+        )
+    finally:
+        reopened.close()
 
 
 def test_successor_must_descend_from_the_current_active_attempt(db):

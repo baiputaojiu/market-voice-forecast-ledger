@@ -230,6 +230,9 @@ class JobStateService:
             ):
                 if job.status in {JobStatus.RUNNING, JobStatus.RETRYING}:
                     self._transition(job, JobStatus.FAILED)
+                    self._jobs.record_unit_input_changed(
+                        unit, self._clock()
+                    )
                 input_changed = True
             else:
                 if job.status in {JobStatus.QUEUED, JobStatus.RETRYING}:

@@ -218,6 +218,62 @@ class JobRepository:
             changed_at,
         )
 
+    def record_unit_input_changed(
+        self, unit: JobUnit, changed_at: datetime
+    ) -> None:
+        self._require_transaction()
+        self._append_event(
+            unit.job_id,
+            unit.unit_key,
+            "unit_input_changed",
+            {
+                "attempt_no": unit.attempt_count,
+                "error_code": "UNIT_INPUT_CHANGED",
+            },
+            changed_at,
+        )
+
+    def has_current_unit_input_changed_proof(self, job_id: int) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT
+                event.event_kind,
+                event.metadata_json,
+                unit.status AS unit_status,
+                unit.bound_input_hash,
+                unit.attempt_count,
+                attempt.id AS attempt_id
+            FROM job_events AS event
+            LEFT JOIN job_units AS unit
+                ON unit.job_id=event.job_id
+                AND unit.unit_key=event.unit_key
+            LEFT JOIN job_unit_attempts AS attempt
+                ON attempt.job_id=unit.job_id
+                AND attempt.unit_key=unit.unit_key
+                AND attempt.attempt_no=unit.attempt_count
+            WHERE event.job_id=?
+            ORDER BY event.id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None or row["event_kind"] != "unit_input_changed":
+            return False
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            row["unit_status"] == UnitStatus.PENDING.value
+            and row["bound_input_hash"] is not None
+            and row["attempt_id"] is not None
+            and metadata
+            == {
+                "attempt_no": row["attempt_count"],
+                "error_code": "UNIT_INPUT_CHANGED",
+            }
+        )
+
     def running_unit_count(self, job_id: int) -> int:
         return self._conn.execute(
             "SELECT COUNT(*) FROM job_units WHERE job_id=? AND status=?",

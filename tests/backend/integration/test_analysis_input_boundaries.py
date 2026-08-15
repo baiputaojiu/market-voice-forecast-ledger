@@ -558,6 +558,88 @@ def test_unchanged_eligibility_reevaluation_time_does_not_change_input(db):
     ) == prepared.expected_segment_ids
 
 
+def test_empty_input_contract_changes_with_current_policy_hash(db):
+    subject_id = _create_subject(
+        db, "Synthetic Empty Policy Person", SubjectKind.PERSON, channel_index=8
+    )
+    service = AnalysisRunService(db)
+    first = service.preview_input_contract(
+        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
+    )
+    assert db.execute("SELECT COUNT(*) FROM transcript_segments").fetchone()[0] == 0
+
+    db.execute(
+        "UPDATE subject_channel_policies SET policy_hash=? WHERE subject_id=?",
+        ("synthetic-empty-policy-v2", subject_id),
+    )
+    second = service.preview_input_contract(
+        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
+    )
+
+    assert second != first
+
+
+def test_empty_input_contract_ignores_policy_display_and_update_time(db):
+    subject_id = _create_subject(
+        db,
+        "Synthetic Empty Policy Metadata Person",
+        SubjectKind.PERSON,
+        channel_index=9,
+    )
+    service = AnalysisRunService(db)
+    first = service.preview_input_contract(
+        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
+    )
+
+    db.execute(
+        """
+        UPDATE subject_channel_policies
+        SET channel_display_name=?, updated_at=?
+        WHERE subject_id=?
+        """,
+        ("Changed display only", "2026-09-01T00:00:00.000000Z", subject_id),
+    )
+    second = service.preview_input_contract(
+        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
+    )
+
+    assert second == first
+
+
+def test_configuration_required_policy_rejects_preview_and_begin(db):
+    subject_id = _create_subject(
+        db,
+        "Synthetic Configuration Required Person",
+        SubjectKind.PERSON,
+        channel_index=10,
+    )
+    prepared = _create_job_for_input(db, subject_id)
+    db.execute(
+        """
+        UPDATE subject_channel_policies
+        SET configuration_status=?, policy_hash=?
+        WHERE subject_id=?
+        """,
+        (
+            ConfigurationStatus.CONFIGURATION_REQUIRED.value,
+            "synthetic-configuration-required-policy",
+            subject_id,
+        ),
+    )
+
+    with pytest.raises(DomainError) as preview_error:
+        AnalysisRunService(db).preview_input_contract(
+            subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
+        )
+    assert preview_error.value.code == "ANALYSIS_POLICY_NOT_CONFIGURED"
+
+    with pytest.raises(DomainError) as begin_error:
+        _begin(db, prepared)
+    assert begin_error.value.code == "ANALYSIS_POLICY_NOT_CONFIGURED"
+    assert db.execute("SELECT COUNT(*) FROM analysis_scopes").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 0
+
+
 def test_preview_is_read_only(db):
     subject_id = _create_subject(
         db, "Synthetic Preview Person", SubjectKind.PERSON, channel_index=7
