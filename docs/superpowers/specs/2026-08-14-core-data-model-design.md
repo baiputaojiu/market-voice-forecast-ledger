@@ -6,8 +6,11 @@
 - 実装前レビュー統合案承認日: 2026-08-15 JST
 - 書面反映版ユーザー承認日: 2026-08-15 JST
 - M2詳細実装計画ユーザー承認日: 2026-08-15 JST
+- フィージビリティ検証後修正案ユーザー承認日: 2026-08-15 JST
+- フィージビリティ検証後修正書面ユーザー承認日: 2026-08-15 JST
 - 対象: M1の設計成果物。M2最初のサブプロジェクトである中核バックエンドの境界
 - 設計レビュー: 書面反映版までユーザー承認済み
+- 差分設計: `docs/superpowers/specs/2026-08-15-m2-feasibility-corrections-design.md`
 - 次のゲート: ユーザーによるM2実装開始の明示指示
 - 設定済み入力: 江守哲は表示名「江守哲の米国株投資チャンネル」、正本YouTubeチャンネルID `UCVXka7buS_WptsAzSE0LcKg`
 - 設定済み入力: 暁投資顧問の公式YouTubeチャンネルIDは `UCOfzLmXpI3qmZfV7_Cs1sYA`
@@ -102,7 +105,7 @@ flowchart LR
 
 ### 日付指定分析
 
-ユーザーが選択した日のJST 23:59:59を `cutoff_at_jst` とする。`published_at` がcutoff以前の動画だけを入力候補にする。システムが取得済みでも、公開日時がcutoffより後なら含めない。
+ユーザーが選択したJST暦日をscopeの基準日とする。内部ではJST翌日0時をUTCへ変換した `cutoff_exclusive_utc` を作り、`published_at < cutoff_exclusive_utc` の動画だけを入力候補にする。これは画面上の「選択日JST 23:59:59まで」を小数秒まで漏れなく表現する。システムが取得済みでも、公開日時が上限以後なら含めない。
 
 ### 相対期間
 
@@ -116,7 +119,7 @@ flowchart LR
 
 「何月第1週」は、その月の1日を含む月曜日から日曜日とする。月をまたいでも切らず、絶対日付範囲を保存・表示する。
 
-時刻はDB内でUTCのISO 8601文字列として保存し、JSTへ変換して表示・日付範囲計算する。期間の開始日・終了日はJST暦日の `YYYY-MM-DD` とする。
+時刻はDB内でUTCのISO 8601文字列として保存し、固定JST（UTC+9）へ変換して表示・日付範囲計算する。`ZoneInfo`、IANA timezone database、`tzdata`へ依存しない。週境界はUTCへ変更せず、JSTの月曜日から日曜日を維持する。期間の開始日・終了日はJST暦日の `YYYY-MM-DD` とする。
 
 ## 論理エンティティ
 
@@ -189,13 +192,15 @@ flowchart LR
 
 #### `analysis_scopes`
 
-- `subject_id` と `cutoff_at_jst` の組を一意にする。
+- `subject_id` とJST暦日の `cutoff_day_jst` の組を一意にし、動画包含判定用の `cutoff_exclusive_utc` も保存する。
 - 異なるcutoffの結果は別scopeとして共存する。
 - `status` は `ready`、`running`、`current`、`stale`、`failed` を使う。
 
 #### `analysis_runs`
 
 - 同じscopeの初回実行、再試行、再分析を追記する実行記録である。
+- runは追記専用のjob-attempt履歴を持ち、最新attemptだけをactiveとする。各jobは変更不能で、manifestは先頭に入力固定unit、全upstream unitの後に最終反映unitをそれぞれちょうど1件持つ。入力固定unitのhashは主体、cutoff、方針・話者割当snapshot、入力本文hash、設定versionから再計算して照合し、初回run・snapshot・job-attemptの挿入と入力固定unitの `success` は同じtransactionで確定する。
+- 停止後の後継jobは、runに属する成功済み永続成果物をすべて同一hashで再利用できる場合だけ同じrunの新attemptとして追記する。成功済み成果物の再計算が必要なら、新しいrunを作る。
 - modelは `gpt-5.6-sol`、reasoning effortは `max` を必須にする。
 - prompt版、JSON Schema版、入力hash、開始・終了日時、run状態、外部ツール呼び出し件数、安全なerror codeを保存する。
 - 下位モデルでの成功扱いを禁止する。
@@ -283,9 +288,11 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 - scope、資産、期間、条件layerの現在結果を保存する。
 - 同じ組に複数の根拠がある場合でも、相反方向を平均してflatにしない。
 - 現在見解、信頼度、根拠数、`stale`、`heatmap_eligible`、除外理由、`view_relation = current | changed | disagreement` を保存する。
-- 同じ資産・期間・条件layerに属する同一動画内の相反予想は、優先順位で片方を落とさず一つの `disagreement` 候補へまとめ、両方向と双方の根拠linkを保持する。
-- その候補と他動画の候補を比較するときは公開日時が新しい候補を最優先し、同日時なら `forecast_basis = direct`、次に期間が具体的な候補を優先する。
-- 後から公開された動画で方向が変わった場合は `changed` とする。
+- 同じ分析主体・資産・比較可能な期間・条件layerの採用可能な候補を、UTC正規化済み `published_at` ごとにまとめる。`+1`・`+2`の上昇系と`-1`・`-2`の下降系が同じ公開日時群にあれば、同一動画か別動画か、`forecast_basis`、指数の直接・推定、期間具体性にかかわらず一つの `disagreement` 候補へまとめ、両方向とすべての根拠linkを保持する。
+- 最新公開日時群の上昇系・下降系が、いずれかの古い公開日時群と逆なら `changed` とする。途中に同方向の再投稿があっても変更履歴を消さず、最新群を現在見解、古い群を履歴・反証として保持する。
+- 上昇系・下降系以外の横ばい、転換点、判断不能、空欄は独立状態のままとし、自動的な `disagreement` または `changed` へ変換しない。
+- 動画IDとstatement IDは決定的な順序付けにだけ使い、同じ公開日時群の相反方向から片方を選ぶ優先順位には使わない。
+- 同じ公開日時群に上昇系・下降系の対立がない場合だけ、直接予想、次に期間具体性を代表表示の選択に使える。独立した根拠linkはこの選択で削除しない。
 - `low`、`unresolved`、未承認の期間不明、将来予想以外は、規則またはレビューを満たすまで主ヒートマップへ入れない。承認済み期間不明は専用列だけに入れる。
 - 条件付き予想は別layerとし、条件付き印と条件文を必須にする。
 
@@ -300,21 +307,30 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 - scope、主体、資産、期間または時期不明列、layerごとに一意とする。
 - 正本は `current_forecasts` とし、cache削除後に再構築できることを必須にする。
 - `disagreement` cellはflatへ変換せず、相反する複数方向を保持する。
+- 元の正規化期間は変更せず、週・月cellと交差する採用可能な予想を表示slotへ投影する。同じslotへ複数期間が重なる場合も公開日時群の規則を適用し、条件layerは混ぜない。
+- `heatmap_cell_forecasts` で一つのcellと複数の元予想を結び、元期間、独立根拠、直接・推定表示を失わない。cellとlinkはどちらも現在予想から再生成できるcacheとする。
+- 複数の元予想を投影したcellの直接・推定は、最新の現在群に推定割当が一つでもあれば推定とし、信頼度は最新現在群の最弱値を表示する。根拠数は、最新方向を支持する全公開日時群の重複しないstatement数とし、古い同方向の切り抜き・再投稿も独立根拠として数える。反対方向その他の履歴・反証は元予想linkから別表示する。
+- 条件付きcellでは、異なる条件文を正本の元予想から失わず、すべて確認できるようにする。
 
 ### job、checkpoint、監査
 
 #### `jobs`
 
 - 動画pipelineまたは分析scopeの実行を管理する。
+- `job_kind` は `video_pipeline` または `analysis_scope` とし、分析runは `analysis_scope` jobだけを参照する。
 - 状態は `queued`、`running`、`pause_requested`、`paused`、`cancel_requested`、`stopped`、`retrying`、`failed`、`succeeded`。
 - 実行前に決定的なmanifest hashと総unit数を保存する。
 
 #### `job_units`
 
 - 動画メタデータ取得とチャンネル適合判定、音声取得、文字起こし各chunk、話者割当、主体別分析入力抽出、Codex batch、自動割当、ヒートマップ更新の実作業単位を保存する。
-- 入力hash、出力hash、状態、試行回数、安全なerror code、開始・終了日時を持つ。
+- 入力hash、モデル・設定・契約versionを含むexecution contract hash、出力hash、状態、試行回数、安全なerror code、開始・終了日時を持つ。
+- 分析jobの先頭unitは主体・cutoff・入力snapshotに対応する入力契約hashを持ち、別の主体、cutoff、方針・割当状態、本文、設定用のjobをrunへ接続できないようにする。
+- manifestは各unitの先行依存を固定し、unit開始時に依存unitの実出力hashと外部入力hashから実効入力hashを一度だけ束縛する。後継jobでは依存unitを同一hashで再利用できない場合、その全後続unitを再利用しない。
 - 出力の検証とunit成功状態を同じDBトランザクションで確定する。
-- 再開時は入力hashと出力hashが一致する成功unitだけを再利用する。
+- 入力固定、各Codex batch、発言正規化、期間正規化、指数割当、予想投影、最終反映の各unitは、対応する永続出力と `success` を同じtransactionで確定する。後から別処理で実績のないunitを成功化しない。
+- 中断時に `running` のまま残ったunitと再試行対象の失敗unitは、再開処理で `pending` へ戻し、そのunitを先頭から実行する。途中出力は正式成果物として参照しない。
+- 再開時は入力hash、出力hash、モデル・設定・契約versionが一致する `success` unitだけを再利用する。
 
 #### `audit_events`
 
@@ -359,7 +375,9 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 
 ### 失敗と再試行
 
-失敗したunitとjobを `failed` にし、現在予想を部分更新しない。原因解消後は失敗unitから再試行し、成功済みunitを再計算しない。
+失敗したunitとjobを `failed` にし、現在予想を部分更新しない。原因解消後は再試行対象unitを `pending` へ戻し、そのunitを先頭から実行する。入力・成果物hashとversionが一致する成功済みunitは再計算しない。最終反映unit以外の全upstream unitと後段検証が完了した場合だけ、最終反映unitが現在予想、run受理event、監査event、heatmap cache、自身の `success`、jobの `succeeded` を一つのtransactionで更新する。
+
+故障注入testは、同一connectionのrollback確認だけでなく、connectionを閉じて開き直した後のunit状態、旧current集合、旧heatmap、旧scope状態を確認する。Python例外rollbackと別process強制終了・WAL回復は別試験とする。
 
 ### review required
 
@@ -421,12 +439,11 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 - unit出力保存とunit成功化。
 - チャンネル方針変更と監査event追加と動画適合性再評価と依存scopeのstale化。
 - 話者割当変更と監査event追加と依存scopeのstale化。
-- 同一scopeの現在発言、指数割当、現在予想の置換と監査event追加。
-- mapping reviewの追加と実効的な採用可否更新。
-- period reviewの追加と実効的な時期不明列採用可否更新。
-- 現在予想更新と影響heatmap cellの再生成。
+- 完了runの最終反映では、同一scopeの現在発言・指数割当・現在予想の置換、scopeのcurrent化、run受理event、監査event、影響heatmap cellと元予想linkの再生成、最終unitの `success`、jobの `succeeded` を一つのtransactionで確定する。
+- mapping reviewまたはperiod reviewが現在runへ適用される場合は、reviewと監査eventの追加、再投影、現在結果の置換、影響heatmap cellと元予想linkの再生成を一つのtransactionで確定する。既に成功済みの分析job状態は変更しない。
+- 未受理runまたは履歴runだけに対するmapping review・period reviewは、reviewとその監査eventを一つのtransactionで追加する。
 
-途中失敗では現在値を半端に更新しない。
+途中失敗では現在値を半端に更新しない。現在行だけを置換する公開serviceは設けず、完了runは最終反映service、現在runのreviewはreview適用serviceを必ず通す。
 
 `audit_events`、`analysis_runs`、`mapping_reviews`、`period_reviews` はSQLite triggerでもUPDATEとDELETEを拒否する。`analysis_input_snapshots` は本文の非NULLからNULLへの変更と削除日時設定だけを許可し、出典、hash、run設定その他の変更を拒否する。サービス層にも同じ規則を置き、DB制約違反を安全なerror codeへ変換する。
 
@@ -457,12 +474,12 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 18. 1つの発言へ複数の分析対象区間を順序付きで結び付けられ、個人主体では本人区間以外を拒否する。
 19. 根拠文が対応区間本文の連続部分でなければrunを採用しない。
 20. 元動画、切り抜き、Shorts、再投稿の同内容発言が、それぞれ独立した根拠として数えられる。
-21. 後の動画で反対方向になれば見解変更、同じ資産・期間・条件layerに属する同一動画内の相反予想は両方向を持つ見解相違セルになり、flatへ変換されない。
+21. 同じ公開日時・資産・比較可能な期間・条件layerの上昇系と下降系は、動画、直接性、推定割当、期間具体性にかかわらず両方向を持つ見解相違になり、flatへ変換されない。公開日時が異なる群で上昇系と下降系が反転すれば見解変更になる。
 
 ### 日付指定分析
 
-22. 公開日時がcutoff後の動画は、取得済みでも入力に含まれない。
-23. 「来週」を公開日基準で絶対日付範囲へ変換し、`time_basis = published_at` を保存する。
+22. JST翌日0時の排他的cutoff以後に公開された動画は、取得済みでも入力に含まれず、選択日内の小数秒付き公開日時は取りこぼさない。
+23. UTC保存の公開日時を固定JSTへ変換し、「来週」をJST月曜～日曜の絶対日付範囲へ変換して `time_basis = published_at` を保存する。`ZoneInfo`と`tzdata`を必要としない。
 24. 本人が述べた「2027年」は `time_basis = explicit_statement` とし、公開日基準と表示しない。
 25. 「2026年9月第1週」を、その月の1日を含む月～日の `2026-08-31`～`2026-09-06` へ変換する。
 26. 収録日時を要求・推測しない。
@@ -482,8 +499,8 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 ### checkpointと回復
 
 36. 動画情報取得と音声取得を別stageとして実完了数を表示する。
-37. 8つの文字起こしchunk中4つ完了後に停止した場合、入力と実成果物のhash検証後に5番目から再開する。
-38. unit出力保存後・成功化前の障害で、不完全出力を成功扱いしない。
+37. 8つの文字起こしchunk中4つ完了後に5番目が中断した場合、再接続後に入力・実成果物hash・versionを検証し、1～4を再利用して5番目を `pending` から先頭実行する。
+38. unit出力保存後・成功化前の障害で、不完全出力を成功扱いせず、再接続後も5番目が再実行対象になる。
 39. `pause_requested` 後に安全境界で `paused` になってから同じjobを再開し、停止後の再実行は後継jobを作る。
 40. `review required` をjob失敗と誤分類しない。
 
@@ -506,12 +523,24 @@ Codex自己信頼度だけで昇格させない。アプリ規則信頼度とCod
 52. チャンネル表示名が変わっても正規チャンネルIDが同じなら判定は変わらず、同名でもIDが違えば不適合になる。
 53. 暁投資顧問は固定ID `UCOfzLmXpI3qmZfV7_Cs1sYA` と完全一致する公式チャンネル動画だけが `eligible` になり、動画内の全発言が組織主体の入力になる。
 54. 動画の正規チャンネルIDを解決できない場合は `channel_unresolved` となり、表示名一致だけで収集・分析へ進まない。
+55. 全upstream unit成功後の最終反映unitで故障し、connectionを開き直しても、旧current集合、旧heatmap、旧scope状態が完全に残り、最終反映unitだけが `pending` へ戻る。
+56. 同じ公開日時群の一方が直接予想でも他方が発言内推論でも、上昇系と下降系なら見解相違になる。
+57. 同じ週・月slotへ複数の元期間が重なっても、多対多linkで全元予想と期間を保持し、条件layerを混ぜずに決定的に投影できる。
+58. `low`・`unresolved`は承認前に公開日時群の競合判定と主ヒートマップへ入らない。
+59. 別processを最終反映transactionの途中で強制終了しても、再起動後に旧集合を読み出し、最終反映unitだけを再実行できる。電源断・ディスク故障の保証とは区別する。
+60. 最終反映成功時は、現在予想、run受理event、監査event、heatmap cache、最終unitの `success`、jobの `succeeded` が同じcommitで可視になる。
+61. 現在行だけを置換してheatmap、run受理event、最終unit、job成功を迂回する公開serviceが存在しない。
+62. 現在runに対するmapping・period reviewは、review、再投影、現在結果、heatmap、監査eventが同時に成功するか、すべてrollbackする。
+63. 別の主体・cutoff・policy/assignment状態・入力本文・Codex契約用に作られた分析jobをrunへ接続しようとすると、scopeやrunを作る前に拒否する。
+64. Codex batch、発言、期間、指数割当、予想投影のいずれかで書込み中に失敗すると、そのunitの出力行と `success` がともにrollbackし、既に成功済みの前段unitだけを再利用できる。
+65. 停止した分析jobの後継jobは、run所有の成功済み成果物をすべて同一hashで再利用できる場合だけ同じrunへ接続でき、再計算が必要な場合は新しいrunを要求する。
+66. 先行unitの成果物hash、execution contract、またはunit開始時に束縛した外部入力hashが変わると、そのunitと依存する後続unitを再利用しない。
 
 ## テストの層
 
 - DB制約テスト: 一意性、外部キー、状態enum、時刻範囲、現在値1件、レビューゲート、追記専用trigger、本文削除だけを許すsnapshot制約。
-- ドメイン規則テスト: 主体別チャンネルID適合、手動URLの非迂回、cutoff、明示・相対・時期不明期間、個人話者隔離と暁投資顧問例外、根拠本文一致、4分類、直接予想と発言内推論、転換点、信頼度、競合市場、空欄、見解変更・見解相違、重複非排除。
-- pipeline統合テスト: 動画情報と音声取得の別進捗、checkpoint、一時停止・停止・再開、成果物hash検証、失敗再試行、stale化、transaction、専用フォルダー限定削除。
+- ドメイン規則テスト: 主体別チャンネルID適合、手動URLの非迂回、固定JST cutoff、明示・相対・時期不明期間、個人話者隔離と暁投資顧問例外、根拠本文一致、4分類、直接予想と発言内推論、転換点、信頼度、競合市場、空欄、公開日時群による見解変更・見解相違、重複非排除。
+- pipeline統合テスト: 動画情報と音声取得の別進捗、checkpoint、一時停止・停止・再開、作業unit先頭からの再実行、途中成果物不採用、成果物hash・version検証、再接続後のrollback永続状態、stale化、transaction、専用フォルダー限定削除。
 - 合成end-to-endテスト: 架空名と合成発言だけで、保存済み入力から16行ヒートマップまで検証する。
 - 手動性能確認: ユーザー報告の文字起こし約74分、話者割当約4分、Codex分析約4.5分を比較値にするが、固定SLAにはしない。
 

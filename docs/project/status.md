@@ -6,7 +6,7 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンド19タスク計画も承認済みだが、本実装前に使い捨てのSQLite縦断スパイクを行う。書面spec、38 scenario・7 Taskの詳細実行計画、開始までの確認事項はユーザー承認済み。現在は隔離worktreeの準備段階で、アプリ本体とM2本実装は未着手である。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2事前の使い捨てSQLite縦断スパイクも、隔離worktreeで38/38 scenario成功として完了した。検証から得たUTC保存＋固定JST、作業unit単位の再実行、再接続後のrollback確認、公開日時群による見解相違・見解変更の修正は、正本文書への反映とユーザー書面承認まで完了した。承認後にM2の19タスク計画を最終監査し、実装可能な依存hash、job-attempt、原子的進捗、現在結果更新、heatmap再投影、process crash試験へ具体化した。アプリ本体とM2本実装は未着手で、開始には別の明示承認が必要である。
 
 ## Git状態（Git State）
 
@@ -55,12 +55,23 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - 読み取り専用の事前確認でPython 3.14.6、SQLite 3.50.4、必要な標準ライブラリ、約60GBの空き容量を確認した。
 - 書面化したフィージビリティ・スパイクspecがユーザー承認された。
 - 38 scenario・7 Taskの詳細実行計画とスモールテスト開始までの全確認事項がユーザー承認された。
+- `.worktrees/` を公開対象から除外し、隔離worktree `spike/m2-core-feasibility` を作成した。
+- 本番packageへ流用しない合成SQLite模型を実装し、38 scenarioを全件実行して38 passed、0 failed、0 error、0 skippedを確認した。8つの必須安全条件はすべてpassした。
+- 400動画、10,000区間、2,000発言、2,500指数割当、4 scopeの合成fixtureで投影・checkpoint・heatmap再生成を計測した。これは実YouTube、音声、Codex CLI、API、UI、process crashの検証ではない。
+- フィージビリティ結果から、固定UTC+9のJST実装、故障後の再接続確認、同一公開日時と複数期間slotの追加試験をM2計画変更候補として特定した。
+- DB保存・内部比較をUTC、画面・日付指定・相対期間・週境界を固定JST（UTC+9）とし、`ZoneInfo`と`tzdata`を使わない方針がユーザー承認された。
+- 中断・失敗時は5～10分相当の作業unitだけを `pending` から先頭実行し、途中出力を採用せず、全upstream unitと後段検証の完了後に最終反映unitが現在予想・ヒートマップ・自身・job状態を原子的に更新する方針がユーザー承認された。
+- 同じ公開日時の上昇系・下降系を見解相違、異なる公開日時での反転を見解変更とする規則がユーザー承認された。
+- 承認済み差分を `docs/superpowers/specs/2026-08-15-m2-feasibility-corrections-design.md` に書面化した。
+- フィージビリティ修正書面のユーザーレビューが承認された。
+- `superpowers:writing-plans` で19タスク計画を最終監査し、manifest依存graphと実入力hash束縛、runの追記専用job-attempt、成果物とunit成功の同一transaction、同方向再投稿で消えない見解変更、共通再投影型、Task 14の非公開writer、Task 16の唯一の最終反映・現在review経路、多対多heatmap元予想link、子process crash回復を明文化した。
+- 最終監査は設計文書だけを変更した。M2実装コード、実装用worktree、commit、pushは行っていない。
 
 ## 作業中（In Progress）
 
 - 現在進行中のアプリ実装作業はない。
-- 承認済み詳細計画をこのスレッド内で順次実行するため、隔離worktreeの準備を進めている。サブエージェントは起動しない。
-- worktree作成、実験コード作成、スモールテスト実行、M2本実装はいずれも未実施。
+- 承認済みフィージビリティ修正の正本文書反映、ユーザー書面レビュー、19タスク計画の最終監査は完了し、M2本実装の別の明示承認を待っている。
+- M2本実装、実YouTube・音声・Codex CLI・API/UI検証は開始していない。
 
 ## 未着手（Not Started）
 
@@ -68,7 +79,7 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
 - MVPで固定する音声モデル名・バージョン、具体的な生スコア尺度・閾値値、閾値設定バージョンの初期値、保留話者の手動レビュー手順。
-- M2以降のアプリ実装。フィージビリティ結果と修正候補の承認前には着手しない。
+- M2以降のアプリ実装。修正文書のレビュー完了後も、ユーザーの明示的な実装開始承認までは着手しない。
 
 ## 検証結果（Verification Results）
 
@@ -86,6 +97,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - 主体別チャンネル方針の改定後、旧「個人3名は他チャンネルも対象」の残存なし、必須ゲートの記載、架空チャンネルIDなし、決定IDの一意性を検査し、全119テストとworking tree・stagedの公開安全検査に成功した。
 - 2026-08-15の書面spec承認後、旧12タスク草案をM2の19タスク・15 migration計画へ置換し、全TaskのFiles・Interfaces・RED・focused/full test・限定commit、spec対応表、完了条件を確認した。Task連番、migration連番、code fence、placeholder、旧実行禁止表示、旧要件の残存を機械検査し、すべて成功した。
 - 同じ計画改訂に対する全決定的スイートは119 passed、0 failed。状態文書検査、working treeの公開安全性検査28ファイル、`git diff --check` が成功した。
+- M2事前フィージビリティ検証はPython 3.14.6、SQLite 3.50.4、固定seed `20260815` で38/38 scenario成功、8/8必須安全条件passだった。模型DBは3,784,704 bytesで、実データ・資格情報を含まない。
+- 同検証の故障注入では、完了済み4/8 unitの再利用、hash不一致の非再利用、出力後・成功前故障の非成功扱い、現在結果置換失敗時の旧集合保持を確認した。
+- 修正書面承認後のM2計画最終監査では、変更対象8文書、Task 1～19、各Taskの連続Step、migration 0001～0015、39件の一意な決定ID、全code fence、placeholder不在、各TaskのFiles一覧と限定 `git add` 対象の完全一致を機械検査した。
+- 同じ最終監査変更に対し、作業状態の全決定的スイートは119 passed、0 failed、working treeの公開安全性検査は32ファイルで成功し、`git diff --check` も成功した。
 
 ### ユーザー報告のスモールテスト結果
 
@@ -116,10 +131,9 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. `.worktrees/` を除外設定へ追加してから隔離worktreeを作る。
-2. 使い捨て実験コードで全scenario、故障注入、拡大fixture、性能計測を実行する。
-3. 結果、性能値、M1/M2修正候補を提示し、適用可否の承認を受ける。
-4. M2本実装は別の明示承認後に開始する。
+1. M2本実装についてユーザーの別の明示承認を受ける。
+2. 承認後に `superpowers:using-git-worktrees` で本実装用の隔離worktreeを確認する。
+3. 採用済みのタスク別実装・仕様適合レビュー・コード品質レビュー方式で、最終監査済みTask 1からテスト先行で開始する。
 
 ## 重要ファイル（Important Files）
 
@@ -129,9 +143,11 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - `docs/project/public-data-policy.md`: 公開・非公開情報の境界。
 - `docs/superpowers/specs/2026-08-14-cross-pc-work-state-design.md`: 保存・再開基盤の承認済み設計。
 - `docs/superpowers/specs/2026-08-14-core-data-model-design.md`: 書面反映版まで承認済みのM1中核データモデル、処理状態、削除、受け入れ試験設計。
-- `docs/superpowers/plans/2026-08-14-core-data-model.md`: ユーザー承認済みのM2中核バックエンド19タスク詳細計画。実装開始待ち。
+- `docs/superpowers/plans/2026-08-14-core-data-model.md`: 承認済みフィージビリティ差分を反映し、最終監査済みのM2中核バックエンド19タスク詳細計画。実装開始待ち。
+- `docs/superpowers/specs/2026-08-15-m2-feasibility-corrections-design.md`: UTC/JST、unit再実行、再接続、公開日時群の競合に関する承認済み差分設計。
 - `docs/superpowers/specs/2026-08-15-m2-core-feasibility-spike-design.md`: 書面までユーザー承認済みのM2事前フィージビリティ・スパイク設計。
-- `docs/superpowers/plans/2026-08-15-m2-core-feasibility-spike.md`: ユーザー承認済みの38 scenario・7 Task詳細実行計画。実行中。
+- `docs/superpowers/plans/2026-08-15-m2-core-feasibility-spike.md`: 実行済みの38 scenario・7 Task詳細計画。
+- `docs/superpowers/reports/2026-08-15-m2-core-feasibility.md`: 38 scenario、性能観測、findings、未検証範囲を記録した検証報告。模型コードは本番へ流用しない。
 - `.agents/skills/save-work-state/SKILL.md`: GitHubへ保存する処理契約。
 - `.agents/skills/resume-work-state/SKILL.md`: 別PCで再開する処理契約。
 - `tests/work-state/run-tests.ps1`: 決定的な全検査の入口。
