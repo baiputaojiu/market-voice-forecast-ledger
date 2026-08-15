@@ -142,6 +142,20 @@ def _mark_first_four_chunks_complete(db, job_id: int) -> None:
         service.complete_unit(job_id, unit_key, output_hash)
 
 
+def _failed_job_with_running_sibling(
+    db,
+) -> tuple[JobStateService, JobManifest, int]:
+    service = JobStateService(db)
+    manifest = _video_manifest(2)
+    job_id = service.create(manifest)
+    service.begin_unit(job_id, "transcription:chunk:1")
+    service.begin_unit(job_id, "transcription:chunk:2")
+    service.fail_unit(
+        job_id, "transcription:chunk:1", "synthetic_retryable"
+    )
+    return service, manifest, job_id
+
+
 def _complete_analysis_unit(
     db,
     service: JobStateService,
@@ -414,6 +428,47 @@ def test_successor_rejects_a_manifest_from_the_other_job_kind(db):
         )
 
     assert error.value.code == "SUCCESSOR_KIND_MISMATCH"
+
+
+def test_successor_rejects_a_failed_source_with_a_running_attempt(db):
+    service, manifest, job_id = _failed_job_with_running_sibling(db)
+
+    with pytest.raises(DomainError) as error:
+        service.create_successor(job_id, manifest, {}, {})
+
+    assert error.value.code == "SOURCE_JOB_NOT_QUIESCENT"
+    assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    assert (
+        service.unit(job_id, "transcription:chunk:2").status
+        is UnitStatus.RUNNING
+    )
+
+
+def test_failed_source_can_create_successor_after_interrupted_recovery(
+    db_path,
+):
+    first = open_database(db_path)
+    apply_migrations(first)
+    _, manifest, job_id = _failed_job_with_running_sibling(first)
+    first.close()
+
+    reopened = open_database(db_path)
+    try:
+        service = JobStateService(reopened)
+        recovery = service.recover_interrupted(job_id, {})
+
+        assert service.status(job_id) is JobStatus.FAILED
+        assert recovery.pending_unit_keys == (
+            "transcription:chunk:1",
+            "transcription:chunk:2",
+        )
+        successor_id, plan = service.create_successor(
+            job_id, manifest, {}, {}
+        )
+        assert successor_id != job_id
+        assert plan.pending_unit_keys == recovery.pending_unit_keys
+    finally:
+        reopened.close()
 
 
 def test_successor_requires_the_supplied_external_input_to_match(
@@ -693,7 +748,7 @@ def test_pause_failure_with_another_running_unit_requires_crash_recovery(db):
     assert error.value.code == "INTERRUPTED_RECOVERY_REQUIRED"
 
     plan = service.recover_interrupted(job_id, {})
-    assert service.status(job_id) is JobStatus.RETRYING
+    assert service.status(job_id) is JobStatus.FAILED
     assert plan.pending_unit_keys == (
         "transcription:chunk:1",
         "transcription:chunk:2",

@@ -264,3 +264,46 @@ def test_manifest_rejects_private_path_like_unit_keys():
         JobManifest.build(JobKind.VIDEO_PIPELINE, units)
 
     assert error.value.code == "INVALID_UNIT_KEY"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "error_code"),
+    [
+        ("declared_input_hash", "UNSAFE_DECLARED_INPUT_HASH"),
+        ("execution_contract_hash", "UNSAFE_EXECUTION_CONTRACT_HASH"),
+    ],
+)
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        r"C:\private\input.json",
+        "/private/input.json",
+        '{"private":"body"}',
+        "hash with whitespace",
+        "hash\nprivate-body",
+        "hash\tprivate-body",
+        "a" * 257,
+    ],
+)
+def test_manifest_rejects_unsafe_hash_tokens(
+    field_name, error_code, unsafe_value
+):
+    fields = {
+        "declared_input_hash": "input-contract",
+        "execution_contract_hash": "contract-v2",
+    }
+    fields[field_name] = unsafe_value
+    unit = ManifestUnit(
+        "video:one",
+        JobStage.VIDEO_METADATA,
+        1,
+        fields["declared_input_hash"],
+        (),
+        fields["execution_contract_hash"],
+    )
+
+    with pytest.raises(DomainError) as error:
+        JobManifest.build(JobKind.VIDEO_PIPELINE, (unit,))
+
+    assert error.value.code == error_code
+    assert error.value.message == "hash metadata must be a safe token"

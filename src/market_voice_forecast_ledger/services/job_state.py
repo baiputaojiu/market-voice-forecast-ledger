@@ -20,6 +20,7 @@ from market_voice_forecast_ledger.domain.jobs import (
     ResumePlan,
     StageProgress,
     effective_input_hash,
+    validate_hash_token,
 )
 from market_voice_forecast_ledger.repositories.jobs import (
     JobRepository,
@@ -27,7 +28,6 @@ from market_voice_forecast_ledger.repositories.jobs import (
 )
 
 
-_SAFE_HASH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 _SUCCESSOR_SOURCE_STATUSES = frozenset(
     {
@@ -67,10 +67,11 @@ class JobStateService:
         for artifact_hash in artifact_hashes.values():
             self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
         for external_input_hash in external_input_hashes.values():
-            if external_input_hash is not None:
-                self._validate_hash(
-                    external_input_hash, "UNSAFE_EXTERNAL_INPUT_HASH"
-                )
+            self._validate_hash(
+                external_input_hash,
+                "UNSAFE_EXTERNAL_INPUT_HASH",
+                allow_none=True,
+            )
 
         with transaction(self._conn):
             source_job = self._jobs.get(source_job_id)
@@ -86,6 +87,13 @@ class JobStateService:
                 )
             self._stored_manifest(source_job)
             source_units = self._jobs.list_units(source_job_id)
+            if any(
+                unit.status is UnitStatus.RUNNING for unit in source_units
+            ):
+                raise DomainError(
+                    "SOURCE_JOB_NOT_QUIESCENT",
+                    "a successor requires a source with no running attempts",
+                )
             source_by_key = {unit.unit_key: unit for unit in source_units}
 
             successor_id = self._jobs.create(
@@ -170,10 +178,11 @@ class JobStateService:
         unit_key: str,
         external_input_hash: str | None = None,
     ) -> JobUnit:
-        if external_input_hash is not None:
-            self._validate_hash(
-                external_input_hash, "UNSAFE_EXTERNAL_INPUT_HASH"
-            )
+        self._validate_hash(
+            external_input_hash,
+            "UNSAFE_EXTERNAL_INPUT_HASH",
+            allow_none=True,
+        )
         input_changed = False
         with transaction(self._conn):
             job = self._jobs.get(job_id)
@@ -484,7 +493,6 @@ class JobStateService:
                 )
                 self._transition(job, JobStatus.PAUSED)
             elif job.status is JobStatus.FAILED:
-                self._transition(job, JobStatus.RETRYING)
                 plan = self._reset_and_plan(
                     job_id,
                     units,
@@ -702,6 +710,10 @@ class JobStateService:
             )
 
     @staticmethod
-    def _validate_hash(value: str, error_code: str) -> None:
-        if not isinstance(value, str) or not _SAFE_HASH.fullmatch(value):
-            raise DomainError(error_code, "hash metadata must be a safe token")
+    def _validate_hash(
+        value: object,
+        error_code: str,
+        *,
+        allow_none: bool = False,
+    ) -> None:
+        validate_hash_token(value, error_code, allow_none=allow_none)

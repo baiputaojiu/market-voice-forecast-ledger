@@ -67,6 +67,19 @@ LEGAL_TRANSITIONS = {
 }
 
 _SAFE_UNIT_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SAFE_HASH_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+
+
+def validate_hash_token(
+    value: object,
+    error_code: str,
+    *,
+    allow_none: bool = False,
+) -> None:
+    if value is None and allow_none:
+        return
+    if not isinstance(value, str) or not _SAFE_HASH_TOKEN.fullmatch(value):
+        raise DomainError(error_code, "hash metadata must be a safe token")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +114,16 @@ class JobManifest:
         if any(not _SAFE_UNIT_KEY.fullmatch(item.unit_key) for item in ordered):
             raise DomainError(
                 "INVALID_UNIT_KEY", "unit keys must be safe logical identifiers"
+            )
+        for item in ordered:
+            validate_hash_token(
+                item.declared_input_hash,
+                "UNSAFE_DECLARED_INPUT_HASH",
+                allow_none=True,
+            )
+            validate_hash_token(
+                item.execution_contract_hash,
+                "UNSAFE_EXECUTION_CONTRACT_HASH",
             )
 
         earlier: set[str] = set()
