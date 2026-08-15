@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from market_voice_forecast_ledger.api import dependencies
 from market_voice_forecast_ledger.api.app import create_app
 from market_voice_forecast_ledger.api.dependencies import PublicReadAdapter
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.domain.enums import AssignmentKind
-from tests.backend.integration.test_review_application import (
-    _accepted_low_mapping,
-    _accepted_unknown,
+from tests.backend.e2e.synthetic_fixture import (
+    create_accepted_low_mapping_fixture,
+    create_accepted_unknown_period_fixture,
+    create_retained_forecast_fixture,
+    create_speaker_correction_fixture,
 )
-from tests.backend.integration.test_speaker_corrections import _speaker_fixture
-from tests.backend.integration.test_text_deletion import _retained_forecast
 
 
 @pytest.fixture
@@ -25,7 +27,13 @@ def settings(tmp_path) -> Settings:
 
 @pytest.fixture
 def client(settings: Settings):
-    with TestClient(create_app(settings)) as value:
+    with patch.object(
+        dependencies,
+        "bootstrap_reference_data",
+        lambda conn: None,
+    ):
+        app = create_app(settings)
+    with TestClient(app) as value:
         yield value
 
 
@@ -35,18 +43,12 @@ def test_mapping_review_uses_atomic_review_application_service(
     conn = open_database(settings.database_path)
     try:
         private_evidence = "transcript_full_api_mapping_sentinel"
-        prepared, _, scope_id = _accepted_low_mapping(conn, private_evidence)
-        mapping_id = prepared.mapping_ids[0]
-        fixture_subject_id = conn.execute(
-            "SELECT subject_id FROM analysis_scopes WHERE id=?",
-            (scope_id,),
-        ).fetchone()["subject_id"]
-        conn.execute(
-            "UPDATE analysis_subjects SET is_active=0 "
-            "WHERE id=(SELECT MIN(id) FROM analysis_subjects WHERE id!=?)",
-            (fixture_subject_id,),
+        prepared, _, scope_id = create_accepted_low_mapping_fixture(
+            conn,
+            private_evidence,
+            additional_active_subjects=3,
         )
-        conn.commit()
+        mapping_id = prepared.mapping_ids[0]
         cutoff = conn.execute(
             "SELECT cutoff_day_jst FROM analysis_scopes WHERE id=?",
             (scope_id,),
@@ -141,7 +143,9 @@ def test_period_review_uses_atomic_review_application_service(
 ):
     conn = open_database(settings.database_path)
     try:
-        prepared, _, scope_id = _accepted_unknown(conn, "api-period")
+        prepared, _, scope_id = create_accepted_unknown_period_fixture(
+            conn, "api-period"
+        )
         period_id = prepared.period_ids[0]
     finally:
         conn.close()
@@ -172,7 +176,9 @@ def test_speaker_correction_calls_real_service_and_leaves_results_stale(
 ):
     conn = open_database(settings.database_path)
     try:
-        fixture = _speaker_fixture(conn, AssignmentKind.SUBJECT)
+        fixture = create_speaker_correction_fixture(
+            conn, AssignmentKind.SUBJECT
+        )
     finally:
         conn.close()
 
@@ -216,7 +222,9 @@ def test_speaker_correction_read_failure_does_not_escape_atomic_write(
 ):
     conn = open_database(settings.database_path)
     try:
-        fixture = _speaker_fixture(conn, AssignmentKind.SUBJECT)
+        fixture = create_speaker_correction_fixture(
+            conn, AssignmentKind.SUBJECT
+        )
         assignment_before = tuple(
             conn.execute(
                 "SELECT * FROM speaker_assignments WHERE segment_id=?",
@@ -281,7 +289,7 @@ def test_retention_requires_exact_preview_token_and_preserves_public_results(
 ):
     conn = open_database(settings.database_path)
     try:
-        fixture = _retained_forecast(conn, tmp_path)
+        fixture = create_retained_forecast_fixture(conn, tmp_path)
         before = tuple(
             tuple(row)
             for row in conn.execute(
@@ -453,7 +461,9 @@ def test_mapping_review_rollback_is_atomic_and_storage_error_is_private(
 ):
     conn = open_database(settings.database_path)
     try:
-        prepared, _, scope_id = _accepted_low_mapping(conn, "api-rollback")
+        prepared, _, scope_id = create_accepted_low_mapping_fixture(
+            conn, "api-rollback"
+        )
         mapping_id = prepared.mapping_ids[0]
         current_before = tuple(
             tuple(row)

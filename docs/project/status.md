@@ -1,18 +1,20 @@
 # 作業状態
 
-最終更新: 2026-08-15 JST
+最終更新: 2026-08-16 JST
 
 この文書の状態は、このファイルを含むcommitに対応する。SHAは本文へ埋め込まず、Gitから取得する。
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2事前の使い捨てSQLite縦断スパイクも、隔離worktreeで38/38 scenario成功として完了した。検証から得たUTC保存＋固定JST、作業unit単位の再実行、再接続後のrollback確認、公開日時群による見解相違・見解変更の修正は、正本文書への反映とユーザー書面承認まで完了した。承認後にM2の19タスク計画を最終監査し、実装可能な依存hash、job-attempt、原子的進捗、現在結果更新、heatmap再投影、process crash試験へ具体化した。アプリ本体とM2本実装は未着手で、開始には別の明示承認が必要である。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～18をcommit済みで、Task 19の合成E2E、子process crash回復、Windows一括検証入口も自動検証まで実装した。Task 19の初回独立reviewで受け入れた5 findingsはREDから修正し、fresh一括検証を通過した。最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）で、現在はpost-review最終検証と限定commit前である。番号付きTasks 1～19の後にもwhole-branch最終監査・統合確認が必要であり、M2全体の完了や次subprojectの開始はまだ承認されていない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- branch: `main`
-- upstream: `origin/main`
+- 実装worktree branch: `feature/m2-core-backend`
+- Task 19開始HEAD: `932a97e0cceef6f33dd4812331343e7875e9308d` (`feat: expose loopback forecast ledger api`)
+- Task 19 commit: 未作成。独立再reviewはAPPROVE済みで、post-review fresh verification後に承認済みpathだけをcommitする。
+- upstream: なし。このTaskではpush・merge・rebaseもlive remote検証も行っていない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
 - 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
@@ -66,12 +68,18 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - フィージビリティ修正書面のユーザーレビューが承認された。
 - `superpowers:writing-plans` で19タスク計画を最終監査し、manifest依存graphと実入力hash束縛、runの追記専用job-attempt、成果物とunit成功の同一transaction、同方向再投稿で消えない見解変更、共通再投影型、Task 14の非公開writer、Task 16の唯一の最終反映・現在review経路、多対多heatmap元予想link、子process crash回復を明文化した。
 - 最終監査は設計文書だけを変更した。M2実装コード、実装用worktree、commit、pushは行っていない。
+- M2 Task 1～5でpackage・migration、追記専用監査、主体・チャンネル・動画、適合判定、transcript・音声model metadata・話者割当を実装した。
+- M2 Task 6～8でjob manifest・checkpoint・再開、cutoff scope・変更不能run snapshot、Codex出力contractを実装した。
+- M2 Task 9～12で発言分類と複数根拠、期間、指数割当、時期不明・low・unresolved reviewを実装した。
+- M2 Task 13～16で予想と見解相違・変更、原子的な現在行、修正監査・stale化、週・月heatmapを実装した。
+- M2 Task 17～18で保持・削除・安全な音声清掃とloopback-only FastAPI境界を実装した。
+- M2 Task 19で完全合成の4主体×4資産E2E、公開review経路、crash rollback/recovery、一括検証scriptを実装した。成功状態はrepository/serviceと実際の`promote_completed_run`だけで構築し、非active negative controlの作成に限ってtest helperのparameterized SQLを1回使用する。
 
 ## 作業中（In Progress）
 
-- 現在進行中のアプリ実装作業はない。
-- 承認済みフィージビリティ修正の正本文書反映、ユーザー書面レビュー、19タスク計画の最終監査は完了し、M2本実装の別の明示承認を待っている。
-- M2本実装、実YouTube・音声・Codex CLI・API/UI検証は開始していない。
+- Task 19の初回独立read-only reviewはREQUEST_CHANGES（Critical 0、Important 4、Minor 1）。第2構築SQL、短い根拠proof、privacy sentinel、Python選択、固定clockの全5件を受け入れ、順次REDから修正した。
+- 最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）。この状態更新後にfresh一括検証し、承認済みpathだけを限定commitする。
+- 実YouTube、実音声、実Codex/model/tool、実server/socket、UIの統合検証は行っていない。
 
 ## 未着手（Not Started）
 
@@ -79,7 +87,8 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
 - MVPで固定する音声モデル名・バージョン、具体的な生スコア尺度・閾値値、閾値設定バージョンの初期値、保留話者の手動レビュー手順。
-- M2以降のアプリ実装。修正文書のレビュー完了後も、ユーザーの明示的な実装開始承認までは着手しない。
+- Tasks 1～19のwhole-branch最終監査・統合確認とユーザー受け入れ。
+- 次subproject。候補は収集・音声・Codex adapter・UI・常駐workerで、ユーザーの明示承認までは着手しない。
 
 ## 検証結果（Verification Results）
 
@@ -101,6 +110,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - 同検証の故障注入では、完了済み4/8 unitの再利用、hash不一致の非再利用、出力後・成功前故障の非成功扱い、現在結果置換失敗時の旧集合保持を確認した。
 - 修正書面承認後のM2計画最終監査では、変更対象8文書、Task 1～19、各Taskの連続Step、migration 0001～0015、39件の一意な決定ID、全code fence、placeholder不在、各TaskのFiles一覧と限定 `git add` 対象の完全一致を機械検査した。
 - 同じ最終監査変更に対し、作業状態の全決定的スイートは119 passed、0 failed、working treeの公開安全性検査は32ファイルで成功し、`git diff --check` も成功した。
+- 2026-08-16のTask 19最新tree検証でbackend 772件を収集し、771 passed、1 skipped。skipはWindowsでsymlink作成が`OSError`となる環境向けcapability test `test_symlink_escape_is_refused_where_supported`だけだった。
+- 合成E2Eは2 passed、crash回復とWindows検証入口のintegration moduleは5 passed、Task 18のAPI/private境界focused suiteは74 passed、E2Eとfixture移行対象4 moduleの合計は97 passedだった。
+- `scripts/test-backend.ps1` はexit 0で、backend全件、`compileall`、work-state 119 passed・0 failed、状態文書検査、working-tree公開安全性、`git diff --check`を順番に完走した。
+- Task 19の初回独立reviewはCritical 0・Important 4・Minor 1で、全findingを実行可能なREDから修正した。最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）。実際の外部call、server/socket、repository内runtime artifactは発生していない。
 
 ### ユーザー報告のスモールテスト結果
 
@@ -121,6 +134,9 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - `.stitch`生生成物は公開対象外。公開用の画面資料は後続UI設計で別途無害化する必要がある。
 - skill-creator公式`quick_validate.py`はローカルPythonにPyYAMLがないため未実行。frontmatter、metadata、必須契約はローカル構造テスト34件とCodex反復評価で検証した。
 - CPUのみで一連の処理が動くことはユーザーの端末で確認されたが、同じ入力、実装、測定条件をリポジトリ内で再現する自動性能試験は未整備。
+- 現在のFastAPI TestClient依存から、Starletteの`httpx`利用非推奨warningが1件出る。テスト失敗ではなく、後続のdependency更新時に追跡する。
+- 現在のWindows環境はsymlink作成権限がなく、symlink escapeのcapability test 1件を理由付きでskipした。
+- Task 19は完全合成・process内API試験であり、実YouTube、音声、Codex CLI/model/tool、HTTP server/socket、UIを検証していない。
 
 ## 未解決事項（Open Questions）
 
@@ -131,9 +147,9 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. M2本実装についてユーザーの別の明示承認を受ける。
-2. 承認後に `superpowers:using-git-worktrees` で本実装用の隔離worktreeを確認する。
-3. 採用済みのタスク別実装・仕様適合レビュー・コード品質レビュー方式で、最終監査済みTask 1からテスト先行で開始する。
+1. Task 19のpost-review fresh verificationと限定commitを完了する。
+2. `/root` がTasks 1～19のwhole-branch最終監査・統合確認を別工程で行う。
+3. 中核バックエンドの受け入れと次subprojectについてユーザー判断を受ける。次工程は自動承認しない。
 
 ## 重要ファイル（Important Files）
 
@@ -143,7 +159,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - `docs/project/public-data-policy.md`: 公開・非公開情報の境界。
 - `docs/superpowers/specs/2026-08-14-cross-pc-work-state-design.md`: 保存・再開基盤の承認済み設計。
 - `docs/superpowers/specs/2026-08-14-core-data-model-design.md`: 書面反映版まで承認済みのM1中核データモデル、処理状態、削除、受け入れ試験設計。
-- `docs/superpowers/plans/2026-08-14-core-data-model.md`: 承認済みフィージビリティ差分を反映し、最終監査済みのM2中核バックエンド19タスク詳細計画。実装開始待ち。
+- `docs/superpowers/plans/2026-08-14-core-data-model.md`: M2中核バックエンドTasks 1～19の承認済み詳細計画。
+- `tests/backend/e2e/synthetic_fixture.py`: 4主体×4資産の完全合成public-service E2E fixture。
+- `tests/backend/README.md`: Windows setup、直接test、一括検証、artifact境界。
+- `scripts/test-backend.ps1`: backend・compile・work-state・公開安全性・diffの一括検証入口。
 - `docs/superpowers/specs/2026-08-15-m2-feasibility-corrections-design.md`: UTC/JST、unit再実行、再接続、公開日時群の競合に関する承認済み差分設計。
 - `docs/superpowers/specs/2026-08-15-m2-core-feasibility-spike-design.md`: 書面までユーザー承認済みのM2事前フィージビリティ・スパイク設計。
 - `docs/superpowers/plans/2026-08-15-m2-core-feasibility-spike.md`: 実行済みの38 scenario・7 Task詳細計画。

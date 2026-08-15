@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### M2準備: 最終監査済み19タスク計画と実装開始ゲート
+### M2中核バックエンド: Task 19最終確認
 
-M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2事前の使い捨てSQLite縦断スパイクも38/38 scenario成功で完了し、UTC保存＋固定JST、作業unit単位の再実行、再接続後のrollback確認、公開日時群による見解相違・見解変更の修正書面はユーザー承認済みである。承認後の最終計画監査で、unit依存hash、run/job-attempt、成果物と進捗の原子性、現在結果の公開更新経路、複数元予想の再投影、子process crash回復まで19タスクへ具体化した。M2本実装は別の明示承認まで開始しない。
+M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2中核バックエンドは隔離branch `feature/m2-core-backend` でTask 1～18をcommit済みで、Task 19の合成E2E、子process crash回復、Windows一括検証入口も自動検証まで実装した。Task 19の初回独立reviewで受け入れた5 findingsはREDから修正し、fresh一括検証を通過した。最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）で、post-review最終検証と限定commitだけが未完了である。番号付きTaskの完了後にもwhole-branch最終監査・統合確認が別に必要で、次のsubprojectはユーザー承認前に開始しない。
 
 ## 完了済み（Completed）
 
@@ -46,25 +46,32 @@ M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M
 - フィージビリティ修正書面のユーザーレビューが承認された。
 - `superpowers:writing-plans` による19タスクの最終監査を行い、分析jobの依存hash束縛と後継attempt、各永続成果物とunit成功の同時確定、見解変更履歴の保持、Task 14の非公開現在行writer、Task 16の唯一の最終反映・review公開経路、複数元予想link、子process crash試験を計画へ反映した。
 - Task連番、Step連番、15 migration、code fence、共有型と前後依存を再検査した。M2実装コード、worktree、commit、pushは作成していない。
+- M2 Task 1～5でPython package、15 migration基盤、追記専用監査、主体・チャンネル方針、動画・transcript・固定音声model metadata、話者割当を実装した。
+- M2 Task 6～8で決定的job manifest、checkpoint・再開、cutoff scope、変更不能run入力snapshot、Codex構造化出力のfail-closed contractを実装した。
+- M2 Task 9～12で4種類の発言分類、複数根拠、期間正規化・時期不明review、指数割当とlow/unresolved reviewを実装した。
+- M2 Task 13～16で将来予想、見解相違・変更、原子的な現在行置換、修正監査とstale化、週・月16行heatmap cacheを実装した。
+- M2 Task 17～18で保持・削除と安全な音声清掃、loopback-only FastAPIのread/write・private response境界を実装した。
+- M2 Task 19の合成4主体×4資産E2E、review・競合、SQLite crash rollback/recovery、Windows一括検証入口を実装し、自動検証を通過させた。
 
 ## 作業中（In Progress）
 
-- 現在進行中のアプリ実装タスクはない。
-- 承認済みフィージビリティ修正の正本反映、書面レビュー、19タスク計画の最終監査は完了し、M2本実装の別の明示承認を待っている。
+- 初回独立reviewのCritical 0・Important 4・Minor 1をすべて受け入れ、各findingを実行可能なREDから順番に修正した。
+- 最新treeの独立再reviewはAPPROVE（Critical 0、Important 0、Minor 0）。この状態更新後にfresh一括検証し、approved pathだけを限定commitする。
 
 ## 未着手（Not Started）
 
-### M2: 中核バックエンド
+### M2中核バックエンドの完了確認
 
-1. M2本実装についてユーザーの明示的な開始承認を受ける。
-2. 承認後に `superpowers:using-git-worktrees` で本実装用の隔離worktreeを確認する。
-3. 採用済みのタスク別実装・仕様適合レビュー・コード品質レビュー方式で、最終監査済み19タスク計画のTask 1からテスト先行で実装する。
+1. Task 19のpost-review fresh verificationと限定commitを完了する。
+2. `/root` がTasks 1～19のwhole-branch最終監査・統合確認を別工程で行う。
+3. 中核バックエンドの受け入れと次subprojectについてユーザー判断を受ける。番号付きTaskの実装だけでM2全体完了とはしない。
 
 ### M2後続・M3以降
 
-1. 最初のサブプロジェクトとして、SQLite、主体別チャンネル方針、話者割当、job、分析run、発言分類、指数割当、現在予想、監査、削除、FastAPI、合成E2Eを含む中核バックエンドを実装する。
-2. YouTube検索・網羅性評価・収集・音声取得の詳細specと実装。
-3. 固定音声モデル、閾値設定、分割文字起こし、参照声話者割当の詳細specと実装。
-4. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
-5. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
-6. Windows常駐worker、性能・回復性・セキュリティ検証。
+次のsubprojectは未承認であり、以下の順序もユーザー判断前には確定しない。
+
+1. YouTube検索・網羅性評価・収集・音声取得の詳細specと実装。
+2. 固定音声モデル、閾値設定、分割文字起こし、参照声話者割当の詳細specと実装。
+3. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
+4. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
+5. Windows常駐worker、性能・回復性・セキュリティ検証。

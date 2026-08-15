@@ -32,9 +32,12 @@ from market_voice_forecast_ledger.services.review_application import (
     ReviewApplicationResult,
     ReviewApplicationService,
 )
+from tests.backend.e2e.synthetic_fixture import (
+    create_accepted_low_mapping_fixture,
+    create_accepted_unknown_period_fixture,
+)
 from tests.backend.integration.test_atomic_result_replacement import (
     _completed_run,
-    _scope_id,
 )
 from tests.backend.integration.test_analysis_input_boundaries import (
     _begin,
@@ -66,40 +69,6 @@ def _mapping_command(mapping_id, decision, *, corrected_asset=None, reason=None)
         reason=reason or f"Synthetic {decision.value} application",
         corrected_asset=corrected_asset,
     )
-
-
-def _accept(db, prepared, batch):
-    JobStateService(db).begin_unit(prepared.job_id, FINAL_PROMOTION_UNIT_KEY)
-    current = CurrentResultService(db).promote_completed_run(
-        prepared.run_id, batch.id
-    )
-    return current.scope_id
-
-
-def _accepted_low_mapping(db, label="review"):
-    prepared, batch = _completed_run(
-        db, confidence=Confidence.LOW, label=label
-    )
-    scope_id = _accept(db, prepared, batch)
-    assert batch.forecasts == ()
-    return prepared, batch, scope_id
-
-
-def _accepted_unknown(db, label="unknown-review"):
-    prepared = _prepare_upstream(
-        db,
-        (
-            StatementSpec(
-                label,
-                NEWER,
-                period_expression="当面",
-            ),
-        ),
-    )
-    batch = _project(db, prepared)
-    scope_id = _accept(db, prepared, batch)
-    assert batch.forecasts == ()
-    return prepared, batch, scope_id
 
 
 def _job_terminal(db, prepared):
@@ -155,7 +124,7 @@ def test_review_result_type_is_frozen_and_slotted():
 
 
 def test_current_mapping_review_must_use_atomic_application_path(db):
-    prepared, _, _ = _accepted_low_mapping(db, "mapping-guard")
+    prepared, _, _ = create_accepted_low_mapping_fixture(db, "mapping-guard")
     command = _mapping_command(
         prepared.mapping_ids[0], MappingReviewDecision.APPROVE
     )
@@ -168,7 +137,9 @@ def test_current_mapping_review_must_use_atomic_application_path(db):
 
 
 def test_mapping_approval_reprojects_current_and_rebuilds_cache_atomically(db):
-    prepared, initial, scope_id = _accepted_low_mapping(db, "mapping-approve")
+    prepared, initial, scope_id = create_accepted_low_mapping_fixture(
+        db, "mapping-approve"
+    )
     before_terminal = _job_terminal(db, prepared)
 
     result = ReviewApplicationService(db).apply_mapping(
@@ -206,7 +177,9 @@ def test_mapping_approval_reprojects_current_and_rebuilds_cache_atomically(db):
 
 
 def test_mapping_correction_rejection_and_consecutive_reviews_advance_one_head(db):
-    prepared, _, scope_id = _accepted_low_mapping(db, "mapping-sequence")
+    prepared, _, scope_id = create_accepted_low_mapping_fixture(
+        db, "mapping-sequence"
+    )
     service = ReviewApplicationService(db)
     approved = service.apply_mapping(
         _mapping_command(prepared.mapping_ids[0], MappingReviewDecision.APPROVE)
@@ -255,7 +228,7 @@ def test_mapping_correction_rejection_and_consecutive_reviews_advance_one_head(d
 
 
 def test_current_period_review_must_use_application_and_can_add_unknown_cell(db):
-    prepared, initial, scope_id = _accepted_unknown(db)
+    prepared, initial, scope_id = create_accepted_unknown_period_fixture(db)
     period_id = prepared.period_ids[0]
     with pytest.raises(DomainError) as guarded:
         PeriodReviewService(db).review(
@@ -300,7 +273,9 @@ def test_current_period_review_must_use_application_and_can_add_unknown_cell(db)
 
 
 def test_review_application_preserves_correction_driven_stale_warning(db):
-    prepared, _, scope_id = _accepted_low_mapping(db, "stale-review")
+    prepared, _, scope_id = create_accepted_low_mapping_fixture(
+        db, "stale-review"
+    )
     segment_id = db.execute(
         "SELECT segment_id FROM analysis_run_segments "
         "WHERE run_id=? ORDER BY ordinal LIMIT 1",
@@ -333,7 +308,9 @@ def test_review_application_preserves_correction_driven_stale_warning(db):
 
 
 def test_review_application_updates_display_while_fresh_run_stays_running(db):
-    prepared, _, scope_id = _accepted_low_mapping(db, "running-review")
+    prepared, _, scope_id = create_accepted_low_mapping_fixture(
+        db, "running-review"
+    )
     scope = AnalysisRepository(db).get_scope(scope_id)
     fresh_prepared = _create_job_for_input(
         db, scope.subject_id, scope.cutoff_day_jst
@@ -487,7 +464,7 @@ _REVIEW_FAILURE_TRIGGERS = {
 def test_every_review_application_boundary_rolls_back_together(
     db, failure_point
 ):
-    prepared, _, scope_id = _accepted_low_mapping(
+    prepared, _, scope_id = create_accepted_low_mapping_fixture(
         db, f"review-rollback-{failure_point}"
     )
     before = _review_state(db, prepared, scope_id)
@@ -505,7 +482,9 @@ def test_every_review_application_boundary_rolls_back_together(
 
 
 def test_period_review_application_failure_rolls_back_review_and_projection(db):
-    prepared, _, scope_id = _accepted_unknown(db, "period-rollback")
+    prepared, _, scope_id = create_accepted_unknown_period_fixture(
+        db, "period-rollback"
+    )
     before = _review_state(db, prepared, scope_id)
     db.execute(
         """
@@ -529,7 +508,12 @@ def test_period_review_application_failure_rolls_back_review_and_projection(db):
 
 
 def test_review_application_writes_only_safe_audits_and_no_new_codex_run(db):
-    prepared, _, scope_id = _accepted_low_mapping(db, "review-safety")
+    prepared, _, scope_id = create_accepted_low_mapping_fixture(
+        db, "review-safety"
+    )
+    private_input = AnalysisRepository(db).get_snapshot(prepared.run_id).input_text
+    assert private_input is not None
+    assert "Synthetic projection evidence" in private_input
     run_count = db.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0]
     output_before = tuple(
         tuple(row)
@@ -578,7 +562,7 @@ def test_review_application_writes_only_safe_audits_and_no_new_codex_run(db):
 
 
 def test_application_rejects_noncanonical_accepted_history_before_review(db):
-    prepared, _, _ = _accepted_low_mapping(db, "review-history")
+    prepared, _, _ = create_accepted_low_mapping_fixture(db, "review-history")
     accepted_at = db.execute(
         "SELECT created_at FROM analysis_run_events "
         "WHERE run_id=? AND status='accepted'",
@@ -600,7 +584,9 @@ def test_application_rejects_noncanonical_accepted_history_before_review(db):
 
 
 def test_application_rejects_malformed_final_success_provenance(db):
-    prepared, _, _ = _accepted_low_mapping(db, "review-final-provenance")
+    prepared, _, _ = create_accepted_low_mapping_fixture(
+        db, "review-final-provenance"
+    )
     db.execute("DROP TRIGGER job_unit_attempts_no_update")
     db.execute(
         """

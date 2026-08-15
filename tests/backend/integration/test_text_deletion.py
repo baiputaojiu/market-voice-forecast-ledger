@@ -1,13 +1,12 @@
 import json
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from market_voice_forecast_ledger.config import Settings
-from market_voice_forecast_ledger.db.connection import open_database, transaction
+from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.enums import HeatmapGranularity
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -24,16 +23,13 @@ from market_voice_forecast_ledger.services.retention import (
     RetentionService,
 )
 from market_voice_forecast_ledger.services.statements import StatementService
+from tests.backend.e2e.synthetic_fixture import (
+    create_retained_forecast_fixture,
+)
 from tests.backend.integration.test_analysis_input_boundaries import (
     _begin,
     _create_job_for_input,
     _prepare_personal_analysis,
-)
-from tests.backend.integration.test_forecast_projection import (
-    NEWER,
-    StatementSpec,
-    _prepare_upstream,
-    _project,
 )
 from tests.backend.integration.test_statement_evidence import (
     _one_forecast,
@@ -55,47 +51,8 @@ def db(tmp_path):
         conn.close()
 
 
-@dataclass(frozen=True, slots=True)
-class RetainedForecastFixture:
-    settings: Settings
-    run_id: int
-    scope_id: int
-    segment_id: int
-    statement_id: int
-    source_body: str
-    transcript_hash: str
-    input_hash: str
-
-
-def _retained_forecast(db, tmp_path) -> RetainedForecastFixture:
-    prepared = _prepare_upstream(
-        db,
-        (StatementSpec("synthetic-retention-video", NEWER),),
-    )
-    batch = _project(db, prepared)
-    with transaction(db):
-        CurrentResultService(db)._replace_scope_rows_in_transaction(
-            prepared.run_id, batch.id
-        )
-    scope_id = AnalysisRepository(db).get_run(prepared.run_id).scope_id
-    HeatmapService(db).rebuild_scope(scope_id)
-    run_segment = AnalysisRepository(db).get_input_segments(prepared.run_id)[0]
-    segment = SpeakerRepository(db).get_segment(run_segment.segment_id)
-    snapshot = AnalysisRepository(db).get_snapshot(prepared.run_id)
-    return RetainedForecastFixture(
-        settings=Settings.for_data_dir(tmp_path / "runtime"),
-        run_id=prepared.run_id,
-        scope_id=scope_id,
-        segment_id=segment.id,
-        statement_id=prepared.statement_ids[0],
-        source_body=segment.text_body,
-        transcript_hash=segment.text_sha256,
-        input_hash=snapshot.input_sha256,
-    )
-
-
 def test_preview_is_nonmutating_and_delete_preserves_public_history(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     service = RetentionService(db, fixture.settings, clock=lambda: NOW)
     command = DeleteTextCommand(cutoff=NOW)
     current_before = CurrentResultService(db).get_scope(fixture.scope_id)
@@ -180,7 +137,7 @@ def test_preview_is_nonmutating_and_delete_preserves_public_history(db, tmp_path
 
 
 def test_delete_requires_the_exact_current_preview_token(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     service = RetentionService(db, fixture.settings, clock=lambda: NOW)
 
     with pytest.raises(DomainError) as missing:
@@ -200,7 +157,7 @@ def test_delete_requires_the_exact_current_preview_token(db, tmp_path):
 
 
 def test_unlimited_policy_purge_deletes_nothing(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     service = RetentionService(db, fixture.settings, clock=lambda: NOW)
     service.set_policy(RetentionPolicy(None))
 
@@ -218,7 +175,7 @@ def test_unlimited_policy_purge_deletes_nothing(db, tmp_path):
 def test_transcript_and_snapshot_raw_updates_allow_only_canonical_one_way_delete(
     db, tmp_path
 ):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     deleted_at = "2028-08-16T12:00:00.000000Z"
 
     for table, key_name, key_value in (
@@ -349,7 +306,7 @@ def test_plain_sqlite_replace_cannot_bypass_private_text_immutability(
     hash_column,
     replace_primary_key,
 ):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     identity = getattr(fixture, identity_attribute)
     database_path = Path(db.execute("PRAGMA database_list").fetchone()[2])
     plain = sqlite3.connect(database_path, isolation_level=None)
@@ -389,7 +346,7 @@ def test_plain_sqlite_replace_cannot_bypass_private_text_immutability(
 def test_preview_is_deterministic_and_new_preview_invalidates_the_old_token(
     db, tmp_path
 ):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     service = RetentionService(db, fixture.settings, clock=lambda: NOW)
 
     first = service.preview_text_deletion(DeleteTextCommand(cutoff=NOW))
@@ -413,7 +370,7 @@ def test_preview_is_deterministic_and_new_preview_invalidates_the_old_token(
 def test_identical_preview_reissue_does_not_extend_the_old_tokens_lifetime(
     db, tmp_path
 ):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     clock = [NOW]
     service = RetentionService(db, fixture.settings, clock=lambda: clock[0])
     command = DeleteTextCommand(cutoff=NOW)
@@ -438,7 +395,7 @@ def test_identical_preview_reissue_does_not_extend_the_old_tokens_lifetime(
 
 
 def test_preview_is_not_valid_before_its_issuance_time(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     clock = [NOW]
     service = RetentionService(db, fixture.settings, clock=lambda: clock[0])
     preview = service.preview_text_deletion(DeleteTextCommand(cutoff=NOW))
@@ -456,7 +413,7 @@ def test_preview_is_not_valid_before_its_issuance_time(db, tmp_path):
 
 
 def test_preview_rejects_command_policy_drift_expiry_and_replay(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     clock = [NOW]
     service = RetentionService(db, fixture.settings, clock=lambda: clock[0])
 
@@ -505,7 +462,7 @@ def test_delete_rechecks_preview_expiry_after_acquiring_its_transaction(
 ):
     import market_voice_forecast_ledger.services.retention as retention_module
 
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     clock_value = NOW
     service = RetentionService(db, fixture.settings, clock=lambda: clock_value)
     preview = service.preview_text_deletion(DeleteTextCommand(cutoff=NOW))
@@ -604,7 +561,7 @@ def test_preview_schema_rejects_noncanonical_utc_values(
 def test_body_deletion_triggers_reject_noncanonical_structured_utc(
     db, tmp_path, invalid
 ):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
 
     with pytest.raises(sqlite3.IntegrityError):
         db.execute(
@@ -639,7 +596,7 @@ def test_purge_fails_safely_when_cutoff_cannot_be_represented(db, tmp_path):
 
 
 def test_new_eligible_body_after_preview_is_target_drift(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     service = RetentionService(db, fixture.settings, clock=lambda: NOW)
     preview = service.preview_text_deletion(DeleteTextCommand(cutoff=NOW))
     original = db.execute(
@@ -676,7 +633,7 @@ def test_delete_fault_rolls_back_bodies_audit_and_preview_after_reopen(
     db_path = tmp_path / "rollback.sqlite3"
     conn = open_database(db_path)
     apply_migrations(conn)
-    fixture = _retained_forecast(conn, tmp_path)
+    fixture = create_retained_forecast_fixture(conn, tmp_path)
     service = RetentionService(conn, fixture.settings, clock=lambda: NOW)
     preview = service.preview_text_deletion(DeleteTextCommand(cutoff=NOW))
 
@@ -710,7 +667,7 @@ def test_delete_fault_rolls_back_bodies_audit_and_preview_after_reopen(
 
 
 def test_purge_uses_inclusive_canonical_policy_boundary(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     original = db.execute(
         "SELECT video_id, chunk_id FROM transcript_segments WHERE id=?",
         (fixture.segment_id,),
@@ -751,7 +708,7 @@ def test_purge_reads_the_current_policy_inside_its_delete_transaction(
 ):
     import market_voice_forecast_ledger.services.retention as retention_module
 
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     original = db.execute(
         "SELECT video_id, chunk_id FROM transcript_segments WHERE id=?",
         (fixture.segment_id,),
@@ -813,7 +770,7 @@ def test_purge_reads_the_current_policy_inside_its_delete_transaction(
 def test_selection_fails_closed_on_malformed_stored_time_or_hash(
     db, tmp_path, created_at, digest, expected_code
 ):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     original = db.execute(
         "SELECT video_id, chunk_id FROM transcript_segments WHERE id=?",
         (fixture.segment_id,),
@@ -847,7 +804,7 @@ def test_selection_fails_closed_on_malformed_stored_time_or_hash(
 
 
 def test_preview_and_reads_do_not_extend_persisted_expiry(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     before = (
         db.execute(
             "SELECT expires_at FROM transcript_segments WHERE id=?",
@@ -902,7 +859,7 @@ def test_inflight_reanalysis_that_requires_deleted_body_fails_safely(db, tmp_pat
 
 
 def test_new_analysis_run_cannot_silently_omit_deleted_eligible_body(db, tmp_path):
-    fixture = _retained_forecast(db, tmp_path)
+    fixture = create_retained_forecast_fixture(db, tmp_path)
     service = RetentionService(db, fixture.settings, clock=lambda: NOW)
     preview = service.preview_text_deletion(DeleteTextCommand(cutoff=NOW))
     service.delete_text(

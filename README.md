@@ -1,6 +1,6 @@
 # 相場見通し発言台帳
 
-YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。現在は設計と開発基盤の整備段階で、投資判断に利用できる完成版ではありません。
+YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19は実装段階の最終確認中で、投資判断に利用できる完成版ではありません。
 
 ## 現在の状態
 
@@ -22,10 +22,33 @@ Codexはリポジトリ内の `$resume-work-state` スキルを使い、Git、�
 
 「別PCへ引き継げるようにして」または「今日の作業内容をGitHubへ反映して」と依頼します。`$save-work-state` は状態文書と公開安全性を検査し、対象を限定してcommit・pushした後、remoteへの反映まで確認します。
 
+## Windowsでバックエンドを検証する
+
+Python 3.11以上を用意し、リポジトリのルートで次を実行します。
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\python -m pytest tests/backend -q
+```
+
+バックエンド全件、compileall、既存の作業状態検査、公開安全性検査、
+`git diff --check`を一度に実行する入口は次です。このscriptはrepositoryの
+`.venv\Scripts\python.exe`があれば必ずそれを使います。`.venv`がない場合だけ、
+依存packageを導入済みのactivateされた互換PythonとしてPATH上の`python`へ
+fallbackします。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-backend.ps1
+```
+
+テストの構成と境界は[バックエンドテストREADME](tests/backend/README.md)を
+参照してください。
+
 ## 注意
 
 - 予想分析は、保存された対象者の発言だけを根拠にします。Web検索、現在相場、Codexの一般知識では補強しません。
-- 実際に収集した動画、音声、全文文字起こし、本番データベースはGitHubへ保存しません。
+- 実際の全文文字起こし、音声、埋め込み、SQLiteデータベース、runtime log、cache、資格情報はリポジトリ外に置き、commitしません。
 - 分析結果は投資助言ではありません。
 
 ## ローカルAPIのセキュリティ境界
