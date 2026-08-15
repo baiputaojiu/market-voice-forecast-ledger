@@ -372,9 +372,15 @@ class ForecastProjectionService:
         self, run_id: int
     ) -> dict[int, tuple[datetime, str]]:
         try:
-            metadata = json.loads(
-                self._analysis.get_snapshot(run_id).metadata_json
-            )
+            snapshot = self._analysis.get_snapshot(run_id)
+            run = self._analysis.get_run(run_id)
+            raw_metadata = snapshot.metadata_json
+            if (
+                not isinstance(raw_metadata, str)
+                or sha256_text(raw_metadata) != run.input_contract_hash
+            ):
+                raise ValueError
+            metadata = json.loads(raw_metadata)
             if (
                 not isinstance(metadata, dict)
                 or set(metadata) != _FROZEN_METADATA_KEYS

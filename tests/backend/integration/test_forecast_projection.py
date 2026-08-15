@@ -445,6 +445,102 @@ def test_projection_rejects_malformed_frozen_source_metadata(
     assert error.value.code == "FORECAST_SOURCE_SNAPSHOT_INVALID"
 
 
+def test_projection_rejects_consistently_rewritten_frozen_youtube_id(db):
+    prepared = _prepare_upstream(
+        db,
+        (
+            StatementSpec(
+                "contract-bound-youtube-id",
+                NEWER,
+                extra_segment_count=1,
+            ),
+        ),
+    )
+    row = db.execute(
+        "SELECT metadata_json FROM analysis_input_snapshots WHERE run_id=?",
+        (prepared.run_id,),
+    ).fetchone()
+    metadata = json.loads(row["metadata_json"])
+    matching_segments = [
+        segment
+        for segment in metadata["segments"]
+        if segment["video_id"] == prepared.video_ids[0]
+    ]
+    assert len(matching_segments) == 2
+    for segment in matching_segments:
+        assert segment["youtube_video_id"] == "contract-bound-youtube-id"
+        segment["youtube_video_id"] = "consistently-forged-youtube-id"
+    db.execute("DROP TRIGGER analysis_input_snapshots_limited_update")
+    db.execute(
+        "UPDATE analysis_input_snapshots SET metadata_json=? WHERE run_id=?",
+        (
+            json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            prepared.run_id,
+        ),
+    )
+
+    try:
+        accepted = _project(db, prepared)
+    except DomainError as error:
+        assert error.code == "FORECAST_SOURCE_SNAPSHOT_INVALID"
+    else:
+        pytest.fail(
+            "projection accepted rewritten frozen source identity: "
+            f"{accepted.forecasts[0].stable_selection_key}"
+        )
+
+
+@pytest.mark.parametrize(
+    "delete_input_text",
+    [False, True],
+    ids=["untouched", "input-text-deleted"],
+)
+def test_projection_source_contract_is_independent_of_snapshot_body_retention(
+    db, delete_input_text: bool
+):
+    prepared = _prepare_upstream(
+        db, (StatementSpec("body-retention-source", NEWER),)
+    )
+    before = db.execute(
+        """
+        SELECT input_text, metadata_json
+        FROM analysis_input_snapshots
+        WHERE run_id=?
+        """,
+        (prepared.run_id,),
+    ).fetchone()
+    if delete_input_text:
+        db.execute(
+            """
+            UPDATE analysis_input_snapshots
+            SET input_text=NULL, text_deleted_at=?
+            WHERE run_id=?
+            """,
+            ("2026-08-15T00:00:00.000000Z", prepared.run_id),
+        )
+    after = db.execute(
+        """
+        SELECT input_text, metadata_json
+        FROM analysis_input_snapshots
+        WHERE run_id=?
+        """,
+        (prepared.run_id,),
+    ).fetchone()
+
+    batch = _project(db, prepared)
+
+    assert after["metadata_json"] == before["metadata_json"]
+    assert (after["input_text"] is None) is delete_input_text
+    assert batch.forecasts[0].stable_selection_key == (
+        f"body-retention-source:{prepared.statement_ids[0]:020d}"
+    )
+
+
 def test_internal_projection_requires_outer_transaction(db):
     prepared = _prepare_upstream(db, (StatementSpec("one", NEWER),))
 
