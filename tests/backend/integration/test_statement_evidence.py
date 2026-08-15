@@ -458,6 +458,67 @@ def test_normalization_requires_one_output_for_every_successful_codex_batch(db):
     assert db.execute("SELECT COUNT(*) FROM analysis_statements").fetchone()[0] == 0
 
 
+def test_successful_codex_unit_hash_must_match_its_immutable_output(db):
+    prepared = _prepare_output(
+        db,
+        ("Synthetic first subject evidence.",),
+        _one_forecast,
+        start_normalization=False,
+    )
+    stored_output_hash = db.execute(
+        """
+        SELECT output_sha256
+        FROM analysis_run_outputs
+        WHERE run_id=? AND unit_key=?
+        """,
+        (prepared.run_id, CODEX_UNIT_KEY),
+    ).fetchone()[0]
+    mismatched_unit_hash = "f" * 64
+    assert mismatched_unit_hash != stored_output_hash
+    db.execute(
+        """
+        UPDATE job_units
+        SET output_hash=?
+        WHERE job_id=? AND unit_key=? AND status='success'
+        """,
+        (mismatched_unit_hash, prepared.job_id, CODEX_UNIT_KEY),
+    )
+    JobStateService(db).begin_unit(
+        prepared.job_id, STATEMENT_NORMALIZATION_UNIT_KEY
+    )
+
+    with pytest.raises(DomainError) as error:
+        StatementService(db).normalize_and_store(prepared.run_id)
+
+    assert error.value.code == "CODEX_BATCH_OUTPUT_HASH_MISMATCH"
+    assert db.execute("SELECT COUNT(*) FROM analysis_statements").fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM analysis_statement_evidence_links"
+    ).fetchone()[0] == 0
+    assert _unit_failure(db, prepared.job_id) == (
+        "failed",
+        "CODEX_BATCH_OUTPUT_HASH_MISMATCH",
+    )
+    assert JobStateService(db).unit(
+        prepared.job_id, CODEX_UNIT_KEY
+    ).status is UnitStatus.SUCCESS
+    assert tuple(
+        row["unit_key"]
+        for row in db.execute(
+            "SELECT unit_key FROM job_units WHERE job_id=? AND status='failed'",
+            (prepared.job_id,),
+        )
+    ) == (STATEMENT_NORMALIZATION_UNIT_KEY,)
+    assert db.execute(
+        """
+        SELECT output_sha256
+        FROM analysis_run_outputs
+        WHERE run_id=? AND unit_key=?
+        """,
+        (prepared.run_id, CODEX_UNIT_KEY),
+    ).fetchone()[0] == stored_output_hash
+
+
 def test_normalization_unit_must_be_running(db):
     prepared = _prepare_output(
         db,
@@ -659,3 +720,45 @@ def test_exactly_300_unicode_code_points_are_retained(db):
 
     assert row.evidence_links[0].excerpt == excerpt
     assert len(row.evidence_links[0].excerpt) == 300
+
+
+def test_normalization_and_listing_obey_low_sqlite_variable_limit(db):
+    statement_count = 20
+    texts = tuple(
+        f"Synthetic bounded evidence {ordinal:02d}."
+        for ordinal in range(1, statement_count + 1)
+    )
+
+    def statements(segment_ids):
+        return [
+            _statement(
+                (
+                    {
+                        "segment_id": segment_id,
+                        "excerpt": text,
+                    },
+                ),
+                target_expression=f"Synthetic target {ordinal:02d}",
+            )
+            for ordinal, (segment_id, text) in enumerate(
+                zip(segment_ids, texts, strict=True), start=1
+            )
+        ]
+
+    prepared = _prepare_output(db, texts, statements)
+    previous_limit = db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 16)
+    try:
+        assert db.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == 16
+        normalized = StatementService(db).normalize_and_store(prepared.run_id)
+        listed = StatementRepository(db).list_run_statements(prepared.run_id)
+    finally:
+        db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+    assert len(normalized) == statement_count
+    assert listed == normalized
+    assert tuple(row.ordinal for row in listed) == tuple(
+        range(1, statement_count + 1)
+    )
+    assert tuple(
+        row.evidence_links[0].segment_id for row in listed
+    ) == prepared.segment_ids

@@ -172,22 +172,27 @@ class StatementService:
         run = self._analysis.get_run(run_id)
         scope = self._analysis.get_scope(run.scope_id)
         subject_kind = self._analysis.get_active_subject_kind(scope.subject_id)
+        ordered_envelopes = self._ordered_envelopes(run_id, job_id)
+        evidence_segment_ids = tuple(
+            dict.fromkeys(
+                evidence.segment_id
+                for _, envelope in ordered_envelopes
+                for proposal in envelope.statements
+                for evidence in proposal.evidence
+            )
+        )
         run_segments = self._analysis.get_input_segments(run_id)
         by_segment_id = {segment.segment_id: segment for segment in run_segments}
         current_segments = {
-            segment.segment_id: self._current_segment(segment.segment_id)
-            for segment in run_segments
+            segment_id: self._current_segment(segment_id)
+            for segment_id in evidence_segment_ids
+            if segment_id in by_segment_id
         }
-        assignments = {
-            assignment.segment_id: assignment
-            for assignment in self._speakers.list_assignments(
-                tuple(segment.segment_id for segment in run_segments)
-            )
-        }
+        assignments = self._load_assignments(evidence_segment_ids)
 
         resolved: list[_ResolvedStatement] = []
         statement_ordinal = 0
-        for batch_ordinal, envelope in self._ordered_envelopes(run_id, job_id):
+        for batch_ordinal, envelope in ordered_envelopes:
             for proposal_ordinal, proposal in enumerate(
                 envelope.statements, start=1
             ):
@@ -219,12 +224,27 @@ class StatementService:
                 )
         return tuple(resolved)
 
+    def _load_assignments(
+        self, segment_ids: tuple[int, ...]
+    ) -> dict[int, SpeakerAssignment]:
+        variable_limit = self._conn.getlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER
+        )
+        assignments: dict[int, SpeakerAssignment] = {}
+        for offset in range(0, len(segment_ids), variable_limit):
+            chunk = segment_ids[offset : offset + variable_limit]
+            assignments.update(
+                (assignment.segment_id, assignment)
+                for assignment in self._speakers.list_assignments(chunk)
+            )
+        return assignments
+
     def _ordered_envelopes(
         self, run_id: int, job_id: int
     ) -> tuple[tuple[int, AnalysisEnvelope], ...]:
         codex_units = self._conn.execute(
             """
-            SELECT unit_key, ordinal, status
+            SELECT unit_key, ordinal, status, output_hash
             FROM job_units
             WHERE job_id=? AND stage=?
             ORDER BY ordinal
@@ -259,6 +279,11 @@ class StatementService:
                     "each Codex batch requires exactly one immutable output",
                 )
             output = output_rows[0]
+            if unit["output_hash"] != output["output_sha256"]:
+                raise DomainError(
+                    "CODEX_BATCH_OUTPUT_HASH_MISMATCH",
+                    "successful Codex unit does not match its immutable output",
+                )
             try:
                 envelope = AnalysisEnvelope.model_validate_json(
                     output["canonical_output_json"]

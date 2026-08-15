@@ -130,9 +130,8 @@ class StatementRepository:
         if not statement_rows:
             return ()
         statement_ids = tuple(row["id"] for row in statement_rows)
-        placeholders = ", ".join("?" for _ in statement_ids)
         evidence_rows = self._conn.execute(
-            f"""
+            """
             SELECT
                 link.statement_id,
                 link.ordinal,
@@ -142,12 +141,14 @@ class StatementRepository:
                 link.start_ms,
                 link.end_ms
             FROM analysis_statement_evidence_links AS link
+            JOIN analysis_statements AS statement
+                ON statement.id = link.statement_id
             JOIN analysis_run_segments AS run_segment
                 ON run_segment.id = link.run_segment_id
-            WHERE link.statement_id IN ({placeholders})
-            ORDER BY link.statement_id, link.ordinal
+            WHERE statement.run_id = ?
+            ORDER BY statement.ordinal, link.ordinal
             """,
-            statement_ids,
+            (run_id,),
         ).fetchall()
         links_by_statement: dict[int, list[EvidenceLink]] = {
             statement_id: [] for statement_id in statement_ids
