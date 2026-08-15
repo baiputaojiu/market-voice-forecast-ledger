@@ -85,6 +85,7 @@ class StatementSpec:
     period_expression: str | None = "来週"
     target_expression: str = "日経平均"
     confidence: Confidence = Confidence.HIGH
+    extra_segment_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -108,21 +109,30 @@ def _prepare_upstream(db, specs: tuple[StatementSpec, ...]) -> PreparedProjectio
     video_ids: list[int] = []
     for ordinal, spec in enumerate(specs, start=1):
         text = f"Synthetic projection evidence {ordinal}."
+        texts = (text,) + tuple(
+            f"Synthetic projection context {ordinal}-{index}."
+            for index in range(1, spec.extra_segment_count + 1)
+        )
         video_id, created_segments = _add_video_with_segments(
             db,
             subject_id=subject_id,
             youtube_video_id=spec.video_id,
             published_at=spec.published_at,
-            texts=(text,),
+            texts=texts,
             channel_index=81,
         )
-        _save_assignment(
-            db,
-            segment_id=created_segments[0],
-            kind=AssignmentKind.SUBJECT,
-            subject_id=subject_id,
-            evidence_hash=f"projection-assignment-{ordinal}",
-        )
+        for segment_index, created_segment_id in enumerate(
+            created_segments, start=1
+        ):
+            _save_assignment(
+                db,
+                segment_id=created_segment_id,
+                kind=AssignmentKind.SUBJECT,
+                subject_id=subject_id,
+                evidence_hash=(
+                    f"projection-assignment-{ordinal}-{segment_index}"
+                ),
+            )
         video_ids.append(video_id)
         segment_ids.append(created_segments[0])
 
@@ -356,6 +366,85 @@ def test_projection_uses_frozen_run_publication_timestamp(db):
     assert batch.forecasts[0].selected_published_at == NEWER
 
 
+def test_projection_uses_frozen_youtube_id_in_result_and_artifact_hash(db):
+    prepared = _prepare_upstream(
+        db, (StatementSpec("frozen-youtube-id", NEWER),)
+    )
+    db.execute(
+        "UPDATE videos SET youtube_video_id=? WHERE id=?",
+        ("mutable-current-youtube-id", prepared.video_ids[0]),
+    )
+
+    batch = _project(db, prepared)
+    repository = ForecastRepository(db)
+    artifact = repository.batch_artifact(batch.id)
+
+    expected_key = (
+        f"frozen-youtube-id:{prepared.statement_ids[0]:020d}"
+    )
+    assert batch.forecasts[0].stable_selection_key == expected_key
+    assert artifact["forecasts"][0]["stable_selection_key"] == expected_key
+    assert (
+        _successful_artifacts(db, prepared.job_id)[
+            FORECAST_PROJECTION_UNIT_KEY
+        ]
+        == repository.batch_artifact_hash(batch.id)
+    )
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing", "duplicate", "conflicting_youtube_id", "mismatched_time"],
+)
+def test_projection_rejects_malformed_frozen_source_metadata(
+    db, malformation: str
+):
+    prepared = _prepare_upstream(
+        db,
+        (
+            StatementSpec(
+                "malformed-source-metadata",
+                NEWER,
+                extra_segment_count=(
+                    1 if malformation == "conflicting_youtube_id" else 0
+                ),
+            ),
+        ),
+    )
+    row = db.execute(
+        "SELECT metadata_json FROM analysis_input_snapshots WHERE run_id=?",
+        (prepared.run_id,),
+    ).fetchone()
+    metadata = json.loads(row["metadata_json"])
+    segments = metadata["segments"]
+    if malformation == "missing":
+        segments.pop()
+    elif malformation == "duplicate":
+        segments.append(dict(segments[0]))
+    elif malformation == "conflicting_youtube_id":
+        segments[1]["youtube_video_id"] = "conflicting-frozen-youtube-id"
+    else:
+        segments[0]["published_at"] = "2030-01-01T00:00:00.000000Z"
+    db.execute("DROP TRIGGER analysis_input_snapshots_limited_update")
+    db.execute(
+        "UPDATE analysis_input_snapshots SET metadata_json=? WHERE run_id=?",
+        (
+            json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            prepared.run_id,
+        ),
+    )
+
+    with pytest.raises(DomainError) as error:
+        _project(db, prepared)
+
+    assert error.value.code == "FORECAST_SOURCE_SNAPSHOT_INVALID"
+
+
 def test_internal_projection_requires_outer_transaction(db):
     prepared = _prepare_upstream(db, (StatementSpec("one", NEWER),))
 
@@ -439,6 +528,132 @@ def test_review_state_hash_is_canonical_and_batch_records_latest_review_heads(db
     assert batch.latest_period_review_id == period_review_id
     assert batch.forecasts[0].asset is Asset.TOPIX
     assert batch.forecasts[0].unknown_period is True
+
+
+def test_period_review_guard_rejects_nonpositive_explicit_id(db):
+    prepared = _prepare_upstream(
+        db, (StatementSpec("nonpositive-period-review", NEWER),)
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="PERIOD_REVIEW_INVALID"):
+        db.execute(
+            """
+            INSERT INTO period_reviews(
+                id, period_id, decision, actor, reason, created_at
+            ) VALUES (0, ?, 'reject', 'user', ?, ?)
+            """,
+            (
+                prepared.period_ids[0],
+                "Synthetic invalid nonpositive review",
+                "2026-08-11T03:00:00.000000Z",
+            ),
+        )
+
+
+def test_period_review_guard_rejects_id_older_than_existing_for_period(db):
+    prepared = _prepare_upstream(
+        db, (StatementSpec("out-of-order-period-review", NEWER),)
+    )
+    values = (
+        prepared.period_ids[0],
+        "Synthetic valid review",
+        "2026-08-11T03:00:00.000000Z",
+    )
+    db.execute(
+        """
+        INSERT INTO period_reviews(
+            id, period_id, decision, actor, reason, created_at
+        ) VALUES (10, ?, 'reject', 'user', ?, ?)
+        """,
+        values,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="PERIOD_REVIEW_INVALID"):
+        db.execute(
+            """
+            INSERT INTO period_reviews(
+                id, period_id, decision, actor, reason, created_at
+            ) VALUES (5, ?, 'reject', 'user', ?, ?)
+            """,
+            values,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "malformation",
+        "decision",
+        "reason",
+        "created_at",
+    ),
+    [
+        (
+            "blank_reason",
+            "reject",
+            "   ",
+            "2026-08-11T03:00:00.000000Z",
+        ),
+        (
+            "invalid_decision",
+            "synthetic_invalid",
+            "Synthetic invalid decision",
+            "2026-08-11T03:00:00.000000Z",
+        ),
+        (
+            "invalid_time",
+            "reject",
+            "Synthetic invalid time",
+            "2026-02-30T03:00:00.000000Z",
+        ),
+        (
+            "approve_known",
+            "approve_unknown",
+            "Synthetic invalid known approval",
+            "2026-08-11T03:00:00.000000Z",
+        ),
+    ],
+)
+def test_review_state_rejects_malformed_older_period_history(
+    db,
+    malformation: str,
+    decision: str,
+    reason: str,
+    created_at: str,
+):
+    prepared = _prepare_upstream(
+        db, (StatementSpec(f"malformed-period-{malformation}", NEWER),)
+    )
+    if malformation == "invalid_decision":
+        db.execute("PRAGMA ignore_check_constraints = ON")
+    if malformation == "approve_known":
+        db.execute("DROP TRIGGER period_reviews_approve_requires_unknown")
+    db.execute(
+        """
+        INSERT INTO period_reviews(
+            id, period_id, decision, actor, reason, created_at
+        ) VALUES (10, ?, ?, 'user', ?, ?)
+        """,
+        (prepared.period_ids[0], decision, reason, created_at),
+    )
+    db.execute(
+        """
+        INSERT INTO period_reviews(
+            id, period_id, decision, actor, reason, created_at
+        ) VALUES (11, ?, 'reject', 'user', ?, ?)
+        """,
+        (
+            prepared.period_ids[0],
+            "Synthetic valid latest review",
+            "2026-08-11T04:00:00.000000Z",
+        ),
+    )
+
+    with pytest.raises(DomainError) as error:
+        ForecastProjectionService(db).effective_review_state_hash(
+            prepared.run_id
+        )
+
+    assert error.value.code == "FORECAST_PERIOD_REVIEW_STORED_INVALID"
 
 
 def test_latest_period_reject_excludes_known_and_previously_approved_unknown(db):
@@ -640,6 +855,97 @@ def test_success_reuse_verifies_complete_batch_hash_without_duplicate_rows(db):
             prepared.run_id, ProjectionTrigger.INITIAL
         )
     assert mismatch.value.code == "FORECAST_PROJECTION_OUTPUT_HASH_MISMATCH"
+
+
+def test_batch_artifact_seals_exact_statement_link_records(db):
+    prepared = _prepare_upstream(
+        db,
+        (
+            StatementSpec("sealed-counter", OLDER, DirectionKind.DOWN),
+            StatementSpec("sealed-support", NEWER, DirectionKind.UP),
+        ),
+    )
+    batch = _project(db, prepared)
+    repository = ForecastRepository(db)
+
+    artifact = repository.batch_artifact(batch.id)
+    reloaded = repository.get_batch(batch.id)
+
+    assert artifact["forecasts"][0]["statement_links"] == [
+        {
+            "statement_id": prepared.statement_ids[1],
+            "relation_kind": "supporting",
+            "ordinal": 1,
+        },
+        {
+            "statement_id": prepared.statement_ids[0],
+            "relation_kind": "counterevidence",
+            "ordinal": 1,
+        },
+    ]
+    assert reloaded.forecasts[0].source_forecast_ids == (
+        reloaded.forecasts[0].id,
+    )
+
+
+def test_success_reuse_rejects_direct_counter_link_ordinal_gap(db):
+    prepared = _prepare_upstream(
+        db,
+        (
+            StatementSpec("gap-support", NEWER),
+            StatementSpec(
+                "gap-unused",
+                NEWER,
+                statement_type=StatementType.CURRENT_ANALYSIS,
+                forecast_basis=None,
+            ),
+        ),
+    )
+    batch = _project(db, prepared)
+    db.execute(
+        """
+        INSERT INTO analysis_forecast_statement_links(
+            forecast_id, statement_id, relation_kind, ordinal
+        ) VALUES (?, ?, 'counterevidence', 2)
+        """,
+        (batch.forecasts[0].id, prepared.statement_ids[1]),
+    )
+
+    with pytest.raises(DomainError) as error:
+        ForecastProjectionService(db).project_run(
+            prepared.run_id, ProjectionTrigger.INITIAL
+        )
+
+    assert error.value.code == "FORECAST_ARTIFACT_INVALID"
+
+
+def test_link_ordinal_mutation_cannot_retain_the_sealed_hash(db):
+    prepared = _prepare_upstream(
+        db, (StatementSpec("mutated-link-ordinal", NEWER),)
+    )
+    batch = _project(db, prepared)
+    repository = ForecastRepository(db)
+    sealed_hash = _successful_artifacts(db, prepared.job_id)[
+        FORECAST_PROJECTION_UNIT_KEY
+    ]
+    assert repository.batch_artifact_hash(batch.id) == sealed_hash
+    db.execute("DROP TRIGGER analysis_forecast_statement_links_no_update")
+    db.execute(
+        """
+        UPDATE analysis_forecast_statement_links
+        SET ordinal=2
+        WHERE forecast_id=? AND relation_kind='supporting'
+        """,
+        (batch.forecasts[0].id,),
+    )
+
+    with pytest.raises(DomainError) as error:
+        repository.batch_artifact_hash(batch.id)
+
+    assert error.value.code == "FORECAST_ARTIFACT_INVALID"
+    assert _successful_artifacts(db, prepared.job_id)[
+        FORECAST_PROJECTION_UNIT_KEY
+    ] == sealed_hash
 
 
 def test_internal_review_projection_appends_without_changing_successful_unit(db):

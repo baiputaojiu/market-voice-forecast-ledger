@@ -1,3 +1,14 @@
+CREATE TRIGGER period_reviews_require_positive_latest_id
+AFTER INSERT ON period_reviews
+WHEN NEW.id <= 0
+    OR EXISTS (
+        SELECT 1
+        FROM period_reviews
+        WHERE period_id = NEW.period_id
+            AND id > NEW.id
+    )
+BEGIN SELECT RAISE(ABORT, 'PERIOD_REVIEW_INVALID'); END;
+
 CREATE TABLE forecast_projection_batches (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES analysis_runs(id),

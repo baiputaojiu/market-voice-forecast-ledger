@@ -1,10 +1,15 @@
+import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 from market_voice_forecast_ledger.db.connection import transaction
-from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
+from market_voice_forecast_ledger.domain.common import (
+    canonical_json,
+    sha256_text,
+    utc_iso,
+)
 from market_voice_forecast_ledger.domain.enums import (
     Asset,
     ConditionKind,
@@ -27,7 +32,10 @@ from market_voice_forecast_ledger.domain.jobs import (
     STATEMENT_NORMALIZATION_UNIT_KEY,
 )
 from market_voice_forecast_ledger.domain.mappings import AssetMapping
-from market_voice_forecast_ledger.domain.periods import NormalizedPeriod
+from market_voice_forecast_ledger.domain.periods import (
+    EffectivePeriodReview,
+    NormalizedPeriod,
+)
 from market_voice_forecast_ledger.domain.statements import NormalizedStatement
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.repositories.forecasts import ForecastRepository
@@ -41,6 +49,42 @@ from market_voice_forecast_ledger.services.mapping_review import (
 
 
 _ASSET_ORDER = {asset: ordinal for ordinal, asset in enumerate(Asset)}
+_FROZEN_METADATA_KEYS = frozenset(
+    {
+        "cutoff_day_jst",
+        "cutoff_exclusive_utc",
+        "input_sha256",
+        "interviewer_market_context",
+        "policy_hash",
+        "policy_id",
+        "segments",
+        "settings",
+        "subject_id",
+        "subject_kind",
+    }
+)
+_FROZEN_SEGMENT_KEYS = frozenset(
+    {
+        "assignment_evidence_hash",
+        "assignment_kind",
+        "assignment_origin",
+        "assignment_updated_at",
+        "assigned_subject_id",
+        "channel_display_name",
+        "end_ms",
+        "policy_hash",
+        "policy_id",
+        "published_at",
+        "segment_id",
+        "segment_no",
+        "start_ms",
+        "text_sha256",
+        "title",
+        "video_id",
+        "youtube_channel_id",
+        "youtube_video_id",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,43 +371,149 @@ class ForecastProjectionService:
     def _frozen_source_metadata(
         self, run_id: int
     ) -> dict[int, tuple[datetime, str]]:
-        published_by_video: dict[int, datetime] = {}
-        for segment in self._analysis.get_input_segments(run_id):
-            existing = published_by_video.setdefault(
-                segment.video_id, segment.published_at
+        try:
+            metadata = json.loads(
+                self._analysis.get_snapshot(run_id).metadata_json
             )
-            if existing != segment.published_at:
-                raise DomainError(
-                    "FORECAST_SOURCE_TIMESTAMP_CONFLICT",
-                    "one source video has conflicting frozen timestamps",
-                )
-        rows = self._conn.execute(
-            """
-            SELECT id, youtube_video_id
-            FROM videos
-            WHERE id IN (
-                SELECT DISTINCT video_id
-                FROM analysis_run_segments
-                WHERE run_id=?
-            )
-            """,
-            (run_id,),
-        ).fetchall()
-        youtube_ids = {row["id"]: row["youtube_video_id"] for row in rows}
-        return {
-            video_id: (published_at, youtube_ids[video_id])
-            for video_id, published_at in published_by_video.items()
-            if video_id in youtube_ids
-        }
+            if (
+                not isinstance(metadata, dict)
+                or set(metadata) != _FROZEN_METADATA_KEYS
+                or not isinstance(metadata["segments"], list)
+            ):
+                raise ValueError
+            run_segments = {
+                segment.segment_id: segment
+                for segment in self._analysis.get_input_segments(run_id)
+            }
+            raw_segments = metadata["segments"]
+            if len(run_segments) != len(raw_segments):
+                raise ValueError
 
-    def _period_is_eligible(self, period: NormalizedPeriod) -> bool:
-        review = self._periods.latest_review(period.id)
+            seen_segment_ids: set[int] = set()
+            frozen_by_video: dict[int, tuple[datetime, str]] = {}
+            video_by_youtube_id: dict[str, int] = {}
+            for item in raw_segments:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != _FROZEN_SEGMENT_KEYS
+                ):
+                    raise ValueError
+                segment_id = item["segment_id"]
+                video_id = item["video_id"]
+                youtube_video_id = item["youtube_video_id"]
+                if (
+                    not _is_positive_int(segment_id)
+                    or segment_id in seen_segment_ids
+                    or not _is_positive_int(video_id)
+                    or not isinstance(youtube_video_id, str)
+                    or not youtube_video_id
+                    or youtube_video_id.strip() != youtube_video_id
+                ):
+                    raise ValueError
+                published_at = _parse_exact_utc(item["published_at"])
+                run_segment = run_segments.get(segment_id)
+                if (
+                    run_segment is None
+                    or run_segment.video_id != video_id
+                    or run_segment.published_at != published_at
+                ):
+                    raise ValueError
+
+                existing = frozen_by_video.setdefault(
+                    video_id, (published_at, youtube_video_id)
+                )
+                if existing != (published_at, youtube_video_id):
+                    raise ValueError
+                existing_video_id = video_by_youtube_id.setdefault(
+                    youtube_video_id, video_id
+                )
+                if existing_video_id != video_id:
+                    raise ValueError
+                seen_segment_ids.add(segment_id)
+            if seen_segment_ids != set(run_segments):
+                raise ValueError
+            return frozen_by_video
+        except (json.JSONDecodeError, KeyError, LookupError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "FORECAST_SOURCE_SNAPSHOT_INVALID",
+                "frozen source metadata does not match the analysis run",
+            ) from cause
+
+    def _period_is_eligible(
+        self,
+        period: NormalizedPeriod,
+        history: tuple[EffectivePeriodReview, ...] | None = None,
+    ) -> bool:
+        reviews = (
+            self._validated_period_review_history(period)
+            if history is None
+            else history
+        )
+        review = reviews[-1] if reviews else None
         if period.is_unknown:
             return (
                 review is not None
                 and review.decision is PeriodReviewDecision.APPROVE_UNKNOWN
             )
         return review is None or review.decision is not PeriodReviewDecision.REJECT
+
+    def _validated_period_review_history(
+        self, period: NormalizedPeriod
+    ) -> tuple[EffectivePeriodReview, ...]:
+        try:
+            if not _is_positive_int(period.id):
+                raise ValueError
+            rows = self._conn.execute(
+                """
+                SELECT id, period_id, decision, actor, reason, created_at
+                FROM period_reviews
+                WHERE period_id=?
+                ORDER BY id
+                """,
+                (period.id,),
+            ).fetchall()
+            reviews: list[EffectivePeriodReview] = []
+            previous_id = 0
+            for row in rows:
+                review_id = row["id"]
+                period_id = row["period_id"]
+                actor = row["actor"]
+                reason = row["reason"]
+                if (
+                    not _is_positive_int(review_id)
+                    or review_id <= previous_id
+                    or period_id != period.id
+                    or not isinstance(actor, str)
+                    or not actor.strip()
+                    or not isinstance(reason, str)
+                    or not reason.strip()
+                ):
+                    raise ValueError
+                decision = PeriodReviewDecision(row["decision"])
+                created_at = _parse_exact_utc(row["created_at"])
+                if (
+                    decision is PeriodReviewDecision.APPROVE_UNKNOWN
+                    and not period.is_unknown
+                ):
+                    raise ValueError
+                reviews.append(
+                    EffectivePeriodReview(
+                        id=review_id,
+                        period_id=period_id,
+                        decision=decision,
+                        actor=actor,
+                        reason=reason,
+                        created_at=created_at,
+                        period_is_unknown=period.is_unknown,
+                    )
+                )
+                previous_id = review_id
+            return tuple(reviews)
+        except (KeyError, sqlite3.DatabaseError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "FORECAST_PERIOD_REVIEW_STORED_INVALID",
+                "stored period review history is invalid for projection",
+            ) from cause
 
     @staticmethod
     def _condition_text(statement: NormalizedStatement) -> str | None:
@@ -386,7 +536,8 @@ class ForecastProjectionService:
         period_payload: list[dict[str, object]] = []
         latest_period_ids: list[int] = []
         for period in self._periods.list_run_periods(run_id):
-            review = self._periods.latest_review(period.id)
+            history = self._validated_period_review_history(period)
+            review = history[-1] if history else None
             if review is not None:
                 latest_period_ids.append(review.id)
             period_payload.append(
@@ -408,7 +559,9 @@ class ForecastProjectionService:
                         else period.end_date.isoformat()
                     ),
                     "effective_unknown": period.is_unknown,
-                    "effective_eligible": self._period_is_eligible(period),
+                    "effective_eligible": self._period_is_eligible(
+                        period, history
+                    ),
                 }
             )
 
@@ -455,6 +608,19 @@ class ForecastProjectionService:
             self._job_state.fail_unit(
                 job_id, FORECAST_PROJECTION_UNIT_KEY, error_code
             )
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _parse_exact_utc(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if utc_iso(parsed) != value:
+        raise ValueError
+    return parsed
 
 
 def _period_specificity(period: NormalizedPeriod) -> int:

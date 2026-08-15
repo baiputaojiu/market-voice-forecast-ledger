@@ -199,6 +199,8 @@ def resolve_publication_groups(
         for candidate in newest
         if (family := _direction_family(candidate.direction)) is not None
     }
+    selected_direction_set = set(newest_directions)
+    selected_family_set = newest_families
     disagreement = newest_families == {"up", "down"}
 
     if disagreement:
@@ -206,7 +208,16 @@ def resolve_publication_groups(
     else:
         changed = any(
             candidate.inherited_view_relation is ViewRelation.CHANGED
-            for candidate in newest
+            and (
+                candidate.direction in selected_direction_set
+                or (
+                    (family := _direction_family(candidate.direction))
+                    is not None
+                    and family in selected_family_set
+                )
+            )
+            for group in groups.values()
+            for candidate in group
         )
         if len(newest_families) == 1:
             newest_family = next(iter(newest_families))
@@ -224,8 +235,6 @@ def resolve_publication_groups(
             ViewRelation.CHANGED if changed else ViewRelation.CURRENT
         )
 
-    selected_direction_set = set(newest_directions)
-    selected_family_set = newest_families
     supporting: set[int] = set()
     counterevidence: set[int] = set()
     source_forecast_ids: set[int] = set()

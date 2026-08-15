@@ -201,6 +201,7 @@ class ForecastRepository:
 
     def batch_artifact(self, batch_id: int) -> dict[str, object]:
         batch = self.get_batch(batch_id)
+        links_by_forecast = self._links_by_forecast(batch_id)
         return {
             "batch": {
                 "id": batch.id,
@@ -244,6 +245,16 @@ class ForecastRepository:
                     "counterevidence_statement_ids": list(
                         forecast.counterevidence_statement_ids
                     ),
+                    "statement_links": [
+                        {
+                            "statement_id": link["statement_id"],
+                            "relation_kind": link["relation_kind"],
+                            "ordinal": link["ordinal"],
+                        }
+                        for link in links_by_forecast.get(
+                            forecast.id, ()
+                        )
+                    ],
                 }
                 for forecast in batch.forecasts
             ],
@@ -296,7 +307,7 @@ class ForecastRepository:
         for row in rows:
             by_forecast.setdefault(row["forecast_id"], []).append(row)
         return {
-            forecast_id: tuple(forecast_rows)
+            forecast_id: _validated_link_rows(tuple(forecast_rows))
             for forecast_id, forecast_rows in by_forecast.items()
         }
 
@@ -358,6 +369,39 @@ def _forecast_from_row(
     )
 
 
+def _validated_link_rows(
+    links: tuple[sqlite3.Row, ...],
+) -> tuple[sqlite3.Row, ...]:
+    ordinals_by_relation: dict[str, list[int]] = {
+        "supporting": [],
+        "counterevidence": [],
+    }
+    for link in links:
+        relation_kind = link["relation_kind"]
+        statement_id = link["statement_id"]
+        ordinal = link["ordinal"]
+        if (
+            relation_kind not in ordinals_by_relation
+            or not _is_positive_int(statement_id)
+            or not _is_positive_int(ordinal)
+        ):
+            raise DomainError(
+                "FORECAST_ARTIFACT_INVALID",
+                "stored forecast evidence links are invalid",
+            )
+        ordinals_by_relation[relation_kind].append(ordinal)
+    if any(
+        len(set(ordinals)) != len(ordinals)
+        or sorted(ordinals) != list(range(1, len(ordinals) + 1))
+        for ordinals in ordinals_by_relation.values()
+    ):
+        raise DomainError(
+            "FORECAST_ARTIFACT_INVALID",
+            "stored forecast evidence ordinals are not contiguous",
+        )
+    return links
+
+
 def _parse_directions(value: str) -> tuple[DirectionKind, ...]:
     try:
         payload = json.loads(value)
@@ -389,3 +433,7 @@ def _parse_date(value: str | None) -> date | None:
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0

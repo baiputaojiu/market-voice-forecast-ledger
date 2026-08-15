@@ -330,3 +330,39 @@ def test_inherited_change_counterevidence_and_sources_survive_reprojection() -> 
     assert result.counterevidence_statement_ids == (2, 3)
     assert result.source_forecast_ids == (7, 8, 9)
     assert result.evidence_count == 2
+
+
+def test_older_supporting_inherited_change_survives_later_same_family() -> None:
+    result = resolve_publication_groups(
+        (
+            _publication(
+                10,
+                DirectionKind.UP,
+                published_at=OLDER,
+                inherited=ViewRelation.CHANGED,
+            ),
+            _publication(11, DirectionKind.STRONG_UP, published_at=NEWER),
+        )
+    )
+
+    assert result.view_relation is ViewRelation.CHANGED
+    assert result.supporting_statement_ids == (10, 11)
+    assert result.counterevidence_statement_ids == ()
+
+
+def test_older_nonmatching_neutral_inherited_change_does_not_propagate() -> None:
+    result = resolve_publication_groups(
+        (
+            _publication(
+                10,
+                DirectionKind.FLAT,
+                published_at=OLDER,
+                inherited=ViewRelation.CHANGED,
+            ),
+            _publication(11, DirectionKind.UP, published_at=NEWER),
+        )
+    )
+
+    assert result.view_relation is ViewRelation.CURRENT
+    assert result.supporting_statement_ids == (11,)
+    assert result.counterevidence_statement_ids == (10,)
