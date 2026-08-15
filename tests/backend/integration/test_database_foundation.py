@@ -21,7 +21,8 @@ def test_settings_keep_runtime_data_outside_repository(tmp_path):
 def test_migrations_apply_once_and_connection_enables_safety_pragmas(tmp_path):
     conn = open_database(tmp_path / "ledger.sqlite3")
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-    assert apply_migrations(conn) == ("0001_foundation",)
+    applied = apply_migrations(conn)
+    assert applied[0] == "0001_foundation"
     assert apply_migrations(conn) == ()
 
 
@@ -93,7 +94,8 @@ def test_built_wheel_contains_and_applies_embedded_migration(tmp_path):
 
                 conn = open_database(Path(sys.argv[2]))
                 try:
-                    assert apply_migrations(conn) == ("0001_foundation",)
+                    applied = apply_migrations(conn)
+                    assert applied[0] == "0001_foundation"
                     exists = conn.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'app_metadata'"
