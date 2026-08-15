@@ -137,6 +137,82 @@ class AnalysisRepository:
         ).fetchall()
         return tuple(_selected_segment_from_row(row) for row in rows)
 
+    def select_interviewer_context_segments(
+        self,
+        subject_id: int,
+        cutoff_exclusive: datetime,
+        policy: ChannelPolicy,
+    ) -> tuple[SelectedInputSegment, ...]:
+        rows = self._conn.execute(
+            """
+            SELECT
+                segment.id AS segment_id,
+                video.id AS video_id,
+                video.youtube_video_id,
+                video.title AS video_title,
+                video.youtube_channel_id,
+                video.channel_display_name,
+                video.published_at,
+                segment.segment_no,
+                segment.start_ms,
+                segment.end_ms,
+                segment.text_body,
+                segment.text_sha256,
+                eligibility.policy_id,
+                eligibility.policy_hash,
+                assignment.assignment_kind,
+                assignment.assignment_origin,
+                assignment.assigned_subject_id,
+                assignment.assigned_at AS assignment_updated_at,
+                assignment.evidence_hash AS assignment_evidence_hash
+            FROM analysis_subjects AS subject
+            JOIN subject_video_eligibility AS eligibility
+                ON eligibility.subject_id = subject.id
+                AND eligibility.policy_id = ?
+                AND eligibility.policy_hash = ?
+                AND eligibility.status = ?
+            JOIN videos AS video ON video.id = eligibility.video_id
+            JOIN transcript_segments AS segment ON segment.video_id = video.id
+            JOIN speaker_assignments AS assignment
+                ON assignment.segment_id = segment.id
+            WHERE subject.id = ?
+                AND subject.is_active = 1
+                AND subject.subject_kind = ?
+                AND (
+                    ? = ?
+                    OR (
+                        ? = ?
+                        AND video.youtube_channel_id = ?
+                    )
+                )
+                AND video.published_at < ?
+                AND segment.text_body IS NOT NULL
+                AND assignment.assignment_kind = ?
+                AND assignment.assigned_subject_id IS NULL
+                AND assignment.assignment_origin != ?
+            ORDER BY
+                video.published_at,
+                video.youtube_video_id,
+                segment.segment_no
+            """,
+            (
+                policy.id,
+                policy.policy_hash,
+                EligibilityStatus.ELIGIBLE.value,
+                subject_id,
+                SubjectKind.PERSON.value,
+                policy.policy_kind.value,
+                PolicyKind.ALL_CHANNELS.value,
+                policy.policy_kind.value,
+                PolicyKind.FIXED_CHANNEL.value,
+                policy.youtube_channel_id,
+                utc_iso(cutoff_exclusive),
+                AssignmentKind.INTERVIEWER.value,
+                AssignmentOrigin.CHANNEL_ORGANIZATION.value,
+            ),
+        ).fetchall()
+        return tuple(_selected_segment_from_row(row) for row in rows)
+
     def get_or_create_scope(
         self,
         subject_id: int,

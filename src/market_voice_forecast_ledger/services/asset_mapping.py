@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from pydantic import ValidationError
@@ -13,6 +14,7 @@ from market_voice_forecast_ledger.domain.jobs import (
 )
 from market_voice_forecast_ledger.domain.mappings import (
     AssetMapping,
+    MarketCode,
     MarketEvidence,
     StatementContext,
     expression_market_codes,
@@ -45,7 +47,16 @@ class AssetMappingService:
             run.active_job_id, ASSET_MAPPING_UNIT_KEY
         )
         if unit.status is UnitStatus.SUCCESS:
-            return self._mappings.list_run_mappings(run_id)
+            mappings = self._mappings.list_run_mappings(run_id)
+            stored_hash = sha256_text(
+                canonical_json(self._artifact_payload(mappings))
+            )
+            if unit.output_hash != stored_hash:
+                raise DomainError(
+                    "ASSET_MAPPING_OUTPUT_HASH_MISMATCH",
+                    "stored asset mappings do not match the successful unit",
+                )
+            return mappings
         if unit.status is not UnitStatus.RUNNING:
             raise DomainError(
                 "ASSET_MAPPING_UNIT_NOT_RUNNING",
@@ -132,6 +143,9 @@ class AssetMappingService:
         subject_kind = self._analysis.get_active_subject_kind(scope.subject_id)
         statements = self._statements.list_run_statements(run_id)
         hints = self._hints_by_statement(run_id, statements)
+        interviewer_by_video = self._frozen_interviewer_evidence(
+            run_id, subject_kind
+        )
 
         resolved: list[AssetMapping] = []
         for statement in statements:
@@ -141,9 +155,89 @@ class AssetMappingService:
                 adopted_subject_evidence=self._surrounding_evidence(
                     statement, statements
                 ),
+                interviewer_evidence=interviewer_by_video.get(
+                    statement.source_video_id, ()
+                ),
             )
             resolved.extend(map_statement(statement, context))
         return tuple(resolved)
+
+    def _frozen_interviewer_evidence(
+        self, run_id: int, subject_kind: SubjectKind
+    ) -> dict[int, tuple[MarketEvidence, ...]]:
+        try:
+            metadata = json.loads(self._analysis.get_snapshot(run_id).metadata_json)
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("subject_kind") != subject_kind.value
+                or "interviewer_market_context" not in metadata
+            ):
+                raise ValueError
+            raw_context = metadata["interviewer_market_context"]
+            if not isinstance(raw_context, list):
+                raise ValueError
+            if subject_kind is SubjectKind.ORGANIZATION:
+                if raw_context:
+                    raise ValueError
+                return {}
+
+            by_video: dict[int, list[MarketEvidence]] = {}
+            seen_segment_ids: set[int] = set()
+            for item in raw_context:
+                if not isinstance(item, dict) or set(item) != {
+                    "assignment_sha256",
+                    "market_codes",
+                    "segment_id",
+                    "text_sha256",
+                    "video_id",
+                }:
+                    raise ValueError
+                segment_id = item["segment_id"]
+                video_id = item["video_id"]
+                assignment_sha256 = item["assignment_sha256"]
+                text_sha256 = item["text_sha256"]
+                market_values = item["market_codes"]
+                if (
+                    not isinstance(segment_id, int)
+                    or isinstance(segment_id, bool)
+                    or segment_id <= 0
+                    or segment_id in seen_segment_ids
+                    or not isinstance(video_id, int)
+                    or isinstance(video_id, bool)
+                    or video_id <= 0
+                    or not self._is_sha256(assignment_sha256)
+                    or not self._is_sha256(text_sha256)
+                    or not isinstance(market_values, list)
+                ):
+                    raise ValueError
+                market_codes = tuple(MarketCode(value) for value in market_values)
+                if (
+                    any(not isinstance(value, str) for value in market_values)
+                    or len(set(market_codes)) != len(market_codes)
+                ):
+                    raise ValueError
+                seen_segment_ids.add(segment_id)
+                by_video.setdefault(video_id, []).extend(
+                    MarketEvidence(segment_id, market_code)
+                    for market_code in market_codes
+                )
+            return {
+                video_id: tuple(evidence)
+                for video_id, evidence in by_video.items()
+            }
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "ASSET_MAPPING_INTERVIEWER_CONTEXT_INVALID",
+                "frozen interviewer context is not a safe mapping input",
+            ) from cause
+
+    @staticmethod
+    def _is_sha256(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
 
     def _hints_by_statement(
         self,
@@ -192,6 +286,14 @@ class AssetMappingService:
                 raise DomainError(
                     "ASSET_MAPPING_CODEX_STATEMENT_MISMATCH",
                     "normalized statement does not match its Codex proposal",
+                )
+            if any(
+                hint.expression != statement.target_expression
+                for hint in proposal.codex_asset_hints
+            ):
+                raise DomainError(
+                    "ASSET_MAPPING_CODEX_HINT_EXPRESSION_MISMATCH",
+                    "Codex asset hint does not match its statement target",
                 )
             result[statement.id] = proposal.codex_asset_hints
         if len(proposals) != len(statements):

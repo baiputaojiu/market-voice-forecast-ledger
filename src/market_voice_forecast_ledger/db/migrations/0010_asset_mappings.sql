@@ -49,30 +49,82 @@ CREATE TABLE analysis_asset_mappings (
 CREATE INDEX analysis_asset_mappings_run_statement
 ON analysis_asset_mappings(run_id, statement_id);
 
+CREATE TRIGGER analysis_asset_mappings_require_running_unit
+BEFORE INSERT ON analysis_asset_mappings
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM analysis_run_job_attempts AS attempt
+    JOIN job_units AS unit
+        ON unit.job_id = attempt.job_id
+        AND unit.unit_key = 'analysis:map-assets'
+    WHERE attempt.run_id = NEW.run_id
+        AND attempt.attempt_ordinal = (
+            SELECT MAX(active.attempt_ordinal)
+            FROM analysis_run_job_attempts AS active
+            WHERE active.run_id = NEW.run_id
+        )
+        AND unit.status = 'running'
+)
+BEGIN SELECT RAISE(ABORT, 'ASSET_MAPPING_UNIT_NOT_RUNNING'); END;
+
 CREATE TRIGGER analysis_asset_mappings_require_safe_rule_evidence
 BEFORE INSERT ON analysis_asset_mappings
 WHEN EXISTS (
     SELECT 1
     FROM json_each(NEW.rule_evidence_json) AS evidence
-    WHERE json_type(evidence.value) != 'object'
+    WHERE json_type(evidence.value) IS NOT 'object'
+        OR EXISTS (
+            SELECT 1
+            FROM json_each(evidence.value) AS member
+            WHERE member.key NOT IN (
+                'segment_id',
+                'evidence_kind',
+                'market_code',
+                'is_competing'
+            )
+        )
         OR (SELECT COUNT(*) FROM json_each(evidence.value)) != 4
-        OR json_type(evidence.value, '$.segment_id') != 'integer'
-        OR json_extract(evidence.value, '$.segment_id') <= 0
-        OR json_type(evidence.value, '$.evidence_kind') != 'text'
-        OR json_extract(evidence.value, '$.evidence_kind') NOT IN (
+        OR (
+            SELECT COUNT(*)
+            FROM json_each(evidence.value)
+            WHERE key = 'segment_id'
+        ) != 1
+        OR (
+            SELECT COUNT(*)
+            FROM json_each(evidence.value)
+            WHERE key = 'evidence_kind'
+        ) != 1
+        OR (
+            SELECT COUNT(*)
+            FROM json_each(evidence.value)
+            WHERE key = 'market_code'
+        ) != 1
+        OR (
+            SELECT COUNT(*)
+            FROM json_each(evidence.value)
+            WHERE key = 'is_competing'
+        ) != 1
+        OR json_type(evidence.value, '$.segment_id') IS NOT 'integer'
+        OR COALESCE(
+            json_extract(evidence.value, '$.segment_id') <= 0,
+            1
+        )
+        OR json_type(evidence.value, '$.evidence_kind') IS NOT 'text'
+        OR COALESCE(json_extract(evidence.value, '$.evidence_kind') NOT IN (
             'direct_expression',
             'explicit_market_expression',
             'generic_expression',
             'surrounding_subject_statement',
             'interviewer_context',
             'organization_assigned_statement'
-        )
-        OR json_type(evidence.value, '$.market_code') != 'text'
-        OR json_extract(evidence.value, '$.market_code') NOT IN (
+        ), 1)
+        OR json_type(evidence.value, '$.market_code') IS NOT 'text'
+        OR COALESCE(json_extract(evidence.value, '$.market_code') NOT IN (
             'japan', 'us', 'gold'
-        )
-        OR json_type(evidence.value, '$.is_competing') NOT IN (
-            'true', 'false'
+        ), 1)
+        OR (
+            json_type(evidence.value, '$.is_competing') IS NOT 'true'
+            AND json_type(evidence.value, '$.is_competing') IS NOT 'false'
         )
 )
 BEGIN SELECT RAISE(ABORT, 'ASSET_MAPPING_EVIDENCE_UNSAFE'); END;

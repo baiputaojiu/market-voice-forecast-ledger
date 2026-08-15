@@ -22,6 +22,7 @@ class MappingRepository:
 
     def insert(self, mapping: AssetMapping) -> int:
         self._require_transaction()
+        self._require_running_owner(mapping.run_id)
         cursor = self._conn.execute(
             """
             INSERT INTO analysis_asset_mappings(
@@ -98,6 +99,26 @@ class MappingRepository:
             raise DomainError(
                 "ASSET_MAPPING_TRANSACTION_REQUIRED",
                 "asset mapping mutation requires an active caller transaction",
+            )
+
+    def _require_running_owner(self, run_id: int) -> None:
+        row = self._conn.execute(
+            """
+            SELECT unit.status
+            FROM analysis_run_job_attempts AS attempt
+            JOIN job_units AS unit
+                ON unit.job_id=attempt.job_id
+                AND unit.unit_key='analysis:map-assets'
+            WHERE attempt.run_id=?
+            ORDER BY attempt.attempt_ordinal DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            raise DomainError(
+                "ASSET_MAPPING_UNIT_NOT_RUNNING",
+                "asset mapping insertion requires the active running unit",
             )
 
 

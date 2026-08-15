@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 
@@ -9,6 +10,7 @@ from market_voice_forecast_ledger.domain.analysis import (
     AnalysisRunSettings,
     BeginAnalysisRun,
 )
+from market_voice_forecast_ledger.domain.common import sha256_text
 from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     AssignmentOrigin,
@@ -295,7 +297,7 @@ def _prepare_personal_analysis(db) -> PreparedAnalysis:
         ),
         texts=(
             "Synthetic subject evidence.",
-            "Synthetic interviewer context.",
+            "米国株",
             "Synthetic held utterance.",
             "Synthetic other-person utterance.",
         ),
@@ -396,6 +398,61 @@ def test_person_scope_excludes_interviewer_hold_other_subject_and_post_cutoff(db
     ).status is UnitStatus.SUCCESS
 
 
+def test_person_interviewer_market_context_is_frozen_safe_and_not_codex_input(db):
+    prepared = _prepare_personal_analysis(db)
+
+    run = _begin(db, prepared)
+
+    snapshot = AnalysisRepository(db).get_snapshot(run.id)
+    input_payload = json.loads(snapshot.input_text)
+    metadata = json.loads(snapshot.metadata_json)
+    interviewer = db.execute(
+        """
+        SELECT assignment.segment_id, segment.video_id
+        FROM speaker_assignments AS assignment
+        JOIN transcript_segments AS segment ON segment.id=assignment.segment_id
+        WHERE assignment.assignment_kind='interviewer'
+        """
+    ).fetchone()
+    assert metadata["interviewer_market_context"] == [
+        {
+            "assignment_sha256": sha256_text(
+                "personal-interviewer-evidence-v1"
+            ),
+            "market_codes": ["us"],
+            "segment_id": interviewer["segment_id"],
+            "text_sha256": sha256_text("米国株"),
+            "video_id": interviewer["video_id"],
+        }
+    ]
+    assert tuple(
+        row["segment_id"] for row in input_payload["segments"]
+    ) == prepared.expected_segment_ids
+    assert "米国株" not in snapshot.input_text
+    assert "米国株" not in snapshot.metadata_json
+    assert tuple(
+        row.segment_id for row in AnalysisRepository(db).get_input_segments(run.id)
+    ) == prepared.expected_segment_ids
+
+
+def test_begin_rejects_interviewer_context_drift_after_preview(db):
+    prepared = _prepare_personal_analysis(db)
+    db.execute(
+        """
+        UPDATE speaker_assignments
+        SET evidence_hash=?
+        WHERE assignment_kind='interviewer'
+        """,
+        ("changed-interviewer-evidence",),
+    )
+
+    with pytest.raises(DomainError) as error:
+        _begin(db, prepared)
+
+    assert error.value.code == "ANALYSIS_JOB_INPUT_MISMATCH"
+    assert db.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 0
+
+
 def test_organization_scope_requires_channel_organization_assignments(db):
     subject_id = _create_subject(
         db, "Synthetic Organization", SubjectKind.ORGANIZATION, channel_index=4
@@ -421,6 +478,9 @@ def test_organization_scope_requires_channel_organization_assignments(db):
         item.segment_id
         for item in AnalysisRepository(db).get_input_segments(run.id)
     ) == segment_ids
+    assert json.loads(
+        AnalysisRepository(db).get_snapshot(run.id).metadata_json
+    )["interviewer_market_context"] == []
 
 
 def test_organization_scope_excludes_manual_subject_assignment(db):

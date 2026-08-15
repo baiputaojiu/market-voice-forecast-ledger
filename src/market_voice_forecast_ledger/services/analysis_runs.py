@@ -24,6 +24,7 @@ from market_voice_forecast_ledger.domain.enums import (
     JobKind,
     JobStage,
     JobStatus,
+    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -38,6 +39,9 @@ from market_voice_forecast_ledger.domain.jobs import (
     JobUnit,
     ManifestUnit,
     effective_input_hash,
+)
+from market_voice_forecast_ledger.domain.mappings import (
+    expression_market_codes,
 )
 from market_voice_forecast_ledger.domain.sources import ChannelPolicy
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
@@ -286,6 +290,13 @@ class AnalysisRunService:
         segments = self._analysis.select_input_segments(
             subject_id, exclusive, subject_kind, policy
         )
+        interviewer_context = self._interviewer_context_metadata(
+            subject_id,
+            exclusive,
+            subject_kind,
+            policy,
+            segments,
+        )
         input_text = canonical_json(
             {
                 "cutoff_day_jst": cutoff_day.isoformat(),
@@ -314,6 +325,7 @@ class AnalysisRunService:
             "cutoff_day_jst": cutoff_day.isoformat(),
             "cutoff_exclusive_utc": utc_iso(exclusive),
             "input_sha256": input_sha256,
+            "interviewer_market_context": interviewer_context,
             "policy_hash": policy.policy_hash,
             "policy_id": policy.id,
             "segments": [self._segment_metadata(segment) for segment in segments],
@@ -329,6 +341,45 @@ class AnalysisRunService:
             input_contract_hash=sha256_text(metadata_json),
             segments=segments,
         )
+
+    def _interviewer_context_metadata(
+        self,
+        subject_id: int,
+        cutoff_exclusive: datetime,
+        subject_kind: SubjectKind,
+        policy: ChannelPolicy,
+        subject_segments: tuple[SelectedInputSegment, ...],
+    ) -> list[dict[str, object]]:
+        if subject_kind is SubjectKind.ORGANIZATION:
+            return []
+        subject_video_ids = {segment.video_id for segment in subject_segments}
+        context: list[dict[str, object]] = []
+        for segment in self._analysis.select_interviewer_context_segments(
+            subject_id, cutoff_exclusive, policy
+        ):
+            if segment.video_id not in subject_video_ids:
+                continue
+            actual_text_sha256 = sha256_text(segment.text_body)
+            if segment.text_sha256 != actual_text_sha256:
+                raise DomainError(
+                    "ANALYSIS_INTERVIEWER_TEXT_HASH_MISMATCH",
+                    "interviewer context text does not match its stored hash",
+                )
+            context.append(
+                {
+                    "assignment_sha256": sha256_text(
+                        segment.assignment_evidence_hash
+                    ),
+                    "market_codes": [
+                        market.value
+                        for market in expression_market_codes(segment.text_body)
+                    ],
+                    "segment_id": segment.segment_id,
+                    "text_sha256": actual_text_sha256,
+                    "video_id": segment.video_id,
+                }
+            )
+        return context
 
     def _configured_policy(self, subject_id: int) -> ChannelPolicy:
         try:
