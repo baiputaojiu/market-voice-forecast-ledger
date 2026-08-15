@@ -5,7 +5,12 @@ import pytest
 
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
-from market_voice_forecast_ledger.domain.sources import VideoInput
+from market_voice_forecast_ledger.domain.enums import (
+    ConfigurationStatus,
+    PolicyKind,
+    SubjectKind,
+)
+from market_voice_forecast_ledger.domain.sources import ChannelPolicy, VideoInput
 from market_voice_forecast_ledger.repositories.sources import SourceRepository
 
 
@@ -137,3 +142,34 @@ def test_video_upsert_updates_metadata_without_changing_identity(db):
     assert updated_id == original_id
     assert repo.count_videos() == 1
     assert repo.get_video(original_id).title == "Updated title"
+
+
+def test_policy_hash_ignores_non_authoritative_channel_display_name(db):
+    repo = SourceRepository(db)
+    first_subject_id = repo.create_subject("Synthetic One", SubjectKind.PERSON)
+    renamed_subject_id = repo.create_subject("Synthetic Two", SubjectKind.PERSON)
+    shared_policy = {
+        "policy_kind": PolicyKind.FIXED_CHANNEL,
+        "configuration_status": ConfigurationStatus.CONFIGURED,
+        "youtube_channel_id": "UCVXka7buS_WptsAzSE0LcKg",
+    }
+    repo.create_policy(
+        first_subject_id,
+        ChannelPolicy(
+            **shared_policy,
+            channel_display_name="Original Channel Name",
+        ),
+    )
+    repo.create_policy(
+        renamed_subject_id,
+        ChannelPolicy(
+            **shared_policy,
+            channel_display_name="Renamed Channel",
+        ),
+    )
+
+    original = repo.get_policy(first_subject_id)
+    renamed = repo.get_policy(renamed_subject_id)
+    assert original.channel_display_name == "Original Channel Name"
+    assert renamed.channel_display_name == "Renamed Channel"
+    assert original.policy_hash == renamed.policy_hash

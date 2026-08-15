@@ -197,7 +197,6 @@ class SourceRepository:
 
 def _policy_hash(policy: ChannelPolicy) -> str:
     configuration = {
-        "channel_display_name": policy.channel_display_name,
         "configuration_status": policy.configuration_status.value,
         "policy_kind": policy.policy_kind.value,
         "youtube_channel_id": policy.youtube_channel_id,
