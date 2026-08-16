@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### M2中核バックエンド: ユーザー受け入れと次subproject選択
+### M2中核バックエンド: GitHub反映と次subproject選択
 
-M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2中核バックエンドは隔離branch `feature/m2-core-backend` でTask 1～19、whole-branch最終監査、Fix A～Gの監査修正をローカル実装・検証済みである。現在の判断事項は中核バックエンドのユーザー受け入れと次subprojectの選択であり、実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未受け入れのため、アプリ全体の完成とはしない。
+M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2中核バックエンドはTask 1～19、whole-branch最終監査、Fix A～Gの監査修正を完了し、2026-08-16 JSTにユーザー受け入れを得てローカル`main`へfast-forward統合した。統合後の`main`でも一括検証は成功した。現在の判断事項はGitHubへのpushとlive remote照合、その後に着手する次subprojectの選択である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未受け入れのため、アプリ全体の完成とはしない。
 
 ## 完了済み（Completed）
 
@@ -57,21 +57,24 @@ M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M
 - Fix D commit `a92bcaac9b592577d1a7f1efe7b1f70326853351` で組織所有動画の公式segment集合を個人話者修正から保護し、4-path treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）となった。
 - Fix E commit `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` (`fix: verify staged public artifacts`) で公開安全検査を実index blobへ固定し、公開方針と`.gitignore`の禁止artifact parityを補完した。2-path非文書treeの最終独立rereviewはAPPROVE（Critical 0、Important 0、Minor 0）となった。
 - Fix F commit `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` (`fix: reject disguised binary public artifacts`) で、明示的なbinary拡張子allowlist以外のNUL含有fileをStaged・WorkingTree両modeでfail-closedにした。凍結2-path treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）となった。
-- Fix Gのこの文書を含むcommit (`fix: align public ignore policy`) で、`*.sqlite3-*`と`.coverage.*`を`.gitignore`へ追加し、公開方針の第一防御をscannerの第二防御と整合させた。凍結2-path treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）となった。
+- Fix G commit `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`) で、`*.sqlite3-*`と`.coverage.*`を`.gitignore`へ追加し、公開方針の第一防御をscannerの第二防御と整合させた。凍結2-path treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）となった。
 - Fix G treeはbackend 908件中907 passed・既存capability skip 1件、work-state All 209 passed・0 failed、PowerShell 5.1/7.6 Scripts各108 passed・0 failed、working-tree公開安全166ファイル、compileall・diffを通過した。dev bootstrap後のoffline wheelから正確な18 migrationとaudit guardも再確認した。
+- ユーザーがM2中核バックエンドを受け入れ、統合方法1を選択した。`feature/m2-core-backend` はローカル`main`へfast-forward統合され、統合済みworktreeとbranchを通常削除した。
+- 統合後`main`で、無視対象のローカル`.venv`を既存のoffline `setuptools 83`から再構築した。最初に再現したwheel build backend不足を解消後、一括検証はbackend 907 passed・既存capability skip 1件、work-state 209 passed・0 failed、公開安全166ファイルで成功した。追跡ファイルの追加変更はない。
 - 実YouTube・音声・Codex adapter、実HTTP server/socket、UI、電源断・disk failure、hostileな同時junction差し替え、未bootstrap fresh machineへのoffline installation、remote publication、完成製品の受け入れはこの監査で証明していない。
 
 ## 作業中（In Progress）
 
-- ローカル検証済みM2中核バックエンドのユーザー受け入れ。
-- 受け入れ後に着手する次subprojectの選択。ユーザーの明示承認前には開始しない。
+- ローカル`main`のGitHub反映とlive remote SHA照合。push実行前の最終承認待ち。
+- 次subprojectの選択。ユーザーの明示承認前には開始しない。
 
 ## 未着手（Not Started）
 
-### M2中核バックエンドの完了確認
+### M2中核バックエンドの公開反映
 
-1. 中核バックエンドの受け入れ可否についてユーザー判断を受ける。
-2. 次subprojectをユーザーが選択する。監査完了だけで自動的に次工程へ進めない。
+1. 最終承認後、ローカル`main`を既存`origin/main`へ通常pushする。
+2. `verify-remote-head.ps1`でlive remote SHAとローカルHEADの一致を確認する。
+3. 次subprojectをユーザーが選択する。M2受け入れだけで自動的に次工程へ進めない。
 
 ### M2後続・M3以降
 

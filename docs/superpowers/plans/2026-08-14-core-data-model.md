@@ -2511,7 +2511,7 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   は、明示的なbinary拡張子allowlist以外のdecoded fileがNULを含む場合、
   Staged・WorkingTree両modeで内容非表示のままfail-closedにした。許可済み
   binaryと通常のUTF-8/UTF-16 textの処理は維持した。
-- Fix Gのこの文書を含むcommit (`fix: align public ignore policy`) は、
+- Fix G commit `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`) は、
   SQLite3 sidecarの `*.sqlite3-*` と派生coverage fileの `.coverage.*` を
   `.gitignore`へ追加し、公開方針の第一防御を変更不要のscanner第二防御と
   整合させた。
@@ -2634,7 +2634,14 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   remote publication、push・merge・rebase、完成製品の受け入れはこの最終検証で
   実行していない。process crashは合成temporary DBとtest-only childで検証した
   範囲だけを主張する。
-- M2中核バックエンドはローカル実装・検証済みだが、ユーザー受け入れ前である。
-  次subprojectとアプリ全体の完成は別の明示承認を必要とする。
-- Fix Gのexact 6-path commit後にlocal branch/worktreeのclean状態とno-upstreamを
-  確認して引き渡す。ignored Fix G reportはtracked差分へ含めない。
+- M2中核バックエンドは2026-08-16 JSTにユーザー受け入れ済みとなり、
+  `feature/m2-core-backend`からローカル`main`へfast-forward統合した。統合済み
+  worktreeとbranchは通常削除した。次subprojectとアプリ全体の完成は別の明示承認を
+  必要とする。
+- Fix G commit `188617e7bdc31229d161c1efab1d4269b007d67e` までを含む統合後
+  `main`で一括検証を再実行し、backend 907 passed・既存capability skip 1件、
+  work-state 209 passed・0 failed、公開安全166ファイルを確認した。mainにだけ不足して
+  いた無視対象`.venv`は既存offline `setuptools 83`から再構築し、追跡差分を作らず
+  wheel回帰を含む検証を成功させた。
+- GitHubへのpushとlive remote SHA照合は未実施であり、別PCへ保存完了とはまだ
+  判定しない。ignored Fix A～G reportと`.venv`はtracked差分へ含めない。

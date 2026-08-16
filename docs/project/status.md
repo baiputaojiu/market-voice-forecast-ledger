@@ -6,12 +6,12 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～19、whole-branch最終監査、Fix A～Gの監査修正をローカル実装・検証済みである。中核バックエンドはユーザー受け入れ待ちで、次subprojectは未承認である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドはTask 1～19、whole-branch最終監査、Fix A～Gを完了し、2026-08-16 JSTにユーザー受け入れ済みとなった。実装branchはローカル`main`へfast-forward統合され、統合後検証も成功した。GitHubへのpushとlive remote照合、次subprojectの選択は未完了である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- 実装worktree branch: `feature/m2-core-backend`
+- 現在のローカルbranch: `main`
 - Task 19 commit: `3267968d67a70ecee0b6f68e13d241a73e7b634f` (`test: verify synthetic core backend flow`)
 - whole-branch Fix A: `9ba560c4db1a795479d831198f04cc3aa5b496f4` (`fix: prevent superseded analysis promotion`)
 - whole-branch Fix B: `55ccd07c680bbdaa0e532194305f776e04102f0f` (`fix: harden append-only audit boundaries`)
@@ -19,9 +19,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix D: `a92bcaac9b592577d1a7f1efe7b1f70326853351` (`fix: preserve organization analysis input`)
 - whole-branch Fix E: `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` (`fix: verify staged public artifacts`)
 - whole-branch Fix F: `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` (`fix: reject disguised binary public artifacts`)
-- whole-branch Fix G: この文書を含むcommit (`fix: align public ignore policy`)。SHAは本文へ固定せずGitから取得する。
-- upstream: なし。Fix A～Gではpush・merge・rebaseもlive remote検証も行っていない。
-- Fix G handoff: 上記のexact 6-path commit後にlocal branch/worktreeがcleanであることを確認して引き渡す。ignored reportはtracked差分へ含めない。
+- whole-branch Fix G: `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`)。
+- M2統合: `feature/m2-core-backend`をローカル`main`へfast-forward統合後、統合済みworktreeとbranchを通常削除した。
+- upstream: `origin/main`。ローカル`main`はremoteより先行しているが、この状態文書commitを含むpushとlive remote照合は未実施。
+- ローカル環境: main直下の`.venv`はGit除外対象で、既存offline `setuptools 83`から再構築した。収集データや秘密情報を含まず、push対象ではない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
 - 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
@@ -91,7 +92,8 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 作業中（In Progress）
 
-- ローカル検証済みM2中核バックエンドのユーザー受け入れと、次subprojectの選択。
+- ローカル`main`のGitHub反映とlive remote SHA照合。
+- 次subprojectの選択。
 - 実YouTube、実音声、実Codex/model/tool、実server/socket、UIの統合検証は行っていない。
 
 ## 未着手（Not Started）
@@ -100,7 +102,6 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
 - MVPで固定する音声モデル名・バージョン、具体的な生スコア尺度・閾値値、閾値設定バージョンの初期値、保留話者の手動レビュー手順。
-- M2中核バックエンドのユーザー受け入れ。
 - 次subproject。候補は収集・音声・Codex adapter・UI・常駐workerで、ユーザーの明示承認までは着手しない。
 
 ## 検証結果（Verification Results）
@@ -177,8 +178,9 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. 中核バックエンドの受け入れ可否についてユーザー判断を受ける。
-2. 受け入れ後に着手する次subprojectをユーザーが選択する。次工程は自動承認しない。
+1. push対象を最終確認後、ローカル`main`を既存`origin/main`へ通常pushする。
+2. `verify-remote-head.ps1`でlive remote SHA一致を確認し、別PCから再開可能な保存完了状態にする。
+3. 次subprojectをユーザーが選択する。次工程は自動承認しない。
 
 ## 重要ファイル（Important Files）
 
