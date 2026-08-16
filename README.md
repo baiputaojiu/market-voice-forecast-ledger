@@ -1,6 +1,6 @@
 # 相場見通し発言台帳
 
-YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19とwhole-branch監査Fix A～Fはローカルで実装・検証済みで、現在はユーザー受け入れ待ちです。実YouTube・音声・Codex adapterとUIを含む完成版ではなく、投資判断には利用できません。
+YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19とwhole-branch監査Fix A～Gはローカルで実装・検証済みで、現在はユーザー受け入れ待ちです。実YouTube・音声・Codex adapterとUIを含む完成版ではなく、投資判断には利用できません。
 
 ## 現在の状態
 
@@ -13,12 +13,15 @@ YouTube上の対象者の発言を収集し、発言だけを根拠に日経平�
 Fix D commit `a92bcaac9b592577d1a7f1efe7b1f70326853351` は組織主体の
 分析入力を個人話者修正から保護し、Fix E commit
 `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` は公開安全検査を実際の
-index blobへ固定しました。Fix Fのこの文書を含むcommit
-(`fix: reject disguised binary public artifacts`) は、明示的に許可したbinary
+index blobへ固定しました。Fix F commit
+`25136c5048968eb4d81ba59c597b1bdcfd6f8f24` は、明示的に許可したbinary
 拡張子以外のNUL含有fileをStaged・WorkingTree両modeで内容非表示のまま
-fail-closedにします。最新ローカル検証はbackend 908件中907 passed・既存
-capability skip 1件、work-state All 203 passed・0 failed、PowerShell 5.1/7.6の
-PublicSafety各68 passed・0 failedです。branchにupstreamはなく、Fix D～Fで
+fail-closedにします。Fix Gのこの文書を含むcommit
+(`fix: align public ignore policy`) は、SQLite3 sidecarと派生coverage fileを
+`.gitignore`の第一防御にも追加し、scannerの第二防御と整合させます。最新ローカル
+検証はbackend 908件中907 passed・既存capability skip 1件、work-state All
+209 passed・0 failed、PowerShell 5.1/7.6のScripts各108 passed・0 failed、
+working-tree公開安全166ファイルです。branchにupstreamはなく、Fix D～Gで
 push・merge・rebaseは行っていません。
 
 ## 別PCで再開する

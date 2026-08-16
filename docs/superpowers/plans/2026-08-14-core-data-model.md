@@ -2506,10 +2506,15 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   NUL-safeなpath列挙、binary-safeなblob読取、内容を表示しないfail-closed、
   `.gitignore`と公開方針の禁止artifact parityを追加し、WorkingTree modeの
   content読取境界は維持した。
-- Fix Fのこの文書を含むcommit (`fix: reject disguised binary public artifacts`)
+- Fix F commit `25136c5048968eb4d81ba59c597b1bdcfd6f8f24`
+  (`fix: reject disguised binary public artifacts`)
   は、明示的なbinary拡張子allowlist以外のdecoded fileがNULを含む場合、
   Staged・WorkingTree両modeで内容非表示のままfail-closedにした。許可済み
   binaryと通常のUTF-8/UTF-16 textの処理は維持した。
+- Fix Gのこの文書を含むcommit (`fix: align public ignore policy`) は、
+  SQLite3 sidecarの `*.sqlite3-*` と派生coverage fileの `.coverage.*` を
+  `.gitignore`へ追加し、公開方針の第一防御を変更不要のscanner第二防御と
+  整合させた。
 
 ### As-built migration manifest
 
@@ -2568,6 +2573,10 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
 - Fix Fの非文書scopeも同じ2ファイルだけである。独立read-only APPROVEと
   post-review gate後に同じ4文書だけを追加し、exact 6-path commitとする。
   その他のtracked path deviationはない。
+- Fix Gの非文書scopeは `.gitignore` と `tests/work-state/run-tests.ps1` の
+  2ファイルだけである。独立read-only APPROVEとpost-review gate後にREADME、
+  project status/plan、このas-built planだけを追加し、exact 6-path commitとする。
+  その他のtracked path deviationはない。
 
 完全なtask別rulingとreview roundは、Git-ignoredの
 `.superpowers/sdd/2026-08-14-core-data-model/progress.md` と各reportに残す。
@@ -2609,6 +2618,17 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   正確な18 migration archive名・適用順・ledger順、Task 2 audit列・trigger、
   raw UPDATE/DELETEの `APPEND_ONLY` を確認した。未bootstrap fresh machineでの
   offline dependency installationは証明していない。
+- Fix Gでは実Gitの `check-ignore -v --no-index` を使うtestを先に追加し、
+  `.gitignore`変更前に106 passed・2 failedのREDを確認した。失敗は
+  `ledger.sqlite3-wal`と `.coverage.synthetic`だけで、既存の `*.sqlite3`、
+  `*.sqlite-*`、`*.db-*`、`.coverage` controlは成功した。2 patternだけの修正後、
+  PowerShell 5.1/7.6のScriptsは各108 passed・0 failedとなった。
+- Fix Gの凍結2-path非文書treeは独立read-only reviewでAPPROVE（Critical 0、
+  Important 0、Minor 0）となった。repository一括検証はbackend 908件中
+  907 passed、既存capability skip 1件、work-state All 209 passed・0 failed、
+  working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。
+  dev bootstrap後のindex無効offline wheel回帰も1 passed・0 failedで、正確な
+  18 migrationとaudit guardを再確認した。
 - 実YouTube検索・音声・全文文字起こし、実Codex/model/tool call・adapter、実HTTP
   server/socket、React UI、電源断・disk failure、hostileな同時junction差し替え、
   remote publication、push・merge・rebase、完成製品の受け入れはこの最終検証で
@@ -2616,5 +2636,5 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   範囲だけを主張する。
 - M2中核バックエンドはローカル実装・検証済みだが、ユーザー受け入れ前である。
   次subprojectとアプリ全体の完成は別の明示承認を必要とする。
-- Fix Fのexact 6-path commit後にlocal branch/worktreeのclean状態とno-upstreamを
-  確認して引き渡す。ignored Fix F reportはtracked差分へ含めない。
+- Fix Gのexact 6-path commit後にlocal branch/worktreeのclean状態とno-upstreamを
+  確認して引き渡す。ignored Fix G reportはtracked差分へ含めない。

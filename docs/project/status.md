@@ -6,7 +6,7 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～19、whole-branch最終監査、Fix A～Fの監査修正をローカル実装・検証済みである。中核バックエンドはユーザー受け入れ待ちで、次subprojectは未承認である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～19、whole-branch最終監査、Fix A～Gの監査修正をローカル実装・検証済みである。中核バックエンドはユーザー受け入れ待ちで、次subprojectは未承認である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
@@ -18,9 +18,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix C: `772e19dc502a9c2f39a121519e78fabac0b3422a` (`test: finalize core backend verification`)
 - whole-branch Fix D: `a92bcaac9b592577d1a7f1efe7b1f70326853351` (`fix: preserve organization analysis input`)
 - whole-branch Fix E: `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` (`fix: verify staged public artifacts`)
-- whole-branch Fix F: この文書を含むcommit (`fix: reject disguised binary public artifacts`)。SHAは本文へ固定せずGitから取得する。
-- upstream: なし。Fix A～Fではpush・merge・rebaseもlive remote検証も行っていない。
-- Fix F handoff: 上記のexact 6-path commit後にlocal branch/worktreeがcleanであることを確認して引き渡す。ignored reportはtracked差分へ含めない。
+- whole-branch Fix F: `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` (`fix: reject disguised binary public artifacts`)
+- whole-branch Fix G: この文書を含むcommit (`fix: align public ignore policy`)。SHAは本文へ固定せずGitから取得する。
+- upstream: なし。Fix A～Gではpush・merge・rebaseもlive remote検証も行っていない。
+- Fix G handoff: 上記のexact 6-path commit後にlocal branch/worktreeがcleanであることを確認して引き渡す。ignored reportはtracked差分へ含めない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
 - 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
@@ -86,6 +87,7 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix Dで、組織所有動画のHOLD・INTERVIEWER・manual SUBJECT segmentに対する個人話者修正をmutation前に拒否し、組織の公式segment集合を分析入力として保持した。
 - whole-branch Fix Eで、staged公開安全検査をNUL-safeなpath列挙と実index blobのbinary-safe読取へ変更し、lookup・read・decode失敗を内容非表示でfail-closedにした。公開方針と`.gitignore`の禁止sidecar・cache・editor/OS artifactもforce-stage時に拒否する。
 - whole-branch Fix Fで、明示的なbinary拡張子allowlist以外のdecoded fileがNULを含む場合、Staged・WorkingTree両modeで内容を表示せずfail-closedにした。許可済みbinaryと通常のUTF-8/UTF-16 textの境界は維持した。
+- whole-branch Fix Gで、SQLite3 sidecarの`*.sqlite3-*`と派生coverage fileの`.coverage.*`を`.gitignore`へ追加し、公開方針の第一防御を変更不要のscanner第二防御と整合させた。
 
 ## 作業中（In Progress）
 
@@ -138,6 +140,9 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Fix Fの非文書scopeは`check-public-safety.ps1`と`run-tests.ps1`の2-pathだけで、凍結treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）だった。Scriptsは102 passed・0 failed、work-state Allは203 passed・0 failedだった。
 - Fix F treeのrepository一括検証はbackend 908件中907 passed・既存Windows symlink capability skip 1件、work-state All 203 passed・0 failed、working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。
 - dev bootstrap後のoffline wheel回帰はFix F treeでもindexを無効化して成功し、wheel内の正確な18 migration名・適用順・ledger順、Task 2 audit列・trigger、raw UPDATE/DELETEの`APPEND_ONLY`を確認した。未bootstrap fresh machineへのoffline dependency導入は証明していない。
+- Fix GはFix F commit `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` のclean treeから開始した。実Gitの`check-ignore -v --no-index`を使うtestは変更前に106 passed・2 failedとなり、失敗は`ledger.sqlite3-wal`と`.coverage.synthetic`だけだった。既存の`*.sqlite3`、`*.sqlite-*`、`*.db-*`、`.coverage` controlはRED時点から成功した。
+- `.gitignore`へ上記2 patternだけを追加した後、PowerShell 5.1/7.6のScriptsは各108 passed・0 failed、work-state Allは209 passed・0 failedとなった。凍結2-path非文書treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）だった。
+- Fix G treeのrepository一括検証はbackend 908件中907 passed・既存Windows symlink capability skip 1件、work-state All 209 passed・0 failed、working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。dev bootstrap後のindex無効offline wheel回帰も1 passed・0 failedで、正確な18 migrationとaudit guardを再確認した。未bootstrap fresh machineへのoffline dependency導入は証明していない。
 
 ### ユーザー報告のスモールテスト結果
 

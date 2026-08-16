@@ -22,6 +22,7 @@ analysis-snapshots/
 *.db-*
 *.sqlite
 *.sqlite3
+*.sqlite3-*
 *.sqlite-*
 *.wav
 *.mp3
@@ -58,6 +59,7 @@ dist/
 build/
 coverage/
 .coverage
+.coverage.*
 
 # Logs and temporary work
 logs/

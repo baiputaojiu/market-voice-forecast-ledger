@@ -205,6 +205,27 @@ function Test-Scripts {
         return
     }
 
+    $ignorePolicyCases = @(
+        [PSCustomObject]@{ Path = 'ledger.sqlite3-wal'; Message = '.gitignore excludes SQLite3 sidecars' },
+        [PSCustomObject]@{ Path = '.coverage.synthetic'; Message = '.gitignore excludes derived coverage files' },
+        [PSCustomObject]@{ Path = 'ledger.sqlite3'; Message = '.gitignore still excludes SQLite3 databases' },
+        [PSCustomObject]@{ Path = 'ledger.sqlite-journal'; Message = '.gitignore still excludes SQLite sidecars' },
+        [PSCustomObject]@{ Path = 'ledger.db-wal'; Message = '.gitignore still excludes DB sidecars' },
+        [PSCustomObject]@{ Path = '.coverage'; Message = '.gitignore still excludes the base coverage file' }
+    )
+    foreach ($case in $ignorePolicyCases) {
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $ignoreOutput = & git -C $ProjectRoot check-ignore -v --no-index -- $case.Path 2>&1 | Out-String
+        $ignoreExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorAction
+        $matchedByRepositoryIgnore = (
+            $ignoreExitCode -eq 0 -and
+            $ignoreOutput.Trim().StartsWith('.gitignore:', [System.StringComparison]::Ordinal)
+        )
+        Assert-True $matchedByRepositoryIgnore $case.Message
+    }
+
     $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mvfl-work-state-tests-" + [guid]::NewGuid().ToString('N'))
     $nonGit = Join-Path $testRoot 'not-a-repository'
     $safeData = Join-Path $testRoot 'safe-data'
