@@ -2500,11 +2500,16 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   (`fix: preserve organization analysis input`) は組織所有動画のHOLD、
   INTERVIEWER、manual SUBJECT segmentに対する個人話者修正をmutation前に
   拒否し、組織の公式segment集合を分析入力として保持した。
-- Fix Eのこの文書を含むcommit (`fix: verify staged public artifacts`) はstaged
+- Fix E commit `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f`
+  (`fix: verify staged public artifacts`) はstaged
   公開安全検査をworking tree pathではなく実際のindex blobへ固定した。
   NUL-safeなpath列挙、binary-safeなblob読取、内容を表示しないfail-closed、
   `.gitignore`と公開方針の禁止artifact parityを追加し、WorkingTree modeの
   content読取境界は維持した。
+- Fix Fのこの文書を含むcommit (`fix: reject disguised binary public artifacts`)
+  は、明示的なbinary拡張子allowlist以外のdecoded fileがNULを含む場合、
+  Staged・WorkingTree両modeで内容非表示のままfail-closedにした。許可済み
+  binaryと通常のUTF-8/UTF-16 textの処理は維持した。
 
 ### As-built migration manifest
 
@@ -2560,6 +2565,9 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   `tests/work-state/run-tests.ps1` の2ファイルだけである。非文書APPROVEと
   post-review gate後にREADME、project status/plan、このas-built planだけを
   文書scopeへ追加した。その他のtracked path deviationはない。
+- Fix Fの非文書scopeも同じ2ファイルだけである。独立read-only APPROVEと
+  post-review gate後に同じ4文書だけを追加し、exact 6-path commitとする。
+  その他のtracked path deviationはない。
 
 完全なtask別rulingとreview roundは、Git-ignoredの
 `.superpowers/sdd/2026-08-14-core-data-model/progress.md` と各reportに残す。
@@ -2589,7 +2597,15 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   skip 1件、work-state All 181 passed・0 failed、working-tree公開安全166ファイル、
   compileall、`git diff --check`が成功した。PowerShell 5.1/7.6のPublicSafetyは
   各46 passed・0 failed、Scriptsは80 passed・0 failedだった。
-- dev bootstrap後のoffline wheel証明はFix E最終treeでもindexを無効にして成功し、
+- Fix FではStaged・WorkingTreeのsecret/safe NUL fixtureを先に追加し、scanner
+  変更前にPublicSafety 60 passed・8 failedのREDを確認した。対称な2か所の
+  fail-closed修正後、PowerShell 5.1/7.6は各68 passed・0 failedとなった。
+  凍結2-path treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、
+  Minor 0）だった。
+- Fix F treeのrepository一括検証はbackend 908件中907 passed、既存capability
+  skip 1件、work-state All 203 passed・0 failed、Scripts 102 passed・0 failed、
+  working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。
+- dev bootstrap後のoffline wheel証明はFix F treeでもindexを無効にして成功し、
   正確な18 migration archive名・適用順・ledger順、Task 2 audit列・trigger、
   raw UPDATE/DELETEの `APPEND_ONLY` を確認した。未bootstrap fresh machineでの
   offline dependency installationは証明していない。
@@ -2600,3 +2616,5 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   範囲だけを主張する。
 - M2中核バックエンドはローカル実装・検証済みだが、ユーザー受け入れ前である。
   次subprojectとアプリ全体の完成は別の明示承認を必要とする。
+- Fix Fのexact 6-path commit後にlocal branch/worktreeのclean状態とno-upstreamを
+  確認して引き渡す。ignored Fix F reportはtracked差分へ含めない。

@@ -340,6 +340,7 @@ function Test-PublicSafety {
 
     $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mvfl-work-state-tests-" + [guid]::NewGuid().ToString('N'))
     $stagedSafety = Join-Path $testRoot 'staged-safety'
+    $workingTreeSafety = Join-Path $testRoot 'working-tree-safety'
     $secretFixture = 'api' + '_key = "real-looking-secret-value-1234567890"'
 
     try {
@@ -355,6 +356,14 @@ function Test-PublicSafety {
         Set-Content -LiteralPath (Join-Path $stagedSafety 'deleted-secret.txt') -Encoding ASCII -Value $secretFixture
         Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', 'README.md', '.gitignore', 'deleted-secret.txt') | Out-Null
         Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('commit', '-m', 'staged safety baseline') | Out-Null
+
+        New-Item -ItemType Directory -Path $workingTreeSafety -Force | Out-Null
+        Invoke-Git -WorkingDirectory $workingTreeSafety -Arguments @('init') | Out-Null
+        Invoke-Git -WorkingDirectory $workingTreeSafety -Arguments @('config', 'user.name', 'Work State Tests') | Out-Null
+        Invoke-Git -WorkingDirectory $workingTreeSafety -Arguments @('config', 'user.email', 'work-state-tests@example.invalid') | Out-Null
+        Set-Content -LiteralPath (Join-Path $workingTreeSafety 'README.md') -Encoding ASCII -Value '# Working-tree safety fixture'
+        Invoke-Git -WorkingDirectory $workingTreeSafety -Arguments @('add', 'README.md') | Out-Null
+        Invoke-Git -WorkingDirectory $workingTreeSafety -Arguments @('commit', '-m', 'working-tree safety baseline') | Out-Null
 
         Set-Content -LiteralPath (Join-Path $stagedSafety 'index-secret.txt') -Encoding ASCII -Value $secretFixture
         Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', 'index-secret.txt') | Out-Null
@@ -408,6 +417,98 @@ function Test-PublicSafety {
         Assert-True ($utf16StagedSecret.Output -notmatch [regex]::Escape($secretFixture)) 'staged UTF-16 secret failure does not print secret content'
         Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'utf16-index.txt') | Out-Null
         Remove-Item -LiteralPath (Join-Path $stagedSafety 'utf16-index.txt') -Force
+
+        $stagedNulSecretPath = Join-Path $stagedSafety 'staged-nul-secret.txt'
+        [System.IO.File]::WriteAllBytes(
+            $stagedNulSecretPath,
+            [System.Text.Encoding]::UTF8.GetBytes($secretFixture + [char]0)
+        )
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'staged-nul-secret.txt') | Out-Null
+        $stagedNulSecret = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($stagedNulSecret.ExitCode -eq 1) 'staged safety fails closed on secret text with a trailing NUL'
+        Assert-True ($stagedNulSecret.Output -match [regex]::Escape('VIOLATION: Unable to inspect staged file content: staged-nul-secret.txt')) 'staged NUL text uses a stable safe diagnostic'
+        Assert-True ($stagedNulSecret.Output -notmatch [regex]::Escape($secretFixture)) 'staged NUL text failure does not print secret content'
+        Assert-True ($stagedNulSecret.Output -notmatch 'MethodInvocationException|FullyQualifiedErrorId|NativeCommandError|fatal:') 'staged NUL text failure suppresses raw tool errors'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'staged-nul-secret.txt') | Out-Null
+        Remove-Item -LiteralPath $stagedNulSecretPath -Force
+
+        $stagedNulSafePath = Join-Path $stagedSafety 'staged-nul-safe.txt'
+        [System.IO.File]::WriteAllBytes(
+            $stagedNulSafePath,
+            [System.Text.Encoding]::UTF8.GetBytes('ordinary safe text' + [char]0)
+        )
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'staged-nul-safe.txt') | Out-Null
+        $stagedNulSafe = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($stagedNulSafe.ExitCode -eq 1) 'staged safety fails closed on non-secret text with a trailing NUL'
+        Assert-True ($stagedNulSafe.Output -match [regex]::Escape('VIOLATION: Unable to inspect staged file content: staged-nul-safe.txt')) 'staged non-secret NUL text uses the stable safe diagnostic'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'staged-nul-safe.txt') | Out-Null
+        Remove-Item -LiteralPath $stagedNulSafePath -Force
+
+        $workingNulSecretPath = Join-Path $workingTreeSafety 'working-nul-secret.txt'
+        [System.IO.File]::WriteAllBytes(
+            $workingNulSecretPath,
+            [System.Text.Encoding]::UTF8.GetBytes($secretFixture + [char]0)
+        )
+        $workingNulSecret = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
+        Assert-True ($workingNulSecret.ExitCode -eq 1) 'working-tree safety fails closed on secret text with a trailing NUL'
+        Assert-True ($workingNulSecret.Output -match [regex]::Escape('VIOLATION: Unable to inspect file content: working-nul-secret.txt')) 'working-tree NUL text uses a stable safe diagnostic'
+        Assert-True ($workingNulSecret.Output -notmatch [regex]::Escape($secretFixture)) 'working-tree NUL text failure does not print secret content'
+        Assert-True ($workingNulSecret.Output -notmatch 'MethodInvocationException|FullyQualifiedErrorId|NativeCommandError|fatal:') 'working-tree NUL text failure suppresses raw tool errors'
+        Remove-Item -LiteralPath $workingNulSecretPath -Force
+
+        $workingNulSafePath = Join-Path $workingTreeSafety 'working-nul-safe.txt'
+        [System.IO.File]::WriteAllBytes(
+            $workingNulSafePath,
+            [System.Text.Encoding]::UTF8.GetBytes('ordinary safe text' + [char]0)
+        )
+        $workingNulSafe = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
+        Assert-True ($workingNulSafe.ExitCode -eq 1) 'working-tree safety fails closed on non-secret text with a trailing NUL'
+        Assert-True ($workingNulSafe.Output -match [regex]::Escape('VIOLATION: Unable to inspect file content: working-nul-safe.txt')) 'working-tree non-secret NUL text uses the stable safe diagnostic'
+        Remove-Item -LiteralPath $workingNulSafePath -Force
+
+        [byte[]]$allowedBinaryBytes = @(
+            0x89, 0x50, 0x4E, 0x47, 0x00, 0xFF
+        ) + [System.Text.Encoding]::UTF8.GetBytes($secretFixture)
+        $stagedAllowedBinaryPath = Join-Path $stagedSafety 'allowed-binary.png'
+        [System.IO.File]::WriteAllBytes($stagedAllowedBinaryPath, $allowedBinaryBytes)
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'allowed-binary.png') | Out-Null
+        $stagedAllowedBinary = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($stagedAllowedBinary.ExitCode -eq 0) 'staged safety accepts an explicitly allowlisted binary extension'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'allowed-binary.png') | Out-Null
+        Remove-Item -LiteralPath $stagedAllowedBinaryPath -Force
+
+        $workingAllowedBinaryPath = Join-Path $workingTreeSafety 'allowed-binary.png'
+        [System.IO.File]::WriteAllBytes($workingAllowedBinaryPath, $allowedBinaryBytes)
+        $workingAllowedBinary = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
+        Assert-True ($workingAllowedBinary.ExitCode -eq 0) 'working-tree safety accepts an explicitly allowlisted binary extension'
+        Remove-Item -LiteralPath $workingAllowedBinaryPath -Force
+
+        $textEncodingControls = @(
+            [PSCustomObject]@{ Name = 'UTF-8'; Encoding = 'UTF8'; FileName = 'utf8-control.txt' },
+            [PSCustomObject]@{ Name = 'UTF-16'; Encoding = 'Unicode'; FileName = 'utf16-control.txt' }
+        )
+        foreach ($control in $textEncodingControls) {
+            $stagedControlPath = Join-Path $stagedSafety $control.FileName
+            Set-Content -LiteralPath $stagedControlPath -Encoding $control.Encoding -Value 'ordinary safe text'
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', $control.FileName) | Out-Null
+            $stagedSafeControl = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+            Assert-True ($stagedSafeControl.ExitCode -eq 0) "staged safety accepts ordinary $($control.Name) text"
+            Set-Content -LiteralPath $stagedControlPath -Encoding $control.Encoding -Value $secretFixture
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', $control.FileName) | Out-Null
+            $stagedSecretControl = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+            Assert-True ($stagedSecretControl.ExitCode -eq 1) "staged safety preserves ordinary $($control.Name) secret detection"
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', $control.FileName) | Out-Null
+            Remove-Item -LiteralPath $stagedControlPath -Force
+
+            $workingControlPath = Join-Path $workingTreeSafety $control.FileName
+            Set-Content -LiteralPath $workingControlPath -Encoding $control.Encoding -Value 'ordinary safe text'
+            $workingSafeControl = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
+            Assert-True ($workingSafeControl.ExitCode -eq 0) "working-tree safety accepts ordinary $($control.Name) text"
+            Set-Content -LiteralPath $workingControlPath -Encoding $control.Encoding -Value $secretFixture
+            $workingSecretControl = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
+            Assert-True ($workingSecretControl.ExitCode -eq 1) "working-tree safety preserves ordinary $($control.Name) secret detection"
+            Remove-Item -LiteralPath $workingControlPath -Force
+        }
 
         $newDeniedPaths = @(
             'certificate.pem',

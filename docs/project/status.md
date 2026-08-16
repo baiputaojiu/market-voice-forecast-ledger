@@ -6,7 +6,7 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～19、whole-branch最終監査、Fix A～Eの監査修正をローカル実装・検証済みである。中核バックエンドはユーザー受け入れ待ちで、次subprojectは未承認である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドは隔離branchでTask 1～19、whole-branch最終監査、Fix A～Fの監査修正をローカル実装・検証済みである。中核バックエンドはユーザー受け入れ待ちで、次subprojectは未承認である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
@@ -17,9 +17,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix B: `55ccd07c680bbdaa0e532194305f776e04102f0f` (`fix: harden append-only audit boundaries`)
 - whole-branch Fix C: `772e19dc502a9c2f39a121519e78fabac0b3422a` (`test: finalize core backend verification`)
 - whole-branch Fix D: `a92bcaac9b592577d1a7f1efe7b1f70326853351` (`fix: preserve organization analysis input`)
-- whole-branch Fix E: この文書を含むcommit (`fix: verify staged public artifacts`)。SHAは本文へ固定せずGitから取得する。
-- upstream: なし。Fix A～Eではpush・merge・rebaseもlive remote検証も行っていない。
-- Fix E handoff: 上記のexact 6-path commit後にlocal branch/worktreeがcleanであることを確認して引き渡す。ignored reportはtracked差分へ含めない。
+- whole-branch Fix E: `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` (`fix: verify staged public artifacts`)
+- whole-branch Fix F: この文書を含むcommit (`fix: reject disguised binary public artifacts`)。SHAは本文へ固定せずGitから取得する。
+- upstream: なし。Fix A～Fではpush・merge・rebaseもlive remote検証も行っていない。
+- Fix F handoff: 上記のexact 6-path commit後にlocal branch/worktreeがcleanであることを確認して引き渡す。ignored reportはtracked差分へ含めない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
 - 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
@@ -84,6 +85,7 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix Cでno-upstream・detached HEADの作業状態script、Task 1/5の永続characterization、18 migrationのoffline wheel回帰、as-built文書を追加・修正した。
 - whole-branch Fix Dで、組織所有動画のHOLD・INTERVIEWER・manual SUBJECT segmentに対する個人話者修正をmutation前に拒否し、組織の公式segment集合を分析入力として保持した。
 - whole-branch Fix Eで、staged公開安全検査をNUL-safeなpath列挙と実index blobのbinary-safe読取へ変更し、lookup・read・decode失敗を内容非表示でfail-closedにした。公開方針と`.gitignore`の禁止sidecar・cache・editor/OS artifactもforce-stage時に拒否する。
+- whole-branch Fix Fで、明示的なbinary拡張子allowlist以外のdecoded fileがNULを含む場合、Staged・WorkingTree両modeで内容を表示せずfail-closedにした。許可済みbinaryと通常のUTF-8/UTF-16 textの境界は維持した。
 
 ## 作業中（In Progress）
 
@@ -132,7 +134,10 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Fix D commit `a92bcaac9b592577d1a7f1efe7b1f70326853351` の4-path scopeはcorrection serviceと3 integration testだけで、独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）だった。backendは908件中907 passed・既存capability skip 1件、影響suiteは320 passed、work-state Allは135 passed・0 failedだった。
 - Fix Eの非文書scopeは`check-public-safety.ps1`と`run-tests.ps1`の2-pathだけである。初回reviewのSQLite sidecar/cache parity findingとrereviewの`*.sqlite3-*` findingを各REDから順に修正し、最終独立read-only rereviewはAPPROVE（Critical 0、Important 0、Minor 0）だった。
 - Fix E最終treeのrepository一括検証はbackend 908件中907 passed・既存Windows symlink capability skip 1件、work-state All 181 passed・0 failed、working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。PowerShell 5.1/7.6のPublicSafetyは各46 passed・0 failed、Scriptsは80 passed・0 failedだった。
-- dev bootstrap後のoffline wheel回帰はFix E最終treeでもindexを無効化して成功し、wheel内の正確な18 migration名・適用順・ledger順、Task 2 audit列・trigger、raw UPDATE/DELETEの`APPEND_ONLY`を確認した。未bootstrap fresh machineへのoffline dependency導入は証明していない。
+- Fix FはFix E commit `cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` のclean treeから開始した。NUL含有textのStaged・WorkingTree各secret/safe fixtureはscanner変更前に60 passed・8 failedのREDとなり、最小の対称修正後はPowerShell 5.1/7.6のPublicSafetyが各68 passed・0 failedとなった。
+- Fix Fの非文書scopeは`check-public-safety.ps1`と`run-tests.ps1`の2-pathだけで、凍結treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）だった。Scriptsは102 passed・0 failed、work-state Allは203 passed・0 failedだった。
+- Fix F treeのrepository一括検証はbackend 908件中907 passed・既存Windows symlink capability skip 1件、work-state All 203 passed・0 failed、working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。
+- dev bootstrap後のoffline wheel回帰はFix F treeでもindexを無効化して成功し、wheel内の正確な18 migration名・適用順・ledger順、Task 2 audit列・trigger、raw UPDATE/DELETEの`APPEND_ONLY`を確認した。未bootstrap fresh machineへのoffline dependency導入は証明していない。
 
 ### ユーザー報告のスモールテスト結果
 

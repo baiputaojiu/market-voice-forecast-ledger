@@ -293,6 +293,7 @@ foreach ($relativePath in $relativeFiles) {
             continue
         }
         if ($content.IndexOf([char]0) -ge 0) {
+            $violations.Add("Unable to inspect staged file content: $normalized")
             continue
         }
         foreach ($pattern in $secretPatterns) {
@@ -325,6 +326,7 @@ foreach ($relativePath in $relativeFiles) {
         continue
     }
     if ($content.IndexOf([char]0) -ge 0) {
+        $violations.Add("Unable to inspect file content: $normalized")
         continue
     }
     foreach ($pattern in $secretPatterns) {
