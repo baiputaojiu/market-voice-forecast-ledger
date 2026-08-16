@@ -40,6 +40,10 @@ from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
 from market_voice_forecast_ledger.repositories.sources import SourceRepository
 from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
 from market_voice_forecast_ledger.services.channel_policy import ChannelPolicyService
+from market_voice_forecast_ledger.services.corrections import (
+    SpeakerCorrection,
+    SpeakerCorrectionService,
+)
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from market_voice_forecast_ledger.services.speaker_assignment import (
     SpeakerAssignmentService,
@@ -481,6 +485,84 @@ def test_organization_scope_requires_channel_organization_assignments(db):
     assert json.loads(
         AnalysisRepository(db).get_snapshot(run.id).metadata_json
     )["interviewer_market_context"] == []
+
+
+@pytest.mark.parametrize(
+    ("assignment_kind", "uses_organization_subject"),
+    (
+        pytest.param(AssignmentKind.HOLD, False, id="hold"),
+        pytest.param(AssignmentKind.INTERVIEWER, False, id="interviewer"),
+        pytest.param(AssignmentKind.SUBJECT, True, id="manual-subject"),
+    ),
+)
+def test_rejected_organization_correction_preserves_every_official_input_segment(
+    db, assignment_kind, uses_organization_subject
+):
+    subject_id = _create_subject(
+        db,
+        "Synthetic Organization Correction Boundary",
+        SubjectKind.ORGANIZATION,
+        channel_index=41,
+    )
+    video_id, segment_ids = _add_video_with_segments(
+        db,
+        subject_id=subject_id,
+        youtube_video_id="synthetic-organization-correction-boundary",
+        published_at=datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
+        texts=(
+            "Synthetic presenter organization statement.",
+            "Synthetic guest organization statement.",
+            "Synthetic interviewer organization statement.",
+        ),
+        channel_index=41,
+    )
+    organization_assignments = SpeakerAssignmentService(
+        db,
+        clock=lambda: FIXED_UTC,
+    )
+    assert organization_assignments.assign_organization_video(
+        subject_id,
+        video_id,
+    ) == segment_ids
+
+    with pytest.raises(DomainError) as error:
+        SpeakerCorrectionService(db).correct(
+            SpeakerCorrection(
+                segment_ids[1],
+                assignment_kind,
+                subject_id if uses_organization_subject else None,
+                "user",
+                "Synthetic prohibited organization correction",
+            )
+        )
+
+    assert error.value.code == "ORGANIZATION_SPEAKER_CORRECTION_FORBIDDEN"
+    assignments = SpeakerRepository(db).list_assignments(segment_ids)
+    assert tuple(row.segment_id for row in assignments) == segment_ids
+    assert {row.assignment_kind for row in assignments} == {
+        AssignmentKind.SUBJECT
+    }
+    assert {row.assignment_origin for row in assignments} == {
+        AssignmentOrigin.CHANNEL_ORGANIZATION
+    }
+
+    run = _begin(db, _create_job_for_input(db, subject_id))
+    assert tuple(
+        row.segment_id for row in AnalysisRepository(db).get_input_segments(run.id)
+    ) == segment_ids
+
+    assert organization_assignments.assign_organization_video(
+        subject_id,
+        video_id,
+    ) == segment_ids
+    reassigned = SpeakerRepository(db).list_assignments(segment_ids)
+    assert tuple(row.segment_id for row in reassigned) == segment_ids
+    assert {row.assignment_kind for row in reassigned} == {
+        AssignmentKind.SUBJECT
+    }
+    assert {row.assignment_origin for row in reassigned} == {
+        AssignmentOrigin.CHANNEL_ORGANIZATION
+    }
 
 
 def test_organization_scope_excludes_manual_subject_assignment(db):

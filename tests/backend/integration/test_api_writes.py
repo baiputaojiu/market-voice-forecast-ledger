@@ -13,6 +13,7 @@ from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.domain.enums import AssignmentKind
 from tests.backend.e2e.synthetic_fixture import (
+    SyntheticLedgerFixture,
     create_accepted_low_mapping_fixture,
     create_accepted_unknown_period_fixture,
     create_retained_forecast_fixture,
@@ -35,6 +36,46 @@ def client(settings: Settings):
         app = create_app(settings)
     with TestClient(app) as value:
         yield value
+
+
+def _organization_write_state(conn, segment_id, scope_id):
+    tables = (
+        ("current_result_sets", "scope_id"),
+        ("current_statements", "analysis_statement_id"),
+        ("current_asset_mappings", "analysis_mapping_id"),
+        ("current_forecasts", "analysis_forecast_id"),
+        ("heatmap_cells", "id"),
+        ("heatmap_cell_forecasts", "heatmap_cell_id, ordinal"),
+    )
+    return (
+        tuple(
+            conn.execute(
+                "SELECT * FROM speaker_assignments WHERE segment_id=?",
+                (segment_id,),
+            ).fetchone()
+        ),
+        conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0],
+        tuple(
+            conn.execute(
+                "SELECT generation, status, stale_reason "
+                "FROM analysis_scopes WHERE id=?",
+                (scope_id,),
+            ).fetchone()
+        ),
+        tuple(
+            (
+                table,
+                tuple(
+                    tuple(row)
+                    for row in conn.execute(
+                        f"SELECT * FROM {table} WHERE scope_id=? ORDER BY {order_by}",
+                        (scope_id,),
+                    )
+                ),
+            )
+            for table, order_by in tables
+        ),
+    )
 
 
 def test_mapping_review_uses_atomic_review_application_service(
@@ -259,6 +300,60 @@ def test_speaker_correction_calls_real_service_and_leaves_results_stale(
             (fixture.scope_id,),
         ).fetchone()
         assert tuple(scope) == ("stale", "SPEAKER_ASSIGNMENT_CHANGED")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("assignment_kind", "uses_organization_subject"),
+    (
+        pytest.param("hold", False, id="hold"),
+        pytest.param("interviewer", False, id="interviewer"),
+        pytest.param("subject", True, id="manual-subject"),
+    ),
+)
+def test_organization_speaker_correction_api_fails_closed_without_mutation(
+    client: TestClient,
+    settings: Settings,
+    assignment_kind: str,
+    uses_organization_subject: bool,
+):
+    with SyntheticLedgerFixture(settings.data_dir) as ledger:
+        flow = ledger.run_complete_flow()
+        organization_run = flow.run("organization_us")
+        segment_id = organization_run.sources[0].segment_id
+        subject_id = organization_run.prepared.subject_id
+        scope_id = organization_run.scope_id
+        private_body = organization_run.sources[0].body
+        before = _organization_write_state(
+            ledger.connection,
+            segment_id,
+            scope_id,
+        )
+        current_tables = dict(before[3])
+        assert current_tables["current_result_sets"]
+        assert current_tables["current_forecasts"]
+        assert current_tables["heatmap_cells"]
+
+    response = client.post(
+        f"/api/speakers/{segment_id}/corrections",
+        json={
+            "assignment_kind": assignment_kind,
+            "assigned_subject_id": (
+                subject_id if uses_organization_subject else None
+            ),
+            "reason": "Synthetic prohibited organization API correction",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": "ORGANIZATION_SPEAKER_CORRECTION_FORBIDDEN"
+    }
+    assert private_body not in response.text
+    conn = open_database(settings.database_path)
+    try:
+        assert _organization_write_state(conn, segment_id, scope_id) == before
     finally:
         conn.close()
 

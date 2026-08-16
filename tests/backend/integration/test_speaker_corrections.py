@@ -1,6 +1,6 @@
 import json
 import re
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 
 import pytest
@@ -28,11 +28,17 @@ from market_voice_forecast_ledger.services.corrections import (
     SpeakerCorrectionService,
 )
 from market_voice_forecast_ledger.services.current_results import CurrentResultService
+from market_voice_forecast_ledger.services.speaker_assignment import (
+    SpeakerAssignmentService,
+)
 from tests.backend.e2e.synthetic_fixture import (
+    SyntheticLedgerFixture,
     create_speaker_correction_fixture,
 )
 from tests.backend.integration.test_analysis_input_boundaries import (
+    _add_video_with_segments,
     _begin,
+    _create_subject,
     _prepare_personal_analysis,
 )
 
@@ -79,6 +85,41 @@ def _assignment_row(db, segment_id):
         db.execute(
             "SELECT * FROM speaker_assignments WHERE segment_id=?", (segment_id,)
         ).fetchone()
+    )
+
+
+def _organization_correction_state(db, segment_id, scope_id):
+    tables = (
+        ("current_result_sets", "scope_id"),
+        ("current_statements", "analysis_statement_id"),
+        ("current_asset_mappings", "analysis_mapping_id"),
+        ("current_forecasts", "analysis_forecast_id"),
+        ("heatmap_cells", "id"),
+        ("heatmap_cell_forecasts", "heatmap_cell_id, ordinal"),
+    )
+    return (
+        _assignment_row(db, segment_id),
+        db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0],
+        tuple(
+            db.execute(
+                "SELECT generation, status, stale_reason "
+                "FROM analysis_scopes WHERE id=?",
+                (scope_id,),
+            ).fetchone()
+        ),
+        tuple(
+            (
+                table,
+                tuple(
+                    tuple(row)
+                    for row in db.execute(
+                        f"SELECT * FROM {table} WHERE scope_id=? ORDER BY {order_by}",
+                        (scope_id,),
+                    )
+                ),
+            )
+            for table, order_by in tables
+        ),
     )
 
 
@@ -203,6 +244,103 @@ def test_speaker_subject_to_hold_is_audited_stale_and_non_destructive(db):
         "local_path",
     ):
         assert forbidden not in serialized
+
+
+@pytest.mark.parametrize(
+    ("assignment_kind", "uses_organization_subject"),
+    (
+        pytest.param(AssignmentKind.HOLD, False, id="hold"),
+        pytest.param(AssignmentKind.INTERVIEWER, False, id="interviewer"),
+        pytest.param(AssignmentKind.SUBJECT, True, id="manual-subject"),
+    ),
+)
+def test_organization_analysis_segment_correction_is_rejected_without_mutation(
+    tmp_path, assignment_kind, uses_organization_subject
+):
+    with SyntheticLedgerFixture(tmp_path / "runtime") as ledger:
+        flow = ledger.run_complete_flow()
+        organization_run = flow.run("organization_us")
+        segment_id = organization_run.sources[0].segment_id
+        subject_id = organization_run.prepared.subject_id
+        scope_id = organization_run.scope_id
+        assigned_subject_id = subject_id if uses_organization_subject else None
+        before = _organization_correction_state(
+            ledger.connection,
+            segment_id,
+            scope_id,
+        )
+        current_tables = dict(before[3])
+        assert current_tables["current_result_sets"]
+        assert current_tables["current_forecasts"]
+        assert current_tables["heatmap_cells"]
+
+        with pytest.raises(DomainError) as error:
+            SpeakerCorrectionService(ledger.connection).correct(
+                SpeakerCorrection(
+                    segment_id,
+                    assignment_kind,
+                    assigned_subject_id,
+                    "user",
+                    "Synthetic prohibited organization correction",
+                )
+            )
+
+        assert error.value.code == "ORGANIZATION_SPEAKER_CORRECTION_FORBIDDEN"
+        assert error.value.message == (
+            "organization analysis input cannot be manually corrected"
+        )
+        assert organization_run.sources[0].body not in str(error.value)
+        assert _organization_correction_state(
+            ledger.connection,
+            segment_id,
+            scope_id,
+        ) == before
+
+
+def test_organization_correction_guard_uses_video_ownership_not_assignment_origin(db):
+    subject_id = _create_subject(
+        db,
+        "Synthetic Organization Ownership Guard",
+        SubjectKind.ORGANIZATION,
+        channel_index=42,
+    )
+    video_id, segment_ids = _add_video_with_segments(
+        db,
+        subject_id=subject_id,
+        youtube_video_id="synthetic-organization-malformed-assignment",
+        published_at=datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
+        texts=("Synthetic organization assignment requiring recomputation.",),
+        channel_index=42,
+    )
+    SpeakerAssignmentService(
+        db,
+        clock=lambda: FIXED_UTC,
+    ).assign_organization_video(subject_id, video_id)
+    speakers = SpeakerRepository(db)
+    speakers.save_assignment(
+        replace(
+            speakers.get_assignment(segment_ids[0]),
+            assignment_kind=AssignmentKind.HOLD,
+            assigned_subject_id=None,
+            assignment_origin=AssignmentOrigin.MANUAL,
+            evidence_hash="synthetic-malformed-organization-assignment",
+        )
+    )
+    before = _assignment_row(db, segment_ids[0])
+
+    with pytest.raises(DomainError) as error:
+        SpeakerCorrectionService(db).correct(
+            SpeakerCorrection(
+                segment_ids[0],
+                AssignmentKind.INTERVIEWER,
+                None,
+                "user",
+                "Synthetic organization ownership guard",
+            )
+        )
+
+    assert error.value.code == "ORGANIZATION_SPEAKER_CORRECTION_FORBIDDEN"
+    assert _assignment_row(db, segment_ids[0]) == before
 
 
 def test_private_transcript_reason_rolls_back_speaker_assignment_stale_and_audit(db):

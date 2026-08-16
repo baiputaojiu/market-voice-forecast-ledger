@@ -17,6 +17,7 @@ from market_voice_forecast_ledger.domain.enums import (
     EligibilityStatus,
     JobStatus,
     PolicyKind,
+    SubjectKind,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.speakers import SpeakerAssignment
@@ -91,6 +92,11 @@ class SpeakerCorrectionService:
                     "SPEAKER_CORRECTION_SEGMENT_NOT_FOUND",
                     "speaker correction requires an existing transcript segment",
                 ) from cause
+            if self._video_has_current_eligible_organization(video_id):
+                raise DomainError(
+                    "ORGANIZATION_SPEAKER_CORRECTION_FORBIDDEN",
+                    "organization analysis input cannot be manually corrected",
+                )
             try:
                 before = self._speakers.get_assignment(command.segment_id)
             except LookupError as cause:
@@ -174,6 +180,38 @@ class SpeakerCorrectionService:
                 affected_scope_ids, "SPEAKER_ASSIGNMENT_CHANGED"
             )
         return after
+
+    def _video_has_current_eligible_organization(self, video_id: int) -> bool:
+        return self._conn.execute(
+            """
+            SELECT 1
+            FROM subject_video_eligibility AS eligibility
+            JOIN analysis_subjects AS subject
+                ON subject.id=eligibility.subject_id
+            JOIN subject_channel_policies AS policy
+                ON policy.id=eligibility.policy_id
+                AND policy.subject_id=eligibility.subject_id
+                AND policy.policy_hash=eligibility.policy_hash
+            JOIN videos AS video
+                ON video.id=eligibility.video_id
+            WHERE eligibility.video_id=?
+                AND eligibility.status=?
+                AND subject.subject_kind=?
+                AND subject.is_active=1
+                AND policy.policy_kind=?
+                AND policy.configuration_status=?
+                AND policy.youtube_channel_id IS NOT NULL
+                AND video.youtube_channel_id=policy.youtube_channel_id
+            LIMIT 1
+            """,
+            (
+                video_id,
+                EligibilityStatus.ELIGIBLE.value,
+                SubjectKind.ORGANIZATION.value,
+                PolicyKind.FIXED_CHANNEL.value,
+                ConfigurationStatus.CONFIGURED.value,
+            ),
+        ).fetchone() is not None
 
     @staticmethod
     def _validate_command(command: SpeakerCorrection) -> None:
