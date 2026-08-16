@@ -1,6 +1,6 @@
 # 相場見通し発言台帳
 
-YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19とwhole-branch監査修正はローカルで実装・検証済みで、現在はユーザー受け入れ待ちです。実YouTube・音声・Codex adapterとUIを含む完成版ではなく、投資判断には利用できません。
+YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドの番号付きTask 1～19とwhole-branch監査Fix A～Eはローカルで実装・検証済みで、現在はユーザー受け入れ待ちです。実YouTube・音声・Codex adapterとUIを含む完成版ではなく、投資判断には利用できません。
 
 ## 現在の状態
 
@@ -9,6 +9,13 @@ YouTube上の対象者の発言を収集し、発言だけを根拠に日経平�
 - [重要な決定と理由](docs/project/decisions.md)
 - [現在の計画](docs/project/plan.md)
 - [公開データ方針](docs/project/public-data-policy.md)
+
+Fix D commit `a92bcaac9b592577d1a7f1efe7b1f70326853351` は組織主体の
+分析入力を個人話者修正から保護し、Fix Eのこの文書を含むcommit
+(`fix: verify staged public artifacts`) は公開安全検査をworking treeではなく
+実際のindex blobへ固定しました。最新ローカル検証はbackend 908件中
+907 passed・既存capability skip 1件、work-state 181 passed・0 failedです。
+branchにupstreamはなく、Fix D/Eでpush・merge・rebaseは行っていません。
 
 ## 別PCで再開する
 
@@ -54,6 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-backend.ps1
 - 予想分析は、保存された対象者の発言だけを根拠にします。Web検索、現在相場、Codexの一般知識では補強しません。
 - 実際の全文文字起こし、音声、埋め込み、SQLiteデータベース、runtime log、cache、資格情報はリポジトリ外に置き、commitしません。
 - 分析結果は投資助言ではありません。
+- 実YouTube・音声・Codex adapter、実HTTP server/socket、UI、電源断・disk failure、hostileな同時junction差し替え、未bootstrap fresh machineへのoffline導入、remote公開、完成製品の受け入れは未検証です。
 
 ## ローカルAPIのセキュリティ境界
 

@@ -21,13 +21,16 @@ $forbiddenDirectories = @(
     'data', 'storage', 'runtime', 'transcripts', 'audio', 'video',
     'speaker-embeddings', 'analysis-snapshots', 'models', 'logs',
     'tmp', 'temp', 'node_modules', '.venv', 'venv', '__pycache__',
-    'dist', 'build', 'coverage'
+    '.pytest_cache', '.mypy_cache', '.ruff_cache', '.idea', '.vscode',
+    '.worktrees', 'dist', 'build', 'coverage'
 )
 $forbiddenExtensions = @(
     '.db', '.sqlite', '.sqlite3', '.wav', '.mp3', '.m4a', '.aac',
     '.flac', '.ogg', '.mp4', '.mkv', '.webm', '.mov', '.safetensors',
-    '.onnx', '.pt', '.pth', '.pfx', '.p12', '.key'
+    '.onnx', '.pt', '.pth', '.pfx', '.p12', '.key', '.pem', '.pyc',
+    '.pyo', '.pyd', '.log', '.tmp', '.bak', '.part', '.user', '.suo'
 )
+$forbiddenFileNames = @('.DS_Store', 'Thumbs.db', 'desktop.ini')
 $binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.woff', '.woff2')
 $secretPatterns = @(
     '-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',
@@ -47,6 +50,149 @@ function Test-GitRepository {
     $exitCode -eq 0
 }
 
+function Invoke-GitBytes {
+    param([Parameter(Mandatory)][string]$ArgumentLine)
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = 'git'
+    $startInfo.Arguments = $ArgumentLine
+    $startInfo.WorkingDirectory = $scanRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $memory = New-Object System.IO.MemoryStream
+    try {
+        if (-not $process.Start()) {
+            throw 'Unable to start Git.'
+        }
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardOutput.BaseStream.CopyTo($memory)
+        $process.WaitForExit()
+        $null = $stderrTask.Result
+        return [PSCustomObject]@{
+            ExitCode = $process.ExitCode
+            Bytes = $memory.ToArray()
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            ExitCode = -1
+            Bytes = [byte[]]@()
+        }
+    }
+    finally {
+        $memory.Dispose()
+        $process.Dispose()
+    }
+}
+
+function ConvertFrom-StrictGitUtf8 {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $utf8.GetString($Bytes)
+}
+
+function ConvertFrom-NulTerminatedList {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    if ($Value.Length -eq 0) {
+        return @()
+    }
+    if ($Value[$Value.Length - 1] -ne [char]0) {
+        throw 'Git output was not NUL terminated.'
+    }
+    @($Value.Substring(0, $Value.Length - 1).Split([char[]]@([char]0)))
+}
+
+function Get-StagedIndexEntries {
+    $result = Invoke-GitBytes -ArgumentLine '-c core.quotePath=false ls-files --stage -z'
+    if ($result.ExitCode -ne 0) {
+        Write-Host 'Unable to inspect staged index.'
+        exit 2
+    }
+
+    try {
+        $records = ConvertFrom-NulTerminatedList (ConvertFrom-StrictGitUtf8 $result.Bytes)
+    }
+    catch {
+        Write-Host 'Unable to inspect staged index.'
+        exit 2
+    }
+
+    $entries = @{}
+    foreach ($record in $records) {
+        $match = [regex]::Match(
+            $record,
+            '\A(?<mode>[0-9]{6}) (?<oid>[0-9a-fA-F]{40,64}) (?<stage>[0-3])\t(?<path>[\s\S]*)\z'
+        )
+        if (-not $match.Success) {
+            Write-Host 'Unable to inspect staged index.'
+            exit 2
+        }
+        if ($match.Groups['stage'].Value -ne '0') {
+            continue
+        }
+        $entryPath = $match.Groups['path'].Value
+        if ($entries.ContainsKey($entryPath)) {
+            Write-Host 'Unable to inspect staged index.'
+            exit 2
+        }
+        $entries[$entryPath] = [PSCustomObject]@{
+            Mode = $match.Groups['mode'].Value
+            ObjectId = $match.Groups['oid'].Value.ToLowerInvariant()
+        }
+    }
+    $entries
+}
+
+function Read-StagedBlob {
+    param([Parameter(Mandatory)][string]$ObjectId)
+
+    if ($ObjectId -notmatch '\A[0-9a-f]{40,64}\z') {
+        return $null
+    }
+    $result = Invoke-GitBytes -ArgumentLine "cat-file blob $ObjectId"
+    if ($result.ExitCode -ne 0) {
+        return $null
+    }
+    ,$result.Bytes
+}
+
+function ConvertFrom-FileBytes {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $offset = 0
+    if ($Bytes.Length -ge 4 -and $Bytes[0] -eq 0x00 -and $Bytes[1] -eq 0x00 -and $Bytes[2] -eq 0xFE -and $Bytes[3] -eq 0xFF) {
+        $encoding = [System.Text.UTF32Encoding]::new($true, $false, $true)
+        $offset = 4
+    }
+    elseif ($Bytes.Length -ge 4 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE -and $Bytes[2] -eq 0x00 -and $Bytes[3] -eq 0x00) {
+        $encoding = [System.Text.UTF32Encoding]::new($false, $false, $true)
+        $offset = 4
+    }
+    elseif ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        $encoding = [System.Text.UTF8Encoding]::new($false, $true)
+        $offset = 3
+    }
+    elseif ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
+        $encoding = [System.Text.UnicodeEncoding]::new($true, $false, $true)
+        $offset = 2
+    }
+    elseif ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+        $encoding = [System.Text.UnicodeEncoding]::new($false, $false, $true)
+        $offset = 2
+    }
+    else {
+        $encoding = [System.Text.UTF8Encoding]::new($false, $true)
+    }
+    $encoding.GetString($Bytes, $offset, $Bytes.Length - $offset)
+}
+
 function Get-RelativeFiles {
     $isGit = Test-GitRepository
     if ($Mode -eq 'Staged') {
@@ -54,12 +200,18 @@ function Get-RelativeFiles {
             Write-Error 'Staged mode requires a Git repository.'
             exit 2
         }
-        $output = & git -C $scanRoot diff --cached --name-only --diff-filter=ACMR 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error 'Unable to list staged files.'
+        $result = Invoke-GitBytes -ArgumentLine '-c core.quotePath=false diff --cached --name-only --diff-filter=ACMR -z'
+        if ($result.ExitCode -ne 0) {
+            Write-Host 'Unable to list staged files.'
             exit 2
         }
-        return @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        try {
+            return @(ConvertFrom-NulTerminatedList (ConvertFrom-StrictGitUtf8 $result.Bytes))
+        }
+        catch {
+            Write-Host 'Unable to list staged files.'
+            exit 2
+        }
     }
 
     if ($isGit) {
@@ -91,6 +243,7 @@ function Get-RelativeFiles {
 }
 
 $relativeFiles = @(Get-RelativeFiles)
+$stagedIndexEntries = if ($Mode -eq 'Staged') { Get-StagedIndexEntries } else { $null }
 foreach ($relativePath in $relativeFiles) {
     $normalized = $relativePath -replace '\\', '/'
     $segments = @($normalized -split '/')
@@ -103,10 +256,52 @@ foreach ($relativePath in $relativeFiles) {
 
     $fileName = Split-Path -Leaf $normalized
     $extension = [System.IO.Path]::GetExtension($fileName).ToLowerInvariant()
-    if ($forbiddenExtensions -contains $extension -or $fileName -eq '.env' -or $fileName.StartsWith('.env.')) {
+    $isCoverageFile = $fileName -eq '.coverage' -or $fileName -like '.coverage.*'
+    $isDatabaseSidecar = $fileName -like '*.db-*' -or
+        $fileName -like '*.sqlite-*' -or $fileName -like '*.sqlite3-*'
+    if ($forbiddenExtensions -contains $extension -or
+        $forbiddenFileNames -contains $fileName -or
+        $isCoverageFile -or $isDatabaseSidecar -or
+        $fileName -eq '.env' -or $fileName -like '.env.*') {
         if ($fileName -ne '.env.example') {
             $violations.Add("Forbidden file type: $normalized")
         }
+    }
+
+    if ($Mode -eq 'Staged') {
+        if (-not $stagedIndexEntries.ContainsKey($relativePath)) {
+            $violations.Add("Unable to inspect staged file content: $normalized")
+            continue
+        }
+        $bytes = Read-StagedBlob -ObjectId $stagedIndexEntries[$relativePath].ObjectId
+        if ($null -eq $bytes) {
+            $violations.Add("Unable to inspect staged file content: $normalized")
+            continue
+        }
+        if ($bytes.LongLength -gt $MaxFileBytes) {
+            $violations.Add("File exceeds $MaxFileBytes bytes: $normalized ($($bytes.LongLength) bytes)")
+            continue
+        }
+        if ($binaryExtensions -contains $extension) {
+            continue
+        }
+        try {
+            $content = ConvertFrom-FileBytes $bytes
+        }
+        catch {
+            $violations.Add("Unable to inspect staged file content: $normalized")
+            continue
+        }
+        if ($content.IndexOf([char]0) -ge 0) {
+            continue
+        }
+        foreach ($pattern in $secretPatterns) {
+            if ($content -match $pattern) {
+                $violations.Add("Possible secret detected: $normalized")
+                break
+            }
+        }
+        continue
     }
 
     $fullPath = Join-Path $scanRoot ($relativePath -replace '/', [System.IO.Path]::DirectorySeparatorChar)

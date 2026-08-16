@@ -2496,6 +2496,15 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   18 migrationのoffline wheel回帰、no-upstream・detached HEADの作業状態script、
   as-built文書を追加・修正した。characterization testは既存挙動を記録するため
   immediate GREENであり、REDを捏造していない。
+- Fix D commit `a92bcaac9b592577d1a7f1efe7b1f70326853351`
+  (`fix: preserve organization analysis input`) は組織所有動画のHOLD、
+  INTERVIEWER、manual SUBJECT segmentに対する個人話者修正をmutation前に
+  拒否し、組織の公式segment集合を分析入力として保持した。
+- Fix Eのこの文書を含むcommit (`fix: verify staged public artifacts`) はstaged
+  公開安全検査をworking tree pathではなく実際のindex blobへ固定した。
+  NUL-safeなpath列挙、binary-safeなblob読取、内容を表示しないfail-closed、
+  `.gitignore`と公開方針の禁止artifact parityを追加し、WorkingTree modeの
+  content読取境界は維持した。
 
 ### As-built migration manifest
 
@@ -2545,6 +2554,12 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
 - Fix Cのtracked scopeはbriefどおり `pyproject.toml`、foundation/speaker test、
   2つのwork-state helper、work-state test、README、project status/plan、このplanの
   10ファイルで、追加のpath deviationはない。
+- Fix Dのtracked scopeはcorrection serviceと3 integration testの4ファイルだけで、
+  commitは `a92bcaac9b592577d1a7f1efe7b1f70326853351` である。
+- Fix Eの非文書scopeは `scripts/work-state/check-public-safety.ps1` と
+  `tests/work-state/run-tests.ps1` の2ファイルだけである。非文書APPROVEと
+  post-review gate後にREADME、project status/plan、このas-built planだけを
+  文書scopeへ追加した。その他のtracked path deviationはない。
 
 完全なtask別rulingとreview roundは、Git-ignoredの
 `.superpowers/sdd/2026-08-14-core-data-model/progress.md` と各reportに残す。
@@ -2562,9 +2577,26 @@ Task 1～19のcheckboxと初期の15 migration表記は、承認時点のhistori
   fresh machineでbootstrap dependencyまでoffline導入できることは検証していない。
 - Fix A・BとFix Cの凍結非文書treeは独立read-only rereviewでCritical 0、
   Important 0、Minor 0となった。
-- 実YouTube検索・音声・全文文字起こし、実Codex/model/tool call、実HTTP
-  server/socket、React UI、電源断・disk failure、live remote、push・merge・rebaseは
-  この最終検証で実行していない。process crashは合成temporary DBとtest-only childで
-  検証した範囲だけを主張する。
+- Fix Dの凍結4-path treeは独立read-only reviewでAPPROVE（Critical 0、
+  Important 0、Minor 0）となった。backendは908件中907 passed、既存Windows
+  symlink capability skip 1件、影響suite 320 passed、work-state 135 passed・
+  0 failedだった。
+- Fix Eの初回reviewでSQLite sidecar/cache parity、次のrereviewで
+  `*.sqlite3-*` sidecarのImportant findingを受け、各findingを個別のREDから
+  順に修正した。最終凍結2-path treeの独立read-only rereviewはAPPROVE
+  （Critical 0、Important 0、Minor 0）となった。
+- Fix E最終treeのrepository一括検証はbackend 908件中907 passed、既存capability
+  skip 1件、work-state All 181 passed・0 failed、working-tree公開安全166ファイル、
+  compileall、`git diff --check`が成功した。PowerShell 5.1/7.6のPublicSafetyは
+  各46 passed・0 failed、Scriptsは80 passed・0 failedだった。
+- dev bootstrap後のoffline wheel証明はFix E最終treeでもindexを無効にして成功し、
+  正確な18 migration archive名・適用順・ledger順、Task 2 audit列・trigger、
+  raw UPDATE/DELETEの `APPEND_ONLY` を確認した。未bootstrap fresh machineでの
+  offline dependency installationは証明していない。
+- 実YouTube検索・音声・全文文字起こし、実Codex/model/tool call・adapter、実HTTP
+  server/socket、React UI、電源断・disk failure、hostileな同時junction差し替え、
+  remote publication、push・merge・rebase、完成製品の受け入れはこの最終検証で
+  実行していない。process crashは合成temporary DBとtest-only childで検証した
+  範囲だけを主張する。
 - M2中核バックエンドはローカル実装・検証済みだが、ユーザー受け入れ前である。
   次subprojectとアプリ全体の完成は別の明示承認を必要とする。

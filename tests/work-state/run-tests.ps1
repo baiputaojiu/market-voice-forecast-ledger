@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'Docs', 'Scripts', 'Integration', 'SaveSkill', 'ResumeSkill')]
+    [ValidateSet('All', 'Docs', 'Scripts', 'PublicSafety', 'Integration', 'SaveSkill', 'ResumeSkill')]
     [string]$Suite = 'All'
 )
 
@@ -331,6 +331,165 @@ function Test-Scripts {
     }
 }
 
+function Test-PublicSafety {
+    $safetyScript = Join-Path $ProjectRoot 'scripts/work-state/check-public-safety.ps1'
+    if (-not (Test-Path -LiteralPath $safetyScript -PathType Leaf)) {
+        Assert-True $false 'PublicSafety prerequisite Safety script exists'
+        return
+    }
+
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mvfl-work-state-tests-" + [guid]::NewGuid().ToString('N'))
+    $stagedSafety = Join-Path $testRoot 'staged-safety'
+    $secretFixture = 'api' + '_key = "real-looking-secret-value-1234567890"'
+
+    try {
+        New-Item -ItemType Directory -Path $stagedSafety -Force | Out-Null
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('init') | Out-Null
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('config', 'user.name', 'Work State Tests') | Out-Null
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('config', 'user.email', 'work-state-tests@example.invalid') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'README.md') -Encoding ASCII -Value '# Staged safety fixture'
+        Set-Content -LiteralPath (Join-Path $stagedSafety '.gitignore') -Encoding ASCII -Value @(
+            '*.pem', '*.pyc', '*.pyo', '*.pyd', '.coverage', '.coverage.*',
+            '*.log', '*.tmp', '*.bak', '*.part', '.mypy_cache/', '.ruff_cache/'
+        )
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'deleted-secret.txt') -Encoding ASCII -Value $secretFixture
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', 'README.md', '.gitignore', 'deleted-secret.txt') | Out-Null
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('commit', '-m', 'staged safety baseline') | Out-Null
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'index-secret.txt') -Encoding ASCII -Value $secretFixture
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', 'index-secret.txt') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'index-secret.txt') -Encoding ASCII -Value 'safe working copy'
+        $stagedSecret = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($stagedSecret.ExitCode -eq 1) 'staged safety reads secret content from the index instead of the working tree'
+        Assert-True ($stagedSecret.Output -notmatch [regex]::Escape($secretFixture)) 'staged secret failure does not print secret content'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'index-secret.txt') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety 'index-secret.txt') -Force
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'deleted-working-copy.pem') -Encoding ASCII -Value 'synthetic certificate body'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '-f', '--', 'deleted-working-copy.pem') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety 'deleted-working-copy.pem') -Force
+        $missingWorkingFile = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($missingWorkingFile.ExitCode -eq 1) 'staged safety rejects a forbidden staged file missing from the working tree'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'deleted-working-copy.pem') | Out-Null
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'safe-index.txt') -Encoding ASCII -Value 'safe staged content'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', 'safe-index.txt') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'safe-index.txt') -Encoding ASCII -Value $secretFixture
+        $workingSecret = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($workingSecret.ExitCode -eq 0) 'staged safety ignores unsafe content present only in the working tree'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'safe-index.txt') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety 'safe-index.txt') -Force
+
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('rm', '--', 'deleted-secret.txt') | Out-Null
+        $stagedDeletion = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($stagedDeletion.ExitCode -eq 0) 'staged safety does not inspect a staged deletion as committed content'
+        Assert-True ($stagedDeletion.Output -notmatch [regex]::Escape($secretFixture)) 'staged deletion does not print deleted content'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'deleted-secret.txt') | Out-Null
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--', 'deleted-secret.txt') | Out-Null
+
+        $unicodeRelativePath = 'space directory/non-ASCII-日本語.txt'
+        New-Item -ItemType Directory -Path (Join-Path $stagedSafety 'space directory') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety $unicodeRelativePath) -Encoding UTF8 -Value $secretFixture
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', $unicodeRelativePath) | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety $unicodeRelativePath) -Encoding UTF8 -Value 'safe working copy'
+        $unicodeStagedSecret = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($unicodeStagedSecret.ExitCode -eq 1) 'staged safety reads an index path containing spaces and non-ASCII characters'
+        Assert-True ($unicodeStagedSecret.Output -match [regex]::Escape("VIOLATION: Possible secret detected: $unicodeRelativePath")) 'staged safety reports the decoded non-ASCII index path safely'
+        Assert-True ($unicodeStagedSecret.Output -notmatch 'MethodInvocationException|Illegal characters in path|FullyQualifiedErrorId|NativeCommandError|fatal:') 'staged non-ASCII path failure suppresses raw tool errors'
+        Assert-True ($unicodeStagedSecret.Output -notmatch [regex]::Escape($secretFixture)) 'staged non-ASCII path failure does not print secret content'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', $unicodeRelativePath) | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety $unicodeRelativePath) -Force
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'utf16-index.txt') -Encoding Unicode -Value $secretFixture
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'utf16-index.txt') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'utf16-index.txt') -Encoding Unicode -Value 'safe working copy'
+        $utf16StagedSecret = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($utf16StagedSecret.ExitCode -eq 1) 'staged safety decodes BOM-marked index text before checking for secrets'
+        Assert-True ($utf16StagedSecret.Output -notmatch [regex]::Escape($secretFixture)) 'staged UTF-16 secret failure does not print secret content'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'utf16-index.txt') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety 'utf16-index.txt') -Force
+
+        $newDeniedPaths = @(
+            'certificate.pem',
+            'artifact.pyc',
+            'artifact.pyo',
+            'artifact.pyd',
+            '.coverage',
+            '.coverage.synthetic',
+            'run.log',
+            'scratch.tmp',
+            'backup.bak',
+            'download.part',
+            '.mypy_cache/cache.txt',
+            '.ruff_cache/cache.txt',
+            'ledger.db-wal',
+            'ledger.sqlite-journal',
+            'ledger.sqlite3-wal',
+            '.pytest_cache/cache.txt',
+            '.idea/workspace.xml',
+            '.vscode/settings.json',
+            'editor.user',
+            'solution.suo',
+            '.DS_Store',
+            'Thumbs.db',
+            'desktop.ini',
+            '.worktrees/private.txt'
+        )
+        foreach ($deniedPath in $newDeniedPaths) {
+            $absoluteDeniedPath = Join-Path $stagedSafety ($deniedPath -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+            New-Item -ItemType Directory -Path (Split-Path -Parent $absoluteDeniedPath) -Force | Out-Null
+            Set-Content -LiteralPath $absoluteDeniedPath -Encoding ASCII -Value 'content independent denylist fixture'
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '-f', '--', $deniedPath) | Out-Null
+            $deniedResult = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+            Assert-True ($deniedResult.ExitCode -eq 1) "staged safety rejects force-staged denied path $deniedPath"
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', $deniedPath) | Out-Null
+            Remove-Item -LiteralPath $absoluteDeniedPath -Force
+        }
+
+        $invalidUtf8Path = Join-Path $stagedSafety 'invalid-utf8.txt'
+        [System.IO.File]::WriteAllBytes($invalidUtf8Path, [byte[]](0xC3, 0x28))
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'invalid-utf8.txt') | Out-Null
+        Set-Content -LiteralPath $invalidUtf8Path -Encoding ASCII -Value 'safe working copy'
+        $invalidUtf8 = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($invalidUtf8.ExitCode -eq 1) 'staged safety fails closed when index text cannot be decoded'
+        Assert-True ($invalidUtf8.Output -match [regex]::Escape('VIOLATION: Unable to inspect staged file content: invalid-utf8.txt')) 'staged decode failure uses a stable safe message'
+        Assert-True ($invalidUtf8.Output -notmatch 'DecoderFallbackException|MethodInvocationException|FullyQualifiedErrorId|NativeCommandError|fatal:') 'staged decode failure suppresses raw tool errors'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'invalid-utf8.txt') | Out-Null
+        Remove-Item -LiteralPath $invalidUtf8Path -Force
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'staged-large.txt') -Encoding ASCII -Value ('x' * 256)
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'staged-large.txt') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'staged-large.txt') -Encoding ASCII -Value 'small working copy'
+        $stagedLarge = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged', '-MaxFileBytes', '100')
+        Assert-True ($stagedLarge.ExitCode -eq 1 -and $stagedLarge.Output -match 'File exceeds 100 bytes: staged-large\.txt') 'staged safety applies the size limit to index bytes'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'staged-large.txt') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety 'staged-large.txt') -Force
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'working-large.txt') -Encoding ASCII -Value 'small staged content'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'working-large.txt') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'working-large.txt') -Encoding ASCII -Value ('x' * 256)
+        $workingLarge = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged', '-MaxFileBytes', '100')
+        Assert-True ($workingLarge.ExitCode -eq 0) 'staged safety ignores an oversized working copy when index content is small'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'working-large.txt') | Out-Null
+        Remove-Item -LiteralPath (Join-Path $stagedSafety 'working-large.txt') -Force
+
+        Set-Content -LiteralPath (Join-Path $stagedSafety 'missing-index-object.txt') -Encoding ASCII -Value 'unique staged object for fail-closed lookup'
+        Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '--', 'missing-index-object.txt') | Out-Null
+        $missingObjectId = Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('rev-parse', ':missing-index-object.txt')
+        $missingObjectPath = Join-Path $stagedSafety ".git/objects/$($missingObjectId.Substring(0, 2))/$($missingObjectId.Substring(2))"
+        Assert-True (Test-Path -LiteralPath $missingObjectPath -PathType Leaf) 'staged lookup failure fixture owns a loose index object'
+        Remove-Item -LiteralPath $missingObjectPath -Force
+        $missingObject = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+        Assert-True ($missingObject.ExitCode -eq 1) 'staged safety fails closed when an index blob cannot be read'
+        Assert-True ($missingObject.Output -match [regex]::Escape('VIOLATION: Unable to inspect staged file content: missing-index-object.txt')) 'staged blob lookup failure uses a stable safe message'
+        Assert-True ($missingObject.Output -notmatch [regex]::Escape($missingObjectId)) 'staged blob lookup failure does not print the object ID'
+        Assert-True ($missingObject.Output -notmatch 'NativeCommandError|fatal:|could not read') 'staged blob lookup failure suppresses raw Git errors'
+    }
+    finally {
+        Remove-TestRoot -Path $testRoot
+    }
+}
+
 function Test-Integration {
     $scriptPaths = @{
         Inspect = Join-Path $ProjectRoot 'scripts/work-state/inspect-git-state.ps1'
@@ -531,6 +690,9 @@ if ($Suite -in @('All', 'Docs')) {
 }
 if ($Suite -in @('All', 'Scripts')) {
     Test-Scripts
+}
+if ($Suite -in @('All', 'Scripts', 'PublicSafety')) {
+    Test-PublicSafety
 }
 if ($Suite -in @('All', 'Integration')) {
     Test-Integration
