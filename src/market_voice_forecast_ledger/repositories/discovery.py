@@ -44,6 +44,7 @@ _CANONICAL_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _YOUTUBE_UPLOADS_PLAYLIST_ID = re.compile(r"^UU[A-Za-z0-9_-]{22}$")
 _YOUTUBE_PAGE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
+_YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YOUTUBE_ENDPOINT_CLASSES = frozenset({
     "search_list",
     "channels_list",
@@ -618,6 +619,8 @@ class DiscoveryRepository:
                 upper_bound=upper_bound,
                 uploads_playlist_id=None,
                 next_page_token=None,
+                encountered_video_ids=(),
+                unavailable_video_ids=(),
                 page_count=0,
                 batch_ordinal=0,
                 completed_at=None,
@@ -626,8 +629,10 @@ class DiscoveryRepository:
                 "INSERT INTO youtube_sync_checkpoints("
                 "job_id, unit_key, source_kind, source_key, "
                 "effective_lower_bound, upper_bound, uploads_playlist_id, "
-                "next_page_token, page_count, batch_ordinal, completed_at, "
-                "checkpoint_hash) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, NULL, ?)",
+                "next_page_token, encountered_video_ids_json, "
+                "unavailable_video_ids_json, page_count, batch_ordinal, "
+                "completed_at, checkpoint_hash) VALUES "
+                "(?, ?, ?, ?, ?, ?, NULL, NULL, '[]', '[]', 0, 0, NULL, ?)",
                 (
                     job_id,
                     spec.unit_key,
@@ -829,12 +834,14 @@ class DiscoveryRepository:
         *,
         job_id: int,
         unit_key: str,
+        source_key: str,
         uploads_playlist_id: str,
     ) -> YouTubeSyncCheckpoint:
         self._require_transaction()
         checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
         if (
             checkpoint.source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            or source_key != checkpoint.source_key
             or type(uploads_playlist_id) is not str
             or _YOUTUBE_UPLOADS_PLAYLIST_ID.fullmatch(uploads_playlist_id)
             is None
@@ -849,6 +856,8 @@ class DiscoveryRepository:
             checkpoint,
             uploads_playlist_id=uploads_playlist_id,
             next_page_token=checkpoint.next_page_token,
+            encountered_video_ids=checkpoint.encountered_video_ids,
+            unavailable_video_ids=checkpoint.unavailable_video_ids,
             page_count=checkpoint.page_count,
             batch_ordinal=checkpoint.batch_ordinal,
             completed_at=None,
@@ -860,6 +869,8 @@ class DiscoveryRepository:
         job_id: int,
         unit_key: str,
         next_page_token: str | None,
+        encountered_video_ids: tuple[str, ...],
+        unavailable_video_ids: tuple[str, ...],
     ) -> YouTubeSyncCheckpoint:
         self._require_transaction()
         checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
@@ -876,10 +887,27 @@ class DiscoveryRepository:
             )
         ):
             self._raise_seed_checkpoint_invalid()
+        try:
+            self._validate_seed_progress_values(
+                encountered_video_ids, unavailable_video_ids
+            )
+        except (TypeError, ValueError):
+            self._raise_seed_checkpoint_invalid()
+        if (
+            not set(checkpoint.encountered_video_ids).issubset(
+                encountered_video_ids
+            )
+            or not set(checkpoint.unavailable_video_ids).issubset(
+                unavailable_video_ids
+            )
+        ):
+            self._raise_seed_checkpoint_invalid()
         return self._replace_youtube_checkpoint(
             checkpoint,
             uploads_playlist_id=checkpoint.uploads_playlist_id,
             next_page_token=next_page_token,
+            encountered_video_ids=encountered_video_ids,
+            unavailable_video_ids=unavailable_video_ids,
             page_count=checkpoint.page_count + 1,
             batch_ordinal=checkpoint.batch_ordinal + 1,
             completed_at=None,
@@ -907,6 +935,8 @@ class DiscoveryRepository:
             checkpoint,
             uploads_playlist_id=checkpoint.uploads_playlist_id,
             next_page_token=None,
+            encountered_video_ids=checkpoint.encountered_video_ids,
+            unavailable_video_ids=checkpoint.unavailable_video_ids,
             page_count=checkpoint.page_count,
             batch_ordinal=checkpoint.batch_ordinal,
             completed_at=completed_at,
@@ -1236,6 +1266,9 @@ class DiscoveryRepository:
                     if row["completed_at"] is None
                     else _parse_canonical_utc(row["completed_at"])
                 )
+                encountered_video_ids, unavailable_video_ids = (
+                    self._stored_seed_progress(row, source_kind)
+                )
             except (TypeError, ValueError) as cause:
                 raise DomainError(
                     "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
@@ -1276,6 +1309,8 @@ class DiscoveryRepository:
                 upper_bound=upper_bound,
                 uploads_playlist_id=row["uploads_playlist_id"],
                 next_page_token=row["next_page_token"],
+                encountered_video_ids=encountered_video_ids,
+                unavailable_video_ids=unavailable_video_ids,
                 page_count=row["page_count"],
                 batch_ordinal=row["batch_ordinal"],
                 completed_at=completed_at,
@@ -1294,6 +1329,8 @@ class DiscoveryRepository:
                 upper_bound=upper_bound,
                 uploads_playlist_id=row["uploads_playlist_id"],
                 next_page_token=row["next_page_token"],
+                encountered_video_ids=encountered_video_ids,
+                unavailable_video_ids=unavailable_video_ids,
                 page_count=row["page_count"],
                 batch_ordinal=row["batch_ordinal"],
                 completed_at=completed_at,
@@ -1344,6 +1381,9 @@ class DiscoveryRepository:
                 if row["completed_at"] is None
                 else _parse_canonical_utc(row["completed_at"])
             )
+            encountered_video_ids, unavailable_video_ids = (
+                self._stored_seed_progress(row, source_kind)
+            )
         except (TypeError, ValueError) as cause:
             raise DomainError(
                 "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
@@ -1358,6 +1398,8 @@ class DiscoveryRepository:
             upper_bound=upper_bound,
             uploads_playlist_id=row["uploads_playlist_id"],
             next_page_token=row["next_page_token"],
+            encountered_video_ids=encountered_video_ids,
+            unavailable_video_ids=unavailable_video_ids,
             page_count=row["page_count"],
             batch_ordinal=row["batch_ordinal"],
             completed_at=completed_at,
@@ -1370,6 +1412,8 @@ class DiscoveryRepository:
         *,
         uploads_playlist_id: str | None,
         next_page_token: str | None,
+        encountered_video_ids: tuple[str, ...],
+        unavailable_video_ids: tuple[str, ...],
         page_count: int,
         batch_ordinal: int,
         completed_at: datetime | None,
@@ -1383,17 +1427,23 @@ class DiscoveryRepository:
             upper_bound=checkpoint.upper_bound,
             uploads_playlist_id=uploads_playlist_id,
             next_page_token=next_page_token,
+            encountered_video_ids=encountered_video_ids,
+            unavailable_video_ids=unavailable_video_ids,
             page_count=page_count,
             batch_ordinal=batch_ordinal,
             completed_at=completed_at,
         )
         cursor = self._conn.execute(
             "UPDATE youtube_sync_checkpoints SET uploads_playlist_id=?, "
-            "next_page_token=?, page_count=?, batch_ordinal=?, completed_at=?, "
-            "checkpoint_hash=? WHERE job_id=? AND unit_key=? AND checkpoint_hash=?",
+            "next_page_token=?, encountered_video_ids_json=?, "
+            "unavailable_video_ids_json=?, page_count=?, batch_ordinal=?, "
+            "completed_at=?, checkpoint_hash=? "
+            "WHERE job_id=? AND unit_key=? AND checkpoint_hash=?",
             (
                 uploads_playlist_id,
                 next_page_token,
+                canonical_json(list(encountered_video_ids)),
+                canonical_json(list(unavailable_video_ids)),
                 page_count,
                 batch_ordinal,
                 None if completed_at is None else utc_iso(completed_at),
@@ -1435,6 +1485,13 @@ class DiscoveryRepository:
         )
         for row in rows:
             self._validate_stored_observation(row)
+            if (
+                row["youtube_video_id"]
+                not in checkpoint.encountered_video_ids
+                or row["youtube_video_id"]
+                in checkpoint.unavailable_video_ids
+            ):
+                self._raise_seed_artifact_invalid()
             snapshot = self._conn.execute(
                 "SELECT published_at FROM video_metadata_snapshots WHERE id=?",
                 (row["metadata_snapshot_id"],),
@@ -1475,6 +1532,51 @@ class DiscoveryRepository:
             })),
             observation_ids,
         )
+
+    @classmethod
+    def _stored_seed_progress(
+        cls,
+        row: sqlite3.Row,
+        source_kind: DiscoverySourceKind,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        encountered_raw = json.loads(row["encountered_video_ids_json"])
+        unavailable_raw = json.loads(row["unavailable_video_ids_json"])
+        if type(encountered_raw) is not list or type(unavailable_raw) is not list:
+            raise ValueError("checkpoint progress must use JSON arrays")
+        encountered = tuple(encountered_raw)
+        unavailable = tuple(unavailable_raw)
+        cls._validate_seed_progress_values(encountered, unavailable)
+        if (
+            row["encountered_video_ids_json"]
+            != canonical_json(list(encountered))
+            or row["unavailable_video_ids_json"]
+            != canonical_json(list(unavailable))
+            or source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            and (encountered or unavailable)
+        ):
+            raise ValueError("checkpoint progress is not canonical")
+        return encountered, unavailable
+
+    @staticmethod
+    def _validate_seed_progress_values(
+        encountered_video_ids: tuple[str, ...],
+        unavailable_video_ids: tuple[str, ...],
+    ) -> None:
+        if (
+            type(encountered_video_ids) is not tuple
+            or type(unavailable_video_ids) is not tuple
+            or any(
+                type(video_id) is not str
+                or _YOUTUBE_VIDEO_ID.fullmatch(video_id) is None
+                for video_id in encountered_video_ids + unavailable_video_ids
+            )
+            or encountered_video_ids
+            != tuple(sorted(set(encountered_video_ids)))
+            or unavailable_video_ids
+            != tuple(sorted(set(unavailable_video_ids)))
+            or not set(unavailable_video_ids).issubset(encountered_video_ids)
+        ):
+            raise ValueError("checkpoint progress is invalid")
 
     @staticmethod
     def _raise_seed_checkpoint_invalid() -> None:

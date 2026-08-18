@@ -540,6 +540,8 @@ class YouTubeSyncCheckpoint:
     upper_bound: datetime
     uploads_playlist_id: str | None
     next_page_token: str | None
+    encountered_video_ids: tuple[str, ...]
+    unavailable_video_ids: tuple[str, ...]
     page_count: int
     batch_ordinal: int
     completed_at: datetime | None
@@ -556,6 +558,8 @@ def canonical_youtube_sync_checkpoint_hash(
     upper_bound: datetime,
     uploads_playlist_id: str | None,
     next_page_token: str | None,
+    encountered_video_ids: tuple[str, ...],
+    unavailable_video_ids: tuple[str, ...],
     page_count: int,
     batch_ordinal: int,
     completed_at: datetime | None,
@@ -566,6 +570,7 @@ def canonical_youtube_sync_checkpoint_hash(
             None if completed_at is None else utc_iso(completed_at)
         ),
         "effective_lower_bound": utc_iso(effective_lower_bound),
+        "encountered_video_ids": list(encountered_video_ids),
         "job_id": job_id,
         "next_page_token": next_page_token,
         "page_count": page_count,
@@ -573,6 +578,7 @@ def canonical_youtube_sync_checkpoint_hash(
         "source_key": source_key,
         "source_kind": source_kind.value,
         "unit_key": unit_key,
+        "unavailable_video_ids": list(unavailable_video_ids),
         "uploads_playlist_id": uploads_playlist_id,
         "upper_bound": utc_iso(upper_bound),
     }))

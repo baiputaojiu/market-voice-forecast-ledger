@@ -275,6 +275,9 @@ class YouTubeSyncService:
                 "stored YouTube seed unit is invalid",
             )
         if unit.status is UnitStatus.SUCCESS:
+            checkpoint = self._discovery.get_youtube_sync_checkpoint(
+                job_id, unit_key
+            )
             output_hash, observation_ids = self._discovery.seed_unit_artifact(
                 job_id=job_id,
                 unit_key=unit_key,
@@ -288,7 +291,10 @@ class YouTubeSyncService:
                     "stored YouTube sync artifact is invalid",
                 )
             return UnitExecutionResult(
-                len(observation_ids), len(observation_ids), 0, output_hash
+                len(checkpoint.encountered_video_ids),
+                len(observation_ids),
+                len(checkpoint.unavailable_video_ids),
+                output_hash,
             )
         if unit.status is not UnitStatus.RUNNING:
             raise DomainError(
@@ -305,30 +311,26 @@ class YouTubeSyncService:
         checkpoint = self._discovery.get_youtube_sync_checkpoint(
             job_id, unit_key
         )
+        resolved_uploads_playlist_id = discoverer.resolve_uploads_playlist(
+            spec.source_key
+        )
         if checkpoint.uploads_playlist_id is None:
-            uploads_playlist_id = discoverer.resolve_uploads_playlist(
-                spec.source_key
-            )
             with transaction(self._conn):
                 checkpoint = self._discovery.bind_seed_uploads_playlist(
                     job_id=job_id,
                     unit_key=unit_key,
-                    uploads_playlist_id=uploads_playlist_id,
+                    source_key=spec.source_key,
+                    uploads_playlist_id=resolved_uploads_playlist_id,
                 )
-        else:
-            uploads_playlist_id = checkpoint.uploads_playlist_id
-
-        seen_video_ids = set(
-            self._discovery.seed_unit_seen_video_ids(
-                job_id=job_id,
-                unit_key=unit_key,
-                profile_version_id=profile_version.id,
-                profile_id=profile_version.profile_id,
-                source_key=spec.source_key,
+        elif checkpoint.uploads_playlist_id != resolved_uploads_playlist_id:
+            raise DomainError(
+                "YOUTUBE_SEED_CHECKPOINT_INVALID",
+                "YouTube seed checkpoint is invalid",
             )
-        )
-        encountered_video_ids = set(seen_video_ids)
-        unavailable_video_ids: set[str] = set()
+        uploads_playlist_id = resolved_uploads_playlist_id
+
+        encountered_video_ids = set(checkpoint.encountered_video_ids)
+        unavailable_video_ids = set(checkpoint.unavailable_video_ids)
 
         terminal_page_committed = (
             checkpoint.page_count > 0
@@ -369,9 +371,13 @@ class YouTubeSyncService:
                 <= item.published_at
                 < checkpoint.upper_bound
             )
-            page_wholly_older = bool(canonical_items) and all(
-                item.published_at < checkpoint.effective_lower_bound
-                for item in canonical_items
+            page_wholly_older = (
+                len(canonical_items) == len(page.video_ids)
+                and bool(canonical_items)
+                and all(
+                    item.published_at < checkpoint.effective_lower_bound
+                    for item in canonical_items
+                )
             )
             committed_next_token = (
                 None if page_wholly_older else page.next_page_token
@@ -389,10 +395,11 @@ class YouTubeSyncService:
                     job_id=job_id,
                     unit_key=unit_key,
                     next_page_token=committed_next_token,
+                    encountered_video_ids=tuple(sorted(encountered_video_ids)),
+                    unavailable_video_ids=tuple(
+                        sorted(unavailable_video_ids)
+                    ),
                 )
-            seen_video_ids.update(
-                item.youtube_video_id for item in in_window_items
-            )
             terminal_page_committed = committed_next_token is None
 
         with transaction(self._conn):

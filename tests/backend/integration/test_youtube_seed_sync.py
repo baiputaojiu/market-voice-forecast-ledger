@@ -327,6 +327,64 @@ def test_seed_unit_stops_when_a_page_is_wholly_older_than_the_lower_bound(db):
     assert db.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 0
 
 
+def test_unavailable_page_identity_prevents_wholly_old_early_stop(db):
+    old_id = _video_id(115)
+    unavailable_id = _video_id(116)
+    eligible_id = _video_id(117)
+    profile = DiscoveryRepository(db).list_active_profile_versions()[0]
+    playlist_id = "UU" + profile.seed_channel_ids[0][2:]
+    pages = (
+        YouTubePage(
+            (
+                synthetic_playlist_item(old_id, playlist_id),
+                synthetic_playlist_item(unavailable_id, playlist_id),
+            ),
+            "page_after_ambiguous_old",
+        ),
+        YouTubePage(
+            (synthetic_playlist_item(eligible_id, playlist_id),),
+            None,
+        ),
+    )
+    responses = (
+        (
+            synthetic_video_item(
+                video_id=old_id,
+                snippet_published_at=BEFORE_WINDOW,
+            ),
+        ),
+        (
+            synthetic_video_item(
+                video_id=eligible_id,
+                snippet_published_at=WITHIN_WINDOW,
+            ),
+        ),
+    )
+    service, client, _, job_id, unit_key = _seed_fixture(
+        db,
+        playlist_pages=pages,
+        video_responses=responses,
+    )
+
+    result = service.execute_seed_unit(job_id, unit_key)
+
+    assert client.playlist_calls == [
+        (playlist_id, None),
+        (playlist_id, "page_after_ambiguous_old"),
+    ]
+    assert client.video_calls == [
+        (old_id, unavailable_id),
+        (eligible_id,),
+    ]
+    assert result.discovered_count == 3
+    assert result.persisted_count == 1
+    assert result.unavailable_count == 1
+    assert tuple(
+        row["youtube_video_id"]
+        for row in db.execute("SELECT youtube_video_id FROM videos ORDER BY id")
+    ) == (eligible_id,)
+
+
 def test_seed_unit_deduplicates_across_pages_but_preserves_distinct_ids(db):
     first_id, repeated_id, last_id = (
         _video_id(120),

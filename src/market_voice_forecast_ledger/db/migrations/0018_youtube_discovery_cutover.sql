@@ -1325,6 +1325,8 @@ CREATE TABLE youtube_sync_checkpoints (
     upper_bound TEXT NOT NULL,
     uploads_playlist_id TEXT,
     next_page_token TEXT,
+    encountered_video_ids_json TEXT NOT NULL,
+    unavailable_video_ids_json TEXT NOT NULL,
     page_count INTEGER NOT NULL CHECK (page_count >= 0),
     batch_ordinal INTEGER NOT NULL CHECK (batch_ordinal >= 0),
     completed_at TEXT,

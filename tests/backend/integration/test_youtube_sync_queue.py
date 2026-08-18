@@ -60,6 +60,9 @@ def _completed_checkpoint_hash(row, completed_at: datetime) -> str:
             "batch_ordinal": row["batch_ordinal"],
             "completed_at": _utc_text(completed_at),
             "effective_lower_bound": row["effective_lower_bound"],
+            "encountered_video_ids": json.loads(
+                row["encountered_video_ids_json"]
+            ),
             "job_id": row["job_id"],
             "next_page_token": row["next_page_token"],
             "page_count": row["page_count"],
@@ -67,6 +70,9 @@ def _completed_checkpoint_hash(row, completed_at: datetime) -> str:
             "source_key": row["source_key"],
             "source_kind": row["source_kind"],
             "unit_key": row["unit_key"],
+            "unavailable_video_ids": json.loads(
+                row["unavailable_video_ids_json"]
+            ),
             "uploads_playlist_id": row["uploads_playlist_id"],
             "upper_bound": row["upper_bound"],
         }
