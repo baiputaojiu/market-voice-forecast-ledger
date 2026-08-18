@@ -269,6 +269,7 @@ class YouTubeClient:
                 snippet = item["snippet"]
                 resource_id = snippet["resourceId"]
                 content_video_id = content_details["videoId"]
+                snippet_playlist_id = snippet["playlistId"]
                 snippet_video_id = resource_id["videoId"]
                 if (
                     type(content_details) is not dict
@@ -276,6 +277,8 @@ class YouTubeClient:
                     or type(resource_id) is not dict
                     or type(content_video_id) is not str
                     or _YOUTUBE_VIDEO_ID.fullmatch(content_video_id) is None
+                    or type(snippet_playlist_id) is not str
+                    or snippet_playlist_id != playlist_id
                     or snippet_video_id != content_video_id
                     or content_video_id in seen
                 ):
@@ -441,7 +444,11 @@ def _validated_page(response: object) -> YouTubePage:
             raise _response_invalid()
         items = response["items"]
         token = response.get("nextPageToken")
-        if type(items) is not list or any(type(item) is not dict for item in items):
+        if (
+            type(items) is not list
+            or len(items) > 50
+            or any(type(item) is not dict for item in items)
+        ):
             raise _response_invalid()
         if token is not None and (
             type(token) is not str or _PAGE_TOKEN.fullmatch(token) is None

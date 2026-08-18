@@ -144,6 +144,14 @@ class DiscoveryRepository:
                 unit_key=unit_key,
                 request_ordinal=request_ordinal,
             )
+        stored_endpoint_classes = {
+            row["endpoint_class"] for row in existing_rows
+        }
+        if len(stored_endpoint_classes) > 1:
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            )
         if any(row["attempt_no"] == attempt_no for row in existing_rows):
             raise DomainError(
                 "YOUTUBE_QUOTA_RESERVATION_CONFLICT",
@@ -155,6 +163,11 @@ class DiscoveryRepository:
             raise DomainError(
                 "YOUTUBE_QUOTA_RESERVATION_SEQUENCE_INVALID",
                 "YouTube quota reservation attempt sequence is invalid",
+            )
+        if existing_rows and endpoint_class != existing_rows[0]["endpoint_class"]:
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "YouTube quota reservation is invalid",
             )
         try:
             cursor = self._conn.execute(

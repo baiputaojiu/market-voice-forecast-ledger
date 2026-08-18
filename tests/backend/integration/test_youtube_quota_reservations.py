@@ -334,6 +334,50 @@ def test_noncontiguous_attempt_number_fails_closed(quota_db):
     assert _rows(conn) == ()
 
 
+def test_endpoint_class_cannot_change_within_one_logical_request(quota_db):
+    conn, database_path, job_id = quota_db
+    callback = _callback(conn, job_id)
+    callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+    before = [tuple(row) for row in _rows(conn)]
+
+    with pytest.raises(DomainError) as caught:
+        callback(EndpointClass.VIDEOS_LIST, 2, FIXED_NOW)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert str(caught.value) == "YouTube quota reservation is invalid"
+    assert "search_list" not in repr(caught.value)
+    assert "videos_list" not in repr(caught.value)
+    assert str(database_path) not in repr(caught.value)
+    assert [tuple(row) for row in _rows(conn)] == before
+    assert conn.in_transaction is False
+
+
+def test_stored_mixed_endpoint_classes_fail_as_corruption_without_new_write(
+    quota_db,
+):
+    conn, database_path, job_id = quota_db
+    _callback(conn, job_id)(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO youtube_quota_reservations("
+            "job_id, unit_key, request_ordinal, attempt_no, endpoint_class, "
+            "attempted_at) VALUES (?, ?, 1, 2, 'videos_list', ?)",
+            (job_id, UNIT_KEY, "2026-08-18T02:03:05.000000Z"),
+        )
+    before = [tuple(row) for row in _rows(conn)]
+
+    with pytest.raises(DomainError) as caught:
+        _callback(conn, job_id)(EndpointClass.SEARCH_LIST, 3, FIXED_NOW)
+
+    assert caught.value.code == "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert str(caught.value) == "stored YouTube quota reservation is invalid"
+    assert "search_list" not in repr(caught.value)
+    assert "videos_list" not in repr(caught.value)
+    assert str(database_path) not in repr(caught.value)
+    assert [tuple(row) for row in _rows(conn)] == before
+    assert conn.in_transaction is False
+
+
 def test_attempt_five_is_rejected_by_the_four_attempt_storage_contract(quota_db):
     conn, _database_path, job_id = quota_db
     callback = _callback(conn, job_id)

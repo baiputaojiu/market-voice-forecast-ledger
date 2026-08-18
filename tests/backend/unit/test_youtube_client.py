@@ -40,6 +40,7 @@ from tests.backend.youtube_fakes import (
 CHANNEL_ID = "UCabcdefghijklmnopqrstuv"
 OTHER_CHANNEL_ID = "UCbcdefghijklmnopqrstuvw"
 UPLOADS_PLAYLIST_ID = "UUabcdefghijklmnopqrstuv"
+OTHER_UPLOADS_PLAYLIST_ID = "UUbcdefghijklmnopqrstuvw"
 VIDEO_ID = "video000001"
 OTHER_VIDEO_ID = "video000002"
 PUBLISHED_AFTER = "2023-08-17T23:59:59.000000Z"
@@ -83,10 +84,16 @@ def _channel_item(
     }
 
 
-def _playlist_item(video_id: str = VIDEO_ID) -> dict[str, object]:
+def _playlist_item(
+    video_id: str = VIDEO_ID,
+    playlist_id: object = UPLOADS_PLAYLIST_ID,
+) -> dict[str, object]:
     return {
         "contentDetails": {"videoId": video_id},
-        "snippet": {"resourceId": {"videoId": video_id}},
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {"videoId": video_id},
+        },
     }
 
 
@@ -359,6 +366,106 @@ def test_invalid_envelope_item_list_or_next_token_fails_with_safe_permanent_erro
     assert caught.value.category == "permanent"
     assert str(caught.value) == "YouTube provider request failed."
     _assert_one_reservation(reservation, EndpointClass.SEARCH_LIST)
+    assert sleeper.delays == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "endpoint_class"),
+    (
+        ("search", EndpointClass.SEARCH_LIST),
+        ("playlist", EndpointClass.PLAYLIST_ITEMS_LIST),
+    ),
+)
+@pytest.mark.parametrize(("item_count", "accepted"), ((50, True), (51, False)))
+def test_page_item_count_enforces_provider_maximum_without_retry_or_private_leak(
+    method_name,
+    endpoint_class,
+    item_count,
+    accepted,
+):
+    video_ids = tuple(f"video{index:06d}" for index in range(item_count))
+    items = [
+        _search_item(video_id)
+        if method_name == "search"
+        else _playlist_item(video_id)
+        for video_id in video_ids
+    ]
+    if items:
+        items[-1]["private"] = RAW_PROVIDER_SENTINEL
+    transport = FakeYouTubeTransport(page={"items": items})
+    client, reservation, sleeper = _client(transport)
+
+    if accepted:
+        page = (
+            client.search_videos(
+                "Synthetic analyst",
+                PUBLISHED_AFTER,
+                PUBLISHED_BEFORE,
+                None,
+            )
+            if method_name == "search"
+            else client.playlist_items(UPLOADS_PLAYLIST_ID, None)
+        )
+        assert len(page.items) == 50
+    else:
+        with pytest.raises(YouTubeProviderFailure) as caught:
+            if method_name == "search":
+                client.search_videos(
+                    "Synthetic analyst",
+                    PUBLISHED_AFTER,
+                    PUBLISHED_BEFORE,
+                    None,
+                )
+            else:
+                client.playlist_items(UPLOADS_PLAYLIST_ID, None)
+
+        assert caught.value.code == "YOUTUBE_RESPONSE_INVALID"
+        assert caught.value.category == "permanent"
+        assert str(caught.value) == "YouTube provider request failed."
+        assert RAW_PROVIDER_SENTINEL not in repr(caught.value)
+
+    _assert_one_reservation(reservation, endpoint_class)
+    assert len(transport.safe_requests) == 1
+    assert sleeper.delays == []
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    (
+        {
+            "playlistId": OTHER_UPLOADS_PLAYLIST_ID,
+            "resourceId": {"videoId": VIDEO_ID},
+            "private": RAW_PROVIDER_SENTINEL,
+        },
+        {
+            "resourceId": {"videoId": VIDEO_ID},
+            "private": RAW_PROVIDER_SENTINEL,
+        },
+        {
+            "playlistId": True,
+            "resourceId": {"videoId": VIDEO_ID},
+            "private": RAW_PROVIDER_SENTINEL,
+        },
+    ),
+)
+def test_playlist_item_requires_exact_requested_playlist_identity(snippet):
+    transport = FakeYouTubeTransport(page={
+        "items": [{
+            "contentDetails": {"videoId": VIDEO_ID},
+            "snippet": snippet,
+        }]
+    })
+    client, reservation, sleeper = _client(transport)
+
+    with pytest.raises(YouTubeProviderFailure) as caught:
+        client.playlist_items(UPLOADS_PLAYLIST_ID, None)
+
+    assert caught.value.code == "YOUTUBE_RESPONSE_INVALID"
+    assert caught.value.category == "permanent"
+    assert str(caught.value) == "YouTube provider request failed."
+    assert RAW_PROVIDER_SENTINEL not in repr(caught.value)
+    _assert_one_reservation(reservation, EndpointClass.PLAYLIST_ITEMS_LIST)
+    assert len(transport.safe_requests) == 1
     assert sleeper.delays == []
 
 
