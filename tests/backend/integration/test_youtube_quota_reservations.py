@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+
+import pytest
+
+import market_voice_forecast_ledger.repositories.discovery as discovery_repository_module
+from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
+from market_voice_forecast_ledger.db.connection import open_database, transaction
+from market_voice_forecast_ledger.db.migrate import apply_migrations
+from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
+from market_voice_forecast_ledger.youtube.client import (
+    EndpointClass,
+    SafeTransportFailure,
+    YouTubeClient,
+    YouTubeProviderFailure,
+)
+from tests.backend.youtube_fakes import (
+    FIXED_NOW,
+    FakeCredentialStore,
+    FakeYouTubeTransport,
+    RecordingSleeper,
+    fixed_clock,
+)
+
+
+UNIT_KEY = "youtube:profile:1:search"
+OTHER_UNIT_KEY = "youtube:profile:2:search"
+PRIVATE_SENTINEL = "private-provider-body-and-local-path-sentinel"
+
+
+@pytest.fixture
+def quota_db(tmp_path):
+    database_path = tmp_path / "ledger.sqlite3"
+    conn = open_database(database_path)
+    apply_migrations(conn)
+    bootstrap_reference_data(conn)
+    with transaction(conn):
+        job_id = _insert_job_with_unit(conn, UNIT_KEY)
+    try:
+        yield conn, database_path, job_id
+    finally:
+        conn.close()
+
+
+def _insert_job_with_unit(
+    conn: sqlite3.Connection,
+    unit_key: str,
+    *,
+    job_kind: str = "youtube_sync",
+    stage: str = "youtube_search_discovery",
+) -> int:
+    timestamp = "2026-08-18T02:03:04.000000Z"
+    cursor = conn.execute(
+        """
+        INSERT INTO jobs(
+            job_kind, manifest_hash, total_units, status, created_at, updated_at
+        ) VALUES (?, ?, 1, 'queued', ?, ?)
+        """,
+        (job_kind, f"synthetic-manifest-{unit_key}", timestamp, timestamp),
+    )
+    job_id = cursor.lastrowid
+    conn.execute(
+        """
+        INSERT INTO job_units(
+            job_id, unit_key, stage, ordinal, declared_input_hash,
+            dependency_keys_json, execution_contract_hash, status
+        ) VALUES (?, ?, ?, 1, 'synthetic-input', '[]',
+                  'synthetic-contract', 'pending')
+        """,
+        (job_id, unit_key, stage),
+    )
+    return job_id
+
+
+def _callback(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    unit_key: str = UNIT_KEY,
+    request_ordinal: int = 1,
+):
+    return DiscoveryRepository(conn).youtube_attempt_reservation(
+        job_id=job_id,
+        unit_key=unit_key,
+        request_ordinal=request_ordinal,
+    )
+
+
+def _rows(conn: sqlite3.Connection):
+    return tuple(
+        conn.execute(
+            "SELECT job_id, unit_key, request_ordinal, attempt_no, "
+            "endpoint_class, attempted_at "
+            "FROM youtube_quota_reservations ORDER BY id"
+        )
+    )
+
+
+def test_callback_commits_one_minimal_reservation_in_its_own_short_transaction(
+    quota_db,
+):
+    conn, database_path, job_id = quota_db
+    reservation = _callback(conn, job_id)
+    assert conn.in_transaction is False
+
+    reservation(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+
+    assert conn.in_transaction is False
+    reopened = open_database(database_path)
+    try:
+        assert [tuple(row) for row in _rows(reopened)] == [(
+            job_id,
+            UNIT_KEY,
+            1,
+            1,
+            "search_list",
+            "2026-08-18T02:03:04.000000Z",
+        )]
+    finally:
+        reopened.close()
+
+
+def test_reservation_is_committed_before_transport_and_survives_call_crash(quota_db):
+    conn, database_path, job_id = quota_db
+    observed_before_call: list[tuple[object, ...]] = []
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    class CrashAfterInspectingTransport:
+        def get_json(self, _endpoint, _params, _api_key):
+            reopened = open_database(database_path)
+            try:
+                observed_before_call.extend(tuple(row) for row in _rows(reopened))
+            finally:
+                reopened.close()
+            raise SyntheticProcessCrash()
+
+    client = YouTubeClient(
+        transport=CrashAfterInspectingTransport(),
+        credential_store=FakeCredentialStore(),
+        reserve_attempt=_callback(conn, job_id),
+        sleeper=RecordingSleeper(),
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(SyntheticProcessCrash):
+        client.videos(("video000001",))
+
+    assert len(observed_before_call) == 1
+    assert observed_before_call[0][3:] == (
+        1,
+        "videos_list",
+        "2026-08-18T02:03:04.000000Z",
+    )
+    reopened = open_database(database_path)
+    try:
+        assert len(_rows(reopened)) == 1
+    finally:
+        reopened.close()
+
+
+def test_four_transport_attempts_commit_four_distinct_reservations(quota_db):
+    conn, _database_path, job_id = quota_db
+    failure = SafeTransportFailure(kind="network")
+    transport = FakeYouTubeTransport(
+        responses=(failure, failure, failure, failure)
+    )
+    client = YouTubeClient(
+        transport=transport,
+        credential_store=FakeCredentialStore(),
+        reserve_attempt=_callback(conn, job_id),
+        sleeper=RecordingSleeper(),
+        clock=fixed_clock,
+    )
+
+    with pytest.raises(YouTubeProviderFailure) as caught:
+        client.search_videos(
+            "Synthetic analyst",
+            "2023-08-17T23:59:59.000000Z",
+            "2026-08-18T00:00:00.000000Z",
+            None,
+        )
+
+    assert caught.value.category == "transient"
+    assert [row[3] for row in _rows(conn)] == [1, 2, 3, 4]
+    assert {row[4] for row in _rows(conn)} == {"search_list"}
+
+
+@pytest.mark.parametrize(
+    "endpoint_class",
+    tuple(EndpointClass),
+)
+def test_every_endpoint_class_is_persisted_as_the_exact_safe_value(
+    quota_db,
+    endpoint_class,
+):
+    conn, _database_path, job_id = quota_db
+    ordinal = tuple(EndpointClass).index(endpoint_class) + 1
+
+    _callback(conn, job_id, request_ordinal=ordinal)(
+        endpoint_class, 1, FIXED_NOW
+    )
+
+    assert _rows(conn)[-1][4] == endpoint_class.value
+
+
+@pytest.mark.parametrize(
+    ("job_id", "unit_key", "request_ordinal"),
+    (
+        (True, UNIT_KEY, 1),
+        (0, UNIT_KEY, 1),
+        (1, "", 1),
+        (1, PRIVATE_SENTINEL + "\n", 1),
+        (1, UNIT_KEY, True),
+        (1, UNIT_KEY, 0),
+    ),
+)
+def test_invalid_job_unit_and_request_identity_fail_before_opening_a_reservation(
+    quota_db,
+    job_id,
+    unit_key,
+    request_ordinal,
+):
+    conn, _database_path, real_job_id = quota_db
+    if type(job_id) is int and job_id == 1:
+        job_id = real_job_id
+
+    with pytest.raises(DomainError) as caught:
+        _callback(
+            conn,
+            job_id,
+            unit_key=unit_key,
+            request_ordinal=request_ordinal,
+        )
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert PRIVATE_SENTINEL not in str(caught.value)
+    assert _rows(conn) == ()
+
+
+def test_missing_job_and_unit_mismatch_fail_closed_without_sqlite_details(quota_db):
+    conn, _database_path, job_id = quota_db
+    with transaction(conn):
+        other_job_id = _insert_job_with_unit(conn, OTHER_UNIT_KEY)
+
+    for invalid_job_id, invalid_unit_key in (
+        (999_999, UNIT_KEY),
+        (job_id, OTHER_UNIT_KEY),
+        (other_job_id, UNIT_KEY),
+    ):
+        with pytest.raises(DomainError) as caught:
+            _callback(
+                conn,
+                invalid_job_id,
+                unit_key=invalid_unit_key,
+            )
+        assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_INVALID"
+        assert "FOREIGN KEY" not in str(caught.value)
+        assert invalid_unit_key not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("job_kind", "stage"),
+    (
+        ("video_pipeline", "video_metadata"),
+        ("youtube_sync", "video_metadata"),
+    ),
+)
+def test_non_youtube_job_or_unit_stage_is_rejected_without_writing(
+    quota_db,
+    job_kind,
+    stage,
+):
+    conn, _database_path, _job_id = quota_db
+    with transaction(conn):
+        invalid_job_id = _insert_job_with_unit(
+            conn,
+            f"invalid:{job_kind}:{stage}",
+            job_kind=job_kind,
+            stage=stage,
+        )
+
+    with pytest.raises(DomainError) as caught:
+        _callback(
+            conn,
+            invalid_job_id,
+            unit_key=f"invalid:{job_kind}:{stage}",
+        )
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert _rows(conn) == ()
+
+
+@pytest.mark.parametrize(
+    ("endpoint_class", "attempt_no", "attempted_at"),
+    (
+        ("videos_list", 1, FIXED_NOW),
+        (EndpointClass.VIDEOS_LIST, True, FIXED_NOW),
+        (EndpointClass.VIDEOS_LIST, 0, FIXED_NOW),
+        (EndpointClass.VIDEOS_LIST, 1, datetime(2026, 8, 18, 2, 3, 4)),
+        (
+            EndpointClass.VIDEOS_LIST,
+            1,
+            datetime(2026, 8, 18, 2, 3, 4, tzinfo=timezone.utc).astimezone(),
+        ),
+    ),
+)
+def test_invalid_endpoint_attempt_or_time_fail_closed_without_writing(
+    quota_db,
+    endpoint_class,
+    attempt_no,
+    attempted_at,
+):
+    conn, _database_path, job_id = quota_db
+
+    with pytest.raises(DomainError) as caught:
+        _callback(conn, job_id)(endpoint_class, attempt_no, attempted_at)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert _rows(conn) == ()
+
+
+def test_noncontiguous_attempt_number_fails_closed(quota_db):
+    conn, _database_path, job_id = quota_db
+
+    with pytest.raises(DomainError) as caught:
+        _callback(conn, job_id)(EndpointClass.SEARCH_LIST, 2, FIXED_NOW)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_SEQUENCE_INVALID"
+    assert _rows(conn) == ()
+
+
+def test_attempt_five_is_rejected_by_the_four_attempt_storage_contract(quota_db):
+    conn, _database_path, job_id = quota_db
+    callback = _callback(conn, job_id)
+    for attempt_no in range(1, 5):
+        callback(EndpointClass.SEARCH_LIST, attempt_no, FIXED_NOW)
+
+    with pytest.raises(DomainError) as caught:
+        callback(EndpointClass.SEARCH_LIST, 5, FIXED_NOW)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert [row[3] for row in _rows(conn)] == [1, 2, 3, 4]
+
+
+def test_database_open_failure_is_reduced_without_native_or_path_text(
+    quota_db,
+    monkeypatch,
+):
+    conn, database_path, job_id = quota_db
+    callback = _callback(conn, job_id)
+
+    def fail_open(_path):
+        raise sqlite3.OperationalError(f"native {PRIVATE_SENTINEL} {database_path}")
+
+    monkeypatch.setattr(discovery_repository_module, "open_database", fail_open)
+
+    with pytest.raises(DomainError) as caught:
+        callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_STORAGE_FAILED"
+    assert PRIVATE_SENTINEL not in str(caught.value)
+    assert str(database_path) not in str(caught.value)
+
+
+def test_duplicate_reservation_is_rejected_and_original_row_is_unchanged(quota_db):
+    conn, _database_path, job_id = quota_db
+    callback = _callback(conn, job_id)
+    callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+    before = [tuple(row) for row in _rows(conn)]
+
+    with pytest.raises(DomainError) as caught:
+        callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_RESERVATION_CONFLICT"
+    assert [tuple(row) for row in _rows(conn)] == before
+
+
+def test_corrupt_duplicate_row_fails_closed_without_disclosing_stored_text(quota_db):
+    conn, _database_path, job_id = quota_db
+    callback = _callback(conn, job_id)
+    callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+    conn.execute("DROP TRIGGER youtube_quota_reservations_no_update")
+    conn.execute(
+        "UPDATE youtube_quota_reservations SET attempted_at=?",
+        (PRIVATE_SENTINEL,),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+
+    assert caught.value.code == "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID"
+    assert PRIVATE_SENTINEL not in str(caught.value)
+
+
+def test_raw_update_delete_and_replace_remain_append_only(quota_db):
+    conn, _database_path, job_id = quota_db
+    _callback(conn, job_id)(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+    original_id = conn.execute(
+        "SELECT id FROM youtube_quota_reservations"
+    ).fetchone()["id"]
+
+    statements = (
+        (
+            "UPDATE youtube_quota_reservations SET endpoint_class='videos_list' "
+            "WHERE id=?",
+            (original_id,),
+        ),
+        ("DELETE FROM youtube_quota_reservations WHERE id=?", (original_id,)),
+        (
+            "INSERT OR REPLACE INTO youtube_quota_reservations("
+            "id, job_id, unit_key, request_ordinal, attempt_no, "
+            "endpoint_class, attempted_at) VALUES (?, ?, ?, 1, 1, "
+            "'videos_list', '2026-08-18T02:03:05.000000Z')",
+            (original_id + 1, job_id, UNIT_KEY),
+        ),
+    )
+    for sql, params in statements:
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            conn.execute(sql, params)
+
+    assert len(_rows(conn)) == 1
+
+
+def test_reservation_schema_contains_only_approved_safe_fields(quota_db):
+    conn, _database_path, _job_id = quota_db
+    columns = tuple(
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(youtube_quota_reservations)")
+    )
+
+    assert columns == (
+        "id",
+        "job_id",
+        "unit_key",
+        "request_ordinal",
+        "attempt_no",
+        "endpoint_class",
+        "attempted_at",
+    )
+    assert not {
+        "api_key",
+        "request_url",
+        "provider_body",
+        "page_token",
+        "title",
+        "description",
+    } & set(columns)
+
+
+def test_direct_insert_primitive_requires_a_caller_transaction(quota_db):
+    conn, _database_path, job_id = quota_db
+
+    with pytest.raises(DomainError) as caught:
+        DiscoveryRepository(conn).reserve_youtube_quota_attempt(
+            job_id=job_id,
+            unit_key=UNIT_KEY,
+            request_ordinal=1,
+            attempt_no=1,
+            endpoint_class="search_list",
+            attempted_at=FIXED_NOW,
+        )
+
+    assert caught.value.code == "DISCOVERY_TRANSACTION_REQUIRED"
+    assert _rows(conn) == ()

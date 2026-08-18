@@ -1,7 +1,11 @@
 import re
 import sqlite3
 from datetime import datetime, timezone
+from enum import StrEnum
+from pathlib import Path
+from collections.abc import Callable
 
+from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text, utc_iso
 from market_voice_forecast_ledger.domain.discovery import (
     CanonicalVideoMetadata,
@@ -22,11 +26,262 @@ from market_voice_forecast_ledger.domain.errors import DomainError
 
 _UTC_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _SAFE_SOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_YOUTUBE_ENDPOINT_CLASSES = frozenset({
+    "search_list",
+    "channels_list",
+    "playlist_items_list",
+    "videos_list",
+})
+_YOUTUBE_UNIT_STAGES = frozenset({
+    "youtube_seed_discovery",
+    "youtube_search_discovery",
+    "youtube_manual_discovery",
+})
 
 
 class DiscoveryRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+
+    def youtube_attempt_reservation(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        request_ordinal: int,
+    ) -> Callable[[object, int, datetime], None]:
+        self._validate_quota_reservation_identity(
+            job_id=job_id,
+            unit_key=unit_key,
+            request_ordinal=request_ordinal,
+        )
+        database_path = self._database_path()
+
+        def reserve(
+            endpoint_class: object,
+            attempt_no: int,
+            attempted_at: datetime,
+        ) -> None:
+            endpoint_value = (
+                endpoint_class.value
+                if isinstance(endpoint_class, StrEnum)
+                and type(endpoint_class.value) is str
+                else None
+            )
+            if endpoint_value not in _YOUTUBE_ENDPOINT_CLASSES:
+                raise DomainError(
+                    "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                    "YouTube quota reservation is invalid",
+                )
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = open_database(database_path)
+                with transaction(conn):
+                    DiscoveryRepository(conn).reserve_youtube_quota_attempt(
+                        job_id=job_id,
+                        unit_key=unit_key,
+                        request_ordinal=request_ordinal,
+                        attempt_no=attempt_no,
+                        endpoint_class=endpoint_value,
+                        attempted_at=attempted_at,
+                    )
+            except DomainError:
+                raise
+            except (OSError, sqlite3.Error):
+                raise DomainError(
+                    "YOUTUBE_QUOTA_RESERVATION_STORAGE_FAILED",
+                    "YouTube quota reservation could not be stored",
+                ) from None
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+
+        return reserve
+
+    def reserve_youtube_quota_attempt(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        request_ordinal: int,
+        attempt_no: int,
+        endpoint_class: str,
+        attempted_at: datetime,
+    ) -> int:
+        self._require_transaction()
+        self._validate_quota_reservation_identity(
+            job_id=job_id,
+            unit_key=unit_key,
+            request_ordinal=request_ordinal,
+        )
+        if (
+            type(attempt_no) is not int
+            or attempt_no <= 0
+            or attempt_no > 4
+            or type(endpoint_class) is not str
+            or endpoint_class not in _YOUTUBE_ENDPOINT_CLASSES
+            or not _is_exact_utc(attempted_at)
+        ):
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "YouTube quota reservation is invalid",
+            )
+        existing_rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM youtube_quota_reservations "
+                "WHERE job_id=? AND unit_key=? AND request_ordinal=? "
+                "ORDER BY attempt_no",
+                (job_id, unit_key, request_ordinal),
+            )
+        )
+        for row in existing_rows:
+            self._validate_stored_quota_reservation(
+                row,
+                job_id=job_id,
+                unit_key=unit_key,
+                request_ordinal=request_ordinal,
+            )
+        if any(row["attempt_no"] == attempt_no for row in existing_rows):
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_CONFLICT",
+                "YouTube quota reservation already exists",
+            )
+        expected_attempts = tuple(range(1, len(existing_rows) + 1))
+        stored_attempts = tuple(row["attempt_no"] for row in existing_rows)
+        if stored_attempts != expected_attempts or attempt_no != len(existing_rows) + 1:
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_SEQUENCE_INVALID",
+                "YouTube quota reservation attempt sequence is invalid",
+            )
+        try:
+            cursor = self._conn.execute(
+                "INSERT INTO youtube_quota_reservations("
+                "job_id, unit_key, request_ordinal, attempt_no, "
+                "endpoint_class, attempted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    unit_key,
+                    request_ordinal,
+                    attempt_no,
+                    endpoint_class,
+                    utc_iso(attempted_at),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "YouTube quota reservation is invalid",
+            ) from None
+        row = self._conn.execute(
+            "SELECT * FROM youtube_quota_reservations WHERE id=?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            )
+        self._validate_stored_quota_reservation(
+            row,
+            job_id=job_id,
+            unit_key=unit_key,
+            request_ordinal=request_ordinal,
+        )
+        if (
+            row["attempt_no"] != attempt_no
+            or row["endpoint_class"] != endpoint_class
+            or row["attempted_at"] != utc_iso(attempted_at)
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            )
+        return row["id"]
+
+    def _validate_quota_reservation_identity(
+        self,
+        *,
+        job_id: object,
+        unit_key: object,
+        request_ordinal: object,
+    ) -> None:
+        if (
+            type(job_id) is not int
+            or job_id <= 0
+            or type(unit_key) is not str
+            or _SAFE_SOURCE_KEY.fullmatch(unit_key) is None
+            or type(request_ordinal) is not int
+            or request_ordinal <= 0
+        ):
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "YouTube quota reservation is invalid",
+            )
+        owner = self._conn.execute(
+            "SELECT job.job_kind, unit.stage "
+            "FROM jobs AS job "
+            "JOIN job_units AS unit ON unit.job_id=job.id "
+            "WHERE job.id=? AND unit.unit_key=?",
+            (job_id, unit_key),
+        ).fetchone()
+        if (
+            owner is None
+            or owner["job_kind"] != "youtube_sync"
+            or owner["stage"] not in _YOUTUBE_UNIT_STAGES
+        ):
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "YouTube quota reservation is invalid",
+            )
+
+    def _validate_stored_quota_reservation(
+        self,
+        row: sqlite3.Row,
+        *,
+        job_id: int,
+        unit_key: str,
+        request_ordinal: int,
+    ) -> None:
+        try:
+            _parse_canonical_utc(row["attempted_at"])
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            ) from cause
+        if (
+            type(row["id"]) is not int
+            or row["id"] <= 0
+            or row["job_id"] != job_id
+            or row["unit_key"] != unit_key
+            or row["request_ordinal"] != request_ordinal
+            or type(row["attempt_no"]) is not int
+            or row["attempt_no"] <= 0
+            or row["attempt_no"] > 4
+            or type(row["endpoint_class"]) is not str
+            or row["endpoint_class"] not in _YOUTUBE_ENDPOINT_CLASSES
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            )
+
+    def _database_path(self) -> Path:
+        rows = tuple(self._conn.execute("PRAGMA database_list"))
+        main_rows = tuple(row for row in rows if row["name"] == "main")
+        if (
+            len(main_rows) != 1
+            or type(main_rows[0]["file"]) is not str
+            or not main_rows[0]["file"]
+        ):
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_STORAGE_FAILED",
+                "YouTube quota reservation requires a file database",
+            )
+        return Path(main_rows[0]["file"])
 
     def create_profile_version(
         self,
