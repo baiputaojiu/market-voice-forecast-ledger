@@ -424,6 +424,24 @@ function Test-PublicSafety {
         Assert-True ($allowedStagedCredentialSource.ExitCode -eq 0) 'staged safety allows only the two credential adapter source files'
         Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('restore', '--staged', '--', 'src/market_voice_forecast_ledger/credentials/__init__.py', 'src/market_voice_forecast_ledger/credentials/windows.py') | Out-Null
 
+        $syntheticLinkTarget = 'C:/private/native/synthetic-link-target'
+        $syntheticLinkPayloadPath = Join-Path $stagedSafety 'synthetic-link-payload.txt'
+        [System.IO.File]::WriteAllText($syntheticLinkPayloadPath, $syntheticLinkTarget)
+        $syntheticLinkObjectId = Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('hash-object', '-w', '--', 'synthetic-link-payload.txt')
+        Remove-Item -LiteralPath $syntheticLinkPayloadPath -Force
+        foreach ($credentialSourcePath in @(
+            'src/market_voice_forecast_ledger/credentials/__init__.py',
+            'src/market_voice_forecast_ledger/credentials/windows.py'
+        )) {
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('update-index', '--add', '--cacheinfo', "120000,$syntheticLinkObjectId,$credentialSourcePath") | Out-Null
+            $stagedCredentialSymlink = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
+            Assert-True ($stagedCredentialSymlink.ExitCode -eq 1) "staged safety rejects a symlink-mode credential source at $credentialSourcePath"
+            Assert-True ($stagedCredentialSymlink.Output -match [regex]::Escape("VIOLATION: Credential source must be a regular file: $credentialSourcePath")) "staged credential symlink uses a stable safe diagnostic at $credentialSourcePath"
+            Assert-True ($stagedCredentialSymlink.Output -notmatch [regex]::Escape($syntheticLinkTarget)) "staged credential symlink does not print its target at $credentialSourcePath"
+            Assert-True ($stagedCredentialSymlink.Output -notmatch [regex]::Escape($syntheticLinkObjectId)) "staged credential symlink does not print its object ID at $credentialSourcePath"
+            Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('update-index', '--force-remove', '--', $credentialSourcePath) | Out-Null
+        }
+
         Set-Content -LiteralPath (Join-Path $stagedCredentialSource 'windows.py') -Encoding ASCII -Value $secretFixture
         Invoke-Git -WorkingDirectory $stagedSafety -Arguments @('add', '-f', '--', 'src/market_voice_forecast_ledger/credentials/windows.py') | Out-Null
         $secretStagedCredentialSource = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $stagedSafety, '-Mode', 'Staged')
@@ -458,6 +476,32 @@ function Test-PublicSafety {
         Set-Content -LiteralPath (Join-Path $workingCredentialSource 'windows.py') -Encoding ASCII -Value 'class WindowsCredentialManager: pass'
         $allowedWorkingCredentialSource = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
         Assert-True ($allowedWorkingCredentialSource.ExitCode -eq 0) 'working-tree safety allows only the two credential adapter source files'
+
+        $workingCredentialLink = Join-Path $workingCredentialSource 'windows.py'
+        $workingCredentialTarget = Join-Path $testRoot 'synthetic-private-credential-target.txt'
+        Set-Content -LiteralPath $workingCredentialTarget -Encoding ASCII -Value $secretFixture
+        Remove-Item -LiteralPath $workingCredentialLink -Force
+        $workingCredentialSymlinkCreated = $false
+        try {
+            New-Item -ItemType SymbolicLink -Path $workingCredentialLink -Target $workingCredentialTarget -ErrorAction Stop | Out-Null
+            $workingCredentialSymlinkCreated = $true
+        }
+        catch {
+            Write-Host "SKIP: working-tree credential symlink creation unavailable: $($_.Exception.GetType().Name)"
+        }
+        if ($workingCredentialSymlinkCreated) {
+            try {
+                $workingCredentialSymlink = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')
+                Assert-True ($workingCredentialSymlink.ExitCode -eq 1) 'working-tree safety rejects an allowlisted credential symlink'
+                Assert-True ($workingCredentialSymlink.Output -match [regex]::Escape('VIOLATION: Credential source must be a regular file: src/market_voice_forecast_ledger/credentials/windows.py')) 'working-tree credential symlink uses a stable safe diagnostic'
+                Assert-True ($workingCredentialSymlink.Output -notmatch 'Possible secret detected') 'working-tree credential symlink is rejected before target content is read'
+                Assert-True ($workingCredentialSymlink.Output -notmatch [regex]::Escape((Split-Path -Leaf $workingCredentialTarget))) 'working-tree credential symlink does not print its target'
+            }
+            finally {
+                Remove-Item -LiteralPath $workingCredentialLink -Force
+            }
+        }
+        Set-Content -LiteralPath $workingCredentialLink -Encoding ASCII -Value 'class WindowsCredentialManager: pass'
 
         Set-Content -LiteralPath (Join-Path $workingCredentialSource 'extra.py') -Encoding ASCII -Value 'safe but unapproved source'
         $extraWorkingCredentialSource = Invoke-ScriptProcess -ScriptPath $safetyScript -Arguments @('-Path', $workingTreeSafety, '-Mode', 'WorkingTree')

@@ -282,7 +282,12 @@ foreach ($relativePath in $relativeFiles) {
             $violations.Add("Unable to inspect staged file content: $normalized")
             continue
         }
-        $bytes = Read-StagedBlob -ObjectId $stagedIndexEntries[$relativePath].ObjectId
+        $stagedEntry = $stagedIndexEntries[$relativePath]
+        if ($isAllowedCredentialSource -and $stagedEntry.Mode -cne '100644') {
+            $violations.Add("Credential source must be a regular file: $normalized")
+            continue
+        }
+        $bytes = Read-StagedBlob -ObjectId $stagedEntry.ObjectId
         if ($null -eq $bytes) {
             $violations.Add("Unable to inspect staged file content: $normalized")
             continue
@@ -315,10 +320,25 @@ foreach ($relativePath in $relativeFiles) {
     }
 
     $fullPath = Join-Path $scanRoot ($relativePath -replace '/', [System.IO.Path]::DirectorySeparatorChar)
-    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+    try {
+        $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
         continue
     }
-    $item = Get-Item -LiteralPath $fullPath
+    catch {
+        $violations.Add("Unable to inspect file content: $normalized")
+        continue
+    }
+    $isRegularFile = $item -is [System.IO.FileInfo]
+    $isReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($isAllowedCredentialSource -and (-not $isRegularFile -or $isReparsePoint)) {
+        $violations.Add("Credential source must be a regular file: $normalized")
+        continue
+    }
+    if (-not $isRegularFile) {
+        continue
+    }
     if ($item.Length -gt $MaxFileBytes) {
         $violations.Add("File exceeds $MaxFileBytes bytes: $normalized ($($item.Length) bytes)")
         continue
