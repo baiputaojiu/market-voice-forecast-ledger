@@ -1,33 +1,6 @@
 from enum import StrEnum
 
 
-class SubjectKind(StrEnum):
-    PERSON = "person"
-    ORGANIZATION = "organization"
-
-
-class PolicyKind(StrEnum):
-    ALL_CHANNELS = "all_channels"
-    FIXED_CHANNEL = "fixed_channel"
-
-
-class ConfigurationStatus(StrEnum):
-    CONFIGURED = "configured"
-    CONFIGURATION_REQUIRED = "configuration_required"
-
-
-class DiscoveryMethod(StrEnum):
-    AUTO_SEARCH = "auto_search"
-    MANUAL_URL = "manual_url"
-
-
-class EligibilityStatus(StrEnum):
-    ELIGIBLE = "eligible"
-    CHANNEL_OUT_OF_SCOPE = "channel_out_of_scope"
-    CONFIGURATION_REQUIRED = "configuration_required"
-    CHANNEL_UNRESOLVED = "channel_unresolved"
-
-
 class AssignmentKind(StrEnum):
     SUBJECT = "subject"
     INTERVIEWER = "interviewer"
@@ -37,12 +10,12 @@ class AssignmentKind(StrEnum):
 class AssignmentOrigin(StrEnum):
     AUTO_VOICE = "auto_voice"
     MANUAL = "manual"
-    CHANNEL_ORGANIZATION = "channel_organization"
 
 
 class JobKind(StrEnum):
     VIDEO_PIPELINE = "video_pipeline"
     ANALYSIS_SCOPE = "analysis_scope"
+    YOUTUBE_SYNC = "youtube_sync"
 
 
 class JobStage(StrEnum):

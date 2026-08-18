@@ -250,26 +250,6 @@ def test_job_read_rejects_incoherent_header_and_unit_state(
     assert response.json() == {"error": "INTERNAL_ERROR"}
 
 
-def test_subject_read_revalidates_the_sealed_policy(
-    client: TestClient, settings: Settings
-):
-    conn = open_database(settings.database_path)
-    try:
-        conn.execute(
-            "UPDATE subject_channel_policies SET policy_hash=? "
-            "WHERE subject_id=(SELECT MIN(id) FROM analysis_subjects)",
-            ("0" * 64,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    response = client.get("/api/subjects")
-
-    assert response.status_code == 500
-    assert response.json() == {"error": "INTERNAL_ERROR"}
-
-
 @pytest.mark.parametrize(
     "path",
     (

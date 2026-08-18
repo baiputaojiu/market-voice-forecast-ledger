@@ -13,7 +13,6 @@ from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     Confidence,
     MappingKind,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -101,7 +100,6 @@ def _prepare_run(
         ...,
     ],
     *,
-    subject_kind: SubjectKind = SubjectKind.PERSON,
     hint_expression: str | None = None,
 ):
     texts = tuple(spec[0] for spec in specs)
@@ -125,7 +123,6 @@ def _prepare_run(
         db,
         texts,
         statements,
-        subject_kind=subject_kind,
     )
     StatementService(db).normalize_and_store(prepared.run_id)
     jobs = JobStateService(db)
@@ -134,8 +131,8 @@ def _prepare_run(
     return prepared
 
 
-def _prepare_and_map(db, specs, *, subject_kind=SubjectKind.PERSON):
-    prepared = _prepare_run(db, specs, subject_kind=subject_kind)
+def _prepare_and_map(db, specs):
+    prepared = _prepare_run(db, specs)
     JobStateService(db).begin_unit(
         prepared.job_id, ASSET_MAPPING_UNIT_KEY
     )
@@ -162,7 +159,6 @@ def _prepare_personal_interviewer_mapping_run(
     subject_id = _create_subject(
         db,
         "Synthetic Interviewer Mapping Person",
-        SubjectKind.PERSON,
         channel_index=72,
     )
     video_id, segment_ids = _add_video_with_segments(

@@ -6,13 +6,13 @@ from typing import Final
 
 from market_voice_forecast_ledger.domain.common import canonical_json, utc_iso
 from market_voice_forecast_ledger.domain.enums import (
-    EligibilityStatus,
     JobKind,
     JobStage,
     JobStatus,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.domain.discovery import PresenceState
 from market_voice_forecast_ledger.domain.jobs import JobManifest, JobUnit
 
 
@@ -142,7 +142,7 @@ class JobRepository:
         )
 
     def create_sealed_video_pipeline_bindings(
-        self, job_id: int, eligibility_ids: tuple[int, ...]
+        self, job_id: int, candidate_ids: tuple[int, ...]
     ) -> None:
         self._require_transaction()
         self._conn.execute(
@@ -151,14 +151,14 @@ class JobRepository:
                 job_id, expected_binding_count, is_sealed
             ) VALUES (?, ?, 0)
             """,
-            (job_id, len(eligibility_ids)),
+            (job_id, len(candidate_ids)),
         )
         self._conn.executemany(
             """
-            INSERT INTO video_pipeline_job_bindings(job_id, eligibility_id)
+            INSERT INTO video_pipeline_job_bindings(job_id, candidate_id)
             VALUES (?, ?)
             """,
-            ((job_id, eligibility_id) for eligibility_id in eligibility_ids),
+            ((job_id, candidate_id) for candidate_id in candidate_ids),
         )
         cursor = self._conn.execute(
             """
@@ -175,10 +175,10 @@ class JobRepository:
         self, source_job_id: int, successor_job_id: int
     ) -> None:
         self._require_transaction()
-        eligibility_ids = self.list_video_pipeline_binding_ids(source_job_id)
-        if eligibility_ids:
+        candidate_ids = self.list_video_pipeline_binding_ids(source_job_id)
+        if candidate_ids:
             self.create_sealed_video_pipeline_bindings(
-                successor_job_id, eligibility_ids
+                successor_job_id, candidate_ids
             )
 
     def list_video_pipeline_binding_ids(self, job_id: int) -> tuple[int, ...]:
@@ -194,10 +194,10 @@ class JobRepository:
                     WHERE member.job_id=binding_set.job_id
                 ) AS member_count,
                 (
-                    SELECT COUNT(DISTINCT eligibility.video_id)
+                    SELECT COUNT(DISTINCT candidate.video_id)
                     FROM video_pipeline_job_bindings AS member
-                    JOIN subject_video_eligibility AS eligibility
-                        ON eligibility.id=member.eligibility_id
+                    JOIN subject_video_candidates AS candidate
+                        ON candidate.id=member.candidate_id
                     WHERE member.job_id=binding_set.job_id
                 ) AS video_count
             FROM video_pipeline_job_binding_sets AS binding_set
@@ -222,37 +222,36 @@ class JobRepository:
             )
         rows = self._conn.execute(
             """
-            SELECT eligibility_id
+            SELECT candidate_id
             FROM video_pipeline_job_bindings
             WHERE job_id=?
-            ORDER BY eligibility_id
+            ORDER BY candidate_id
             """,
             (job_id,),
         ).fetchall()
-        return tuple(row["eligibility_id"] for row in rows)
+        return tuple(row["candidate_id"] for row in rows)
 
-    def has_current_eligible_video_binding(self, job_id: int) -> bool:
+    def has_current_runnable_video_binding(self, job_id: int) -> bool:
         if not self.list_video_pipeline_binding_ids(job_id):
             return False
         return self._conn.execute(
             """
             SELECT 1
             FROM video_pipeline_job_bindings AS binding
-            JOIN subject_video_eligibility AS eligibility
-                ON eligibility.id=binding.eligibility_id
-            JOIN subject_channel_policies AS policy
-                ON policy.id=eligibility.policy_id
-                AND policy.subject_id=eligibility.subject_id
-                AND policy.policy_hash=eligibility.policy_hash
+            JOIN subject_video_candidates AS candidate
+                ON candidate.id=binding.candidate_id
+            JOIN presence_decisions AS decision
+                ON decision.id=candidate.current_presence_decision_id
+                AND decision.candidate_id=candidate.id
             WHERE binding.job_id=?
-                AND eligibility.status=?
+                AND decision.state<>?
             LIMIT 1
             """,
-            (job_id, EligibilityStatus.ELIGIBLE.value),
+            (job_id, PresenceState.REJECTED.value),
         ).fetchone() is not None
 
-    def list_video_job_ids_for_eligibility(
-        self, eligibility_id: int
+    def list_video_job_ids_for_candidate(
+        self, candidate_id: int
     ) -> tuple[int, ...]:
         rows = self._conn.execute(
             """
@@ -261,7 +260,7 @@ class JobRepository:
             JOIN video_pipeline_job_binding_sets AS binding_set
                 ON binding_set.job_id=binding.job_id
             JOIN jobs AS job ON job.id=binding.job_id
-            WHERE binding.eligibility_id=?
+            WHERE binding.candidate_id=?
                 AND job.job_kind=?
                 AND binding_set.is_sealed=1
                 AND binding_set.expected_binding_count=(
@@ -271,7 +270,7 @@ class JobRepository:
                 )
             ORDER BY binding.job_id
             """,
-            (eligibility_id, JobKind.VIDEO_PIPELINE.value),
+            (candidate_id, JobKind.VIDEO_PIPELINE.value),
         ).fetchall()
         return tuple(row["job_id"] for row in rows)
 

@@ -20,11 +20,9 @@ from market_voice_forecast_ledger.domain.common import (
 )
 from market_voice_forecast_ledger.domain.enums import (
     AnalysisRunStatus,
-    ConfigurationStatus,
     JobKind,
     JobStage,
     JobStatus,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -43,10 +41,8 @@ from market_voice_forecast_ledger.domain.jobs import (
 from market_voice_forecast_ledger.domain.mappings import (
     expression_market_codes,
 )
-from market_voice_forecast_ledger.domain.sources import ChannelPolicy
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.repositories.jobs import JobRepository, StoredJob
-from market_voice_forecast_ledger.repositories.sources import SourceRepository
 from market_voice_forecast_ledger.services.job_state import JobStateService
 
 
@@ -100,7 +96,6 @@ class AnalysisRunService:
         self._conn = conn
         self._analysis = AnalysisRepository(conn)
         self._jobs = JobRepository(conn)
-        self._sources = SourceRepository(conn)
         self._job_state = JobStateService(conn, clock=clock)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -113,6 +108,14 @@ class AnalysisRunService:
         self._require_settings(settings)
         frozen_input = self._build_frozen_input(subject_id, cutoff_day, settings)
         return frozen_input.input_contract_hash
+
+    def preview_input(
+        self, subject_id: int, cutoff_day: date
+    ) -> tuple[SelectedInputSegment, ...]:
+        self._analysis.require_active_subject(subject_id)
+        return self._analysis.select_input_segments(
+            subject_id, cutoff_exclusive_utc(cutoff_day)
+        )
 
     def begin(self, command: BeginAnalysisRun) -> AnalysisRun:
         self._require_settings(command.settings)
@@ -288,17 +291,12 @@ class AnalysisRunService:
         cutoff_day: date,
         settings: AnalysisRunSettings,
     ) -> FrozenAnalysisInput:
-        subject_kind = self._analysis.get_active_subject_kind(subject_id)
-        policy = self._configured_policy(subject_id)
+        self._analysis.require_active_subject(subject_id)
         exclusive = cutoff_exclusive_utc(cutoff_day)
-        segments = self._analysis.select_input_segments(
-            subject_id, exclusive, subject_kind, policy
-        )
+        segments = self._analysis.select_input_segments(subject_id, exclusive)
         interviewer_context = self._interviewer_context_metadata(
             subject_id,
             exclusive,
-            subject_kind,
-            policy,
             segments,
         )
         input_text = canonical_json(
@@ -330,12 +328,9 @@ class AnalysisRunService:
             "cutoff_exclusive_utc": utc_iso(exclusive),
             "input_sha256": input_sha256,
             "interviewer_market_context": interviewer_context,
-            "policy_hash": policy.policy_hash,
-            "policy_id": policy.id,
             "segments": [self._segment_metadata(segment) for segment in segments],
             "settings": settings.contract_metadata(),
             "subject_id": subject_id,
-            "subject_kind": subject_kind.value,
         }
         metadata_json = canonical_json(metadata)
         return FrozenAnalysisInput(
@@ -350,16 +345,12 @@ class AnalysisRunService:
         self,
         subject_id: int,
         cutoff_exclusive: datetime,
-        subject_kind: SubjectKind,
-        policy: ChannelPolicy,
         subject_segments: tuple[SelectedInputSegment, ...],
     ) -> list[dict[str, object]]:
-        if subject_kind is SubjectKind.ORGANIZATION:
-            return []
         subject_video_ids = {segment.video_id for segment in subject_segments}
         context: list[dict[str, object]] = []
         for segment in self._analysis.select_interviewer_context_segments(
-            subject_id, cutoff_exclusive, policy
+            subject_id, cutoff_exclusive
         ):
             if segment.video_id not in subject_video_ids:
                 continue
@@ -385,25 +376,6 @@ class AnalysisRunService:
             )
         return context
 
-    def _configured_policy(self, subject_id: int) -> ChannelPolicy:
-        try:
-            policy = self._sources.get_policy(subject_id)
-        except LookupError as error:
-            raise DomainError(
-                "ANALYSIS_POLICY_NOT_CONFIGURED",
-                "analysis requires a configured current channel policy",
-            ) from error
-        if (
-            policy.configuration_status is not ConfigurationStatus.CONFIGURED
-            or policy.id is None
-            or policy.policy_hash is None
-        ):
-            raise DomainError(
-                "ANALYSIS_POLICY_NOT_CONFIGURED",
-                "analysis requires a configured current channel policy",
-            )
-        return policy
-
     @staticmethod
     def _segment_metadata(segment: SelectedInputSegment) -> dict[str, object]:
         return {
@@ -414,12 +386,15 @@ class AnalysisRunService:
             "assigned_subject_id": segment.assigned_subject_id,
             "channel_display_name": segment.channel_display_name,
             "end_ms": segment.end_ms,
-            "policy_hash": segment.policy_hash,
-            "policy_id": segment.policy_id,
+            "metadata_snapshot_hash": segment.metadata_snapshot_hash,
+            "metadata_snapshot_id": segment.metadata_snapshot_id,
+            "presence_decision_hash": segment.presence_decision_hash,
+            "presence_decision_id": segment.presence_decision_id,
             "published_at": utc_iso(segment.published_at),
             "segment_id": segment.segment_id,
             "segment_no": segment.segment_no,
             "start_ms": segment.start_ms,
+            "speaker_assignment_id": segment.speaker_assignment_id,
             "text_sha256": segment.text_sha256,
             "title": segment.video_title,
             "video_id": segment.video_id,

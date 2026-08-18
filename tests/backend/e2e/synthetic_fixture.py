@@ -25,18 +25,14 @@ from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     ConditionKind,
     Confidence,
-    ConfigurationStatus,
     DirectionKind,
-    DiscoveryMethod,
     ForecastBasis,
     HeatmapGranularity,
     JobKind,
     JobStage,
     MappingReviewDecision,
     PeriodReviewDecision,
-    PolicyKind,
     StatementType,
-    SubjectKind,
     TurningPointKind,
     UnitStatus,
 )
@@ -57,11 +53,6 @@ from market_voice_forecast_ledger.domain.jobs import (
 )
 from market_voice_forecast_ledger.domain.mappings import AssetMapping
 from market_voice_forecast_ledger.domain.periods import NormalizedPeriod
-from market_voice_forecast_ledger.domain.sources import (
-    ChannelPolicy,
-    VideoInput,
-    VideoRecord,
-)
 from market_voice_forecast_ledger.domain.speakers import (
     PersonalAssignmentCommand,
     ScoreRule,
@@ -76,7 +67,6 @@ from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
 from market_voice_forecast_ledger.repositories.sources import SourceRepository
 from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
 from market_voice_forecast_ledger.services.asset_mapping import AssetMappingService
-from market_voice_forecast_ledger.services.channel_policy import ChannelPolicyService
 from market_voice_forecast_ledger.services.codex_contract import (
     CODEX_BATCH_UNIT_KEY,
     AnalysisEnvelope,
@@ -111,6 +101,9 @@ from market_voice_forecast_ledger.services.speaker_assignment import (
     SpeakerAssignmentService,
 )
 from market_voice_forecast_ledger.services.statements import StatementService
+from tests.backend.synthetic_collection_fixture import (
+    create_synthetic_collection_candidate,
+)
 
 
 UTC: Final = timezone.utc
@@ -135,22 +128,18 @@ _SUBJECT_DEFINITIONS: Final = MappingProxyType(
     {
         "personal_japan": (
             "Synthetic Personal Japan",
-            SubjectKind.PERSON,
             1,
         ),
         "organization_us": (
             "Synthetic Organization US",
-            SubjectKind.ORGANIZATION,
             2,
         ),
         "conflict_history": (
             "Synthetic Conflict History",
-            SubjectKind.PERSON,
             3,
         ),
         "review_boundary": (
             "Synthetic Review Boundary",
-            SubjectKind.PERSON,
             4,
         ),
     }
@@ -187,9 +176,15 @@ class SyntheticStatementSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class SyntheticVideo:
+    id: int
+    published_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SyntheticSource:
     label: str
-    video: VideoRecord
+    video: SyntheticVideo
     segment_id: int
     body: str
 
@@ -260,7 +255,7 @@ class SyntheticFlowEvidence:
     api_month: dict[str, object]
     mapping_review_evidence: tuple[MappingReviewEvidence, ...]
     period_review_evidence: tuple[PeriodReviewEvidence, ...]
-    later_source: VideoRecord
+    later_source: SyntheticVideo
     later_segment_id: int
     original_video_id: int
     repost_video_id: int
@@ -290,7 +285,7 @@ class SyntheticFlowEvidence:
         return sum(receipt.tool_call_count for receipt in self.receipts)
 
     @property
-    def input_sources(self) -> tuple[VideoRecord, ...]:
+    def input_sources(self) -> tuple[SyntheticVideo, ...]:
         return tuple(source.video for run in self.runs for source in run.sources)
 
     @property
@@ -506,28 +501,13 @@ def _channel_id(index: int) -> str:
     return f"UC{index:022d}"
 
 
-def _create_subject_and_policy(
+def _create_subject(
     conn: sqlite3.Connection,
     name: str,
-    kind: SubjectKind,
     channel_index: int,
 ) -> int:
-    sources = SourceRepository(conn)
-    subject_id = sources.create_subject(name, kind)
-    if kind is SubjectKind.ORGANIZATION:
-        policy = ChannelPolicy(
-            policy_kind=PolicyKind.FIXED_CHANNEL,
-            configuration_status=ConfigurationStatus.CONFIGURED,
-            youtube_channel_id=_channel_id(channel_index),
-            channel_display_name=f"Synthetic Channel {channel_index}",
-        )
-    else:
-        policy = ChannelPolicy(
-            policy_kind=PolicyKind.ALL_CHANNELS,
-            configuration_status=ConfigurationStatus.CONFIGURED,
-        )
-    sources.create_policy(subject_id, policy)
-    return subject_id
+    del channel_index
+    return SourceRepository(conn).create_subject(name)
 
 
 def _ensure_personal_threshold(conn: sqlite3.Connection) -> None:
@@ -579,7 +559,6 @@ def _create_source(
     conn: sqlite3.Connection,
     *,
     subject_id: int,
-    subject_kind: SubjectKind,
     channel_index: int,
     label: str,
     youtube_video_id: str,
@@ -589,69 +568,28 @@ def _create_source(
     expires_at: datetime | None = None,
     chunk_input_hash: str | None = None,
 ) -> SyntheticSource:
-    sources = SourceRepository(conn)
-    policy = sources.get_policy(subject_id)
-    video_id = sources.upsert_video(
-        VideoInput(
-            youtube_video_id=youtube_video_id,
-            youtube_channel_id=policy.youtube_channel_id or _channel_id(channel_index),
-            channel_display_name=f"Synthetic Channel {channel_index}",
-            title=f"Synthetic Source {youtube_video_id}",
-            published_at=published_at,
-            duration_seconds=12,
-            live_kind="upload",
-        )
-    )
-    decision = ChannelPolicyService(conn).evaluate(
-        subject_id,
-        video_id,
-        DiscoveryMethod.AUTO_SEARCH,
-    )
-    if not decision.may_analyze:
-        raise AssertionError("synthetic source unexpectedly ineligible")
-
-    speakers = SpeakerRepository(conn)
-    chunk_id = speakers.add_chunk(
-        video_id=video_id,
-        chunk_no=0,
-        start_ms=0,
-        end_ms=12_000,
-        input_hash=(
-            chunk_input_hash
-            or f"synthetic-chunk-input-{youtube_video_id}"
-        ),
-        output_hash=f"synthetic-chunk-output-{youtube_video_id}",
-        status=UnitStatus.SUCCESS,
-    )
-    segment_id = speakers.add_segment(
-        video_id=video_id,
-        chunk_id=chunk_id,
-        segment_no=0,
-        start_ms=1_000,
-        end_ms=9_000,
+    del channel_index, chunk_input_hash
+    fixture = create_synthetic_collection_candidate(
+        conn,
+        presence_state="presence_confirmed",
+        assignment_kind="subject",
+        subject_id=subject_id,
+        youtube_video_id=youtube_video_id,
+        published_at=published_at,
         text_body=body,
-        anonymous_speaker_id=f"synthetic-speaker-{youtube_video_id}",
         transcript_created_at=SYNTHETIC_CREATED_AT,
         expires_at=expires_at,
     )
-    if subject_kind is SubjectKind.ORGANIZATION:
-        assigned = SpeakerAssignmentService(
-            conn,
-            clock=_synthetic_clock,
-        ).assign_organization_video(subject_id, video_id)
-        if assigned != (segment_id,):
-            raise AssertionError("organization assignment did not cover source")
-    else:
-        _record_personal_assignment(
-            conn,
-            subject_id,
-            segment_id,
-            assignment_kind,
-        )
+    _record_personal_assignment(
+        conn,
+        subject_id,
+        fixture.segment_id,
+        assignment_kind,
+    )
     return SyntheticSource(
         label=label,
-        video=sources.get_video(video_id),
-        segment_id=segment_id,
+        video=SyntheticVideo(fixture.video_id, published_at),
+        segment_id=fixture.segment_id,
         body=body,
     )
 
@@ -848,7 +786,6 @@ def _create_and_execute_subject(
     *,
     role: str,
     subject_id: int,
-    subject_kind: SubjectKind,
     channel_index: int,
     cutoff_day: date,
     specs: tuple[SyntheticStatementSpec, ...],
@@ -858,7 +795,6 @@ def _create_and_execute_subject(
         _create_source(
             conn,
             subject_id=subject_id,
-            subject_kind=subject_kind,
             channel_index=channel_index,
             label=spec.label,
             youtube_video_id=spec.youtube_video_id,
@@ -1113,11 +1049,10 @@ class SyntheticLedgerFixture:
         self._conn = open_database(self.settings.database_path)
         apply_migrations(self._conn)
         for role in self.subject_order:
-            name, kind, channel_index = _SUBJECT_DEFINITIONS[role]
-            self._subject_ids[role] = _create_subject_and_policy(
+            name, channel_index = _SUBJECT_DEFINITIONS[role]
+            self._subject_ids[role] = _create_subject(
                 self._conn,
                 name,
-                kind,
                 channel_index,
             )
         return self
@@ -1142,7 +1077,7 @@ class SyntheticLedgerFixture:
         later_source: SyntheticSource | None = None
 
         for role in self.subject_order:
-            name, subject_kind, channel_index = _SUBJECT_DEFINITIONS[role]
+            name, channel_index = _SUBJECT_DEFINITIONS[role]
             subject_id = self._subject_ids[role]
             specs = _e2e_specs(role)
             if role == "personal_japan":
@@ -1150,7 +1085,6 @@ class SyntheticLedgerFixture:
                     _create_source(
                         conn,
                         subject_id=subject_id,
-                        subject_kind=subject_kind,
                         channel_index=channel_index,
                         label=spec.label,
                         youtube_video_id=spec.youtube_video_id,
@@ -1162,7 +1096,6 @@ class SyntheticLedgerFixture:
                 later_source = _create_source(
                     conn,
                     subject_id=subject_id,
-                    subject_kind=subject_kind,
                     channel_index=channel_index,
                     label="post-cutoff",
                     youtube_video_id="synjp999999",
@@ -1182,7 +1115,6 @@ class SyntheticLedgerFixture:
                     conn,
                     role=role,
                     subject_id=subject_id,
-                    subject_kind=subject_kind,
                     channel_index=channel_index,
                     cutoff_day=SYNTHETIC_CUTOFF,
                     specs=specs,
@@ -1323,17 +1255,15 @@ def create_accepted_low_mapping_fixture(
         0 <= additional_active_subjects <= 3
     ):
         raise ValueError("additional_active_subjects must be from zero to three")
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Low Mapping Subject",
-        SubjectKind.PERSON,
         81,
     )
     for ordinal in range(additional_active_subjects):
-        _create_subject_and_policy(
+        _create_subject(
             conn,
             f"Synthetic Empty Heatmap Subject {ordinal + 1}",
-            SubjectKind.PERSON,
             90 + ordinal,
         )
     spec = SyntheticStatementSpec(
@@ -1354,7 +1284,6 @@ def create_accepted_low_mapping_fixture(
         conn,
         role="accepted-low-mapping",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=81,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(spec,),
@@ -1368,10 +1297,9 @@ def create_accepted_unknown_period_fixture(
     conn: sqlite3.Connection,
     label: str = "unknown-review",
 ) -> tuple[PreparedSyntheticRun, ForecastProjectionBatch, int]:
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Unknown Period Subject",
-        SubjectKind.PERSON,
         82,
     )
     spec = SyntheticStatementSpec(
@@ -1389,7 +1317,6 @@ def create_accepted_unknown_period_fixture(
         conn,
         role="accepted-unknown-period",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=82,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(spec,),
@@ -1418,26 +1345,22 @@ def create_speaker_correction_fixture(
     initial_kind: AssignmentKind = AssignmentKind.SUBJECT,
 ) -> SpeakerFixture:
     sources = SourceRepository(conn)
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Corrected Person",
-        SubjectKind.PERSON,
         100,
     )
     wrong_subject_id = sources.create_subject(
         "Synthetic Unrelated Person",
-        SubjectKind.PERSON,
     )
     inactive_subject_id = sources.create_subject(
         "Synthetic Inactive Person",
-        SubjectKind.PERSON,
     )
     _deactivate_negative_control_subject(conn, inactive_subject_id)
 
     source = _create_source(
         conn,
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=100,
         label="speaker-correction",
         youtube_video_id="synspk00001",
@@ -1486,10 +1409,9 @@ def create_retained_forecast_fixture(
     conn: sqlite3.Connection,
     tmp_path: Path,
 ) -> RetainedForecastFixture:
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Retention Subject",
-        SubjectKind.PERSON,
         83,
     )
     source_body = (
@@ -1509,7 +1431,6 @@ def create_retained_forecast_fixture(
         conn,
         role="retained-forecast",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=83,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(spec,),
@@ -1534,17 +1455,15 @@ def create_retained_forecast_fixture(
 def create_crash_promotion_fixture(
     conn: sqlite3.Connection,
 ) -> CrashPromotionFixture:
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Crash Recovery Subject",
-        SubjectKind.PERSON,
         84,
     )
     old_run = _create_and_execute_subject(
         conn,
         role="crash-old-current",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=84,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(
@@ -1563,7 +1482,6 @@ def create_crash_promotion_fixture(
         conn,
         role="crash-pending-current",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=84,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(

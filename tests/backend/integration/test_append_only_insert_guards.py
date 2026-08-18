@@ -27,16 +27,16 @@ def _video_manifest() -> JobManifest:
     )
 
 
-def test_migration_runner_records_0017_once_and_remains_idempotent(tmp_path):
+def test_migration_runner_records_0018_once_and_remains_idempotent(tmp_path):
     conn = open_database(tmp_path / "runner.sqlite3")
     try:
         first = apply_migrations(conn)
         second = apply_migrations(conn)
-        assert first[-1] == "0017_append_only_guards"
+        assert first[-1] == "0018_youtube_discovery_cutover"
         assert second == ()
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "
-            "WHERE name='0017_append_only_guards'"
+            "WHERE name='0018_youtube_discovery_cutover'"
         ).fetchone()[0] == 1
     finally:
         conn.close()
@@ -65,12 +65,11 @@ def populated_database(tmp_path_factory) -> Path:
             """,
             (subject_id, threshold),
         )
-        eligibility_id = conn.execute(
-            "SELECT id FROM subject_video_eligibility "
-            "WHERE status='eligible' ORDER BY id LIMIT 1"
+        candidate_id = conn.execute(
+            "SELECT id FROM subject_video_candidates ORDER BY id LIMIT 1"
         ).fetchone()[0]
         JobStateService(conn).create_video_pipeline(
-            _video_manifest(), (eligibility_id,)
+            _video_manifest(), (candidate_id,)
         )
         conn.execute(
             """
@@ -128,10 +127,10 @@ def populated_database(tmp_path_factory) -> Path:
         )
         conn.execute(
             """
-            INSERT INTO video_pipeline_job_bindings(job_id, eligibility_id)
+            INSERT INTO video_pipeline_job_bindings(job_id, candidate_id)
             VALUES (900103, ?)
             """,
-            (eligibility_id,),
+            (candidate_id,),
         )
         database_path = fixture.settings.database_path
     return database_path

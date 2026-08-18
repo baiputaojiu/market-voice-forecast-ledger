@@ -4,7 +4,7 @@ import pytest
 
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
-from market_voice_forecast_ledger.domain.enums import AssignmentKind, SubjectKind
+from market_voice_forecast_ledger.domain.enums import AssignmentKind
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from tests.backend.integration.test_analysis_input_boundaries import (
     _add_video_with_segments,
@@ -31,7 +31,7 @@ def db(tmp_path):
 
 def _subject_with_two_publication_days(db, *, name: str, channel_index: int):
     subject_id = _create_subject(
-        db, name, SubjectKind.PERSON, channel_index=channel_index
+        db, name, channel_index=channel_index
     )
     _, first_segments = _add_video_with_segments(
         db,

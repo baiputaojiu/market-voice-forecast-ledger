@@ -44,6 +44,7 @@ EXPECTED_MIGRATIONS = (
     "0015_retention",
     "0016_scope_generations",
     "0017_append_only_guards",
+    "0018_youtube_discovery_cutover",
 )
 
 

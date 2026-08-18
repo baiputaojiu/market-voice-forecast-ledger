@@ -14,17 +14,19 @@ from market_voice_forecast_ledger.domain.analysis import (
     SelectedInputSegment,
 )
 from market_voice_forecast_ledger.domain.common import utc_iso
+from market_voice_forecast_ledger.domain.discovery import (
+    CanonicalVideoMetadata,
+    LiveState,
+    PresenceOrigin,
+    PresenceState,
+    canonical_presence_decision_hash,
+)
 from market_voice_forecast_ledger.domain.enums import (
     AnalysisRunStatus,
     AssignmentKind,
-    AssignmentOrigin,
-    EligibilityStatus,
-    PolicyKind,
     ScopeStatus,
-    SubjectKind,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
-from market_voice_forecast_ledger.domain.sources import ChannelPolicy
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
@@ -36,10 +38,10 @@ class AnalysisRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def get_active_subject_kind(self, subject_id: int) -> SubjectKind:
+    def require_active_subject(self, subject_id: int) -> None:
         row = self._conn.execute(
             """
-            SELECT subject_kind
+            SELECT 1
             FROM analysis_subjects
             WHERE id=? AND is_active=1
             """,
@@ -50,91 +52,82 @@ class AnalysisRepository:
                 "ANALYSIS_SUBJECT_NOT_ELIGIBLE",
                 "analysis requires an active subject",
             )
-        return SubjectKind(row["subject_kind"])
 
     def select_input_segments(
         self,
         subject_id: int,
         cutoff_exclusive: datetime,
-        subject_kind: SubjectKind,
-        policy: ChannelPolicy,
     ) -> tuple[SelectedInputSegment, ...]:
-        assignment_origin = (
-            AssignmentOrigin.CHANNEL_ORGANIZATION.value
-            if subject_kind is SubjectKind.ORGANIZATION
-            else None
-        )
         rows = self._conn.execute(
             """
             SELECT
                 segment.id AS segment_id,
                 video.id AS video_id,
                 video.youtube_video_id,
-                video.title AS video_title,
-                video.youtube_channel_id,
-                video.channel_display_name,
-                video.published_at,
+                metadata.title AS video_title,
+                metadata.channel_id AS youtube_channel_id,
+                metadata.channel_title AS channel_display_name,
+                metadata.published_at,
                 segment.segment_no,
                 segment.start_ms,
                 segment.end_ms,
                 segment.text_body,
                 segment.text_sha256,
-                eligibility.policy_id,
-                eligibility.policy_hash,
+                metadata.id AS metadata_snapshot_id,
+                metadata.canonical_hash AS metadata_snapshot_hash,
+                metadata.youtube_video_id AS metadata_youtube_video_id,
+                metadata.description AS metadata_description,
+                metadata.duration_seconds AS metadata_duration_seconds,
+                metadata.live_state AS metadata_live_state,
+                metadata.actual_start_time AS metadata_actual_start_time,
+                metadata.schema_version AS metadata_schema_version,
+                metadata.fetched_at AS metadata_fetched_at,
+                presence.id AS presence_decision_id,
+                candidate.id AS presence_candidate_id,
+                presence.state AS presence_state,
+                presence.decision_origin,
+                presence.evidence_ref AS presence_evidence_ref,
+                presence.evidence_hash AS presence_evidence_hash,
+                presence.decision_hash AS presence_decision_hash,
+                presence.created_at AS presence_created_at,
+                assignment.id AS speaker_assignment_id,
                 assignment.assignment_kind,
                 assignment.assignment_origin,
                 assignment.assigned_subject_id,
                 assignment.assigned_at AS assignment_updated_at,
                 assignment.evidence_hash AS assignment_evidence_hash
             FROM analysis_subjects AS subject
-            JOIN subject_video_eligibility AS eligibility
-                ON eligibility.subject_id = subject.id
-                AND eligibility.policy_id = ?
-                AND eligibility.policy_hash = ?
-                AND eligibility.status = ?
-            JOIN videos AS video ON video.id = eligibility.video_id
+            JOIN discovery_profiles AS profile
+                ON profile.subject_id=subject.id AND profile.is_active=1
+            JOIN subject_video_candidates AS candidate
+                ON candidate.profile_id=profile.id
+            JOIN presence_decisions AS presence
+                ON presence.id=candidate.current_presence_decision_id
+                AND presence.candidate_id=candidate.id
+                AND presence.state=?
+            JOIN videos AS video ON video.id=candidate.video_id
+            JOIN video_metadata_snapshots AS metadata
+                ON metadata.id=video.current_metadata_snapshot_id
+                AND metadata.video_id=video.id
             JOIN transcript_segments AS segment ON segment.video_id = video.id
             JOIN speaker_assignments AS assignment
                 ON assignment.segment_id = segment.id
             WHERE subject.id = ?
                 AND subject.is_active = 1
-                AND subject.subject_kind = ?
-                AND (
-                    ? = ?
-                    OR (
-                        ? = ?
-                        AND video.youtube_channel_id = ?
-                    )
-                )
-                AND video.published_at < ?
+                AND metadata.published_at < ?
                 AND segment.text_body IS NOT NULL
                 AND assignment.assignment_kind = ?
                 AND assignment.assigned_subject_id = subject.id
-                AND (
-                    (? IS NULL AND assignment.assignment_origin != ?)
-                    OR assignment.assignment_origin = ?
-                )
             ORDER BY
-                video.published_at,
+                metadata.published_at,
                 video.youtube_video_id,
                 segment.segment_no
             """,
             (
-                policy.id,
-                policy.policy_hash,
-                EligibilityStatus.ELIGIBLE.value,
+                PresenceState.CONFIRMED.value,
                 subject_id,
-                subject_kind.value,
-                policy.policy_kind.value,
-                PolicyKind.ALL_CHANNELS.value,
-                policy.policy_kind.value,
-                PolicyKind.FIXED_CHANNEL.value,
-                policy.youtube_channel_id,
                 utc_iso(cutoff_exclusive),
                 AssignmentKind.SUBJECT.value,
-                assignment_origin,
-                AssignmentOrigin.CHANNEL_ORGANIZATION.value,
-                assignment_origin,
             ),
         ).fetchall()
         return tuple(_selected_segment_from_row(row) for row in rows)
@@ -143,7 +136,6 @@ class AnalysisRepository:
         self,
         subject_id: int,
         cutoff_exclusive: datetime,
-        policy: ChannelPolicy,
     ) -> tuple[SelectedInputSegment, ...]:
         rows = self._conn.execute(
             """
@@ -151,66 +143,70 @@ class AnalysisRepository:
                 segment.id AS segment_id,
                 video.id AS video_id,
                 video.youtube_video_id,
-                video.title AS video_title,
-                video.youtube_channel_id,
-                video.channel_display_name,
-                video.published_at,
+                metadata.title AS video_title,
+                metadata.channel_id AS youtube_channel_id,
+                metadata.channel_title AS channel_display_name,
+                metadata.published_at,
                 segment.segment_no,
                 segment.start_ms,
                 segment.end_ms,
                 segment.text_body,
                 segment.text_sha256,
-                eligibility.policy_id,
-                eligibility.policy_hash,
+                metadata.id AS metadata_snapshot_id,
+                metadata.canonical_hash AS metadata_snapshot_hash,
+                metadata.youtube_video_id AS metadata_youtube_video_id,
+                metadata.description AS metadata_description,
+                metadata.duration_seconds AS metadata_duration_seconds,
+                metadata.live_state AS metadata_live_state,
+                metadata.actual_start_time AS metadata_actual_start_time,
+                metadata.schema_version AS metadata_schema_version,
+                metadata.fetched_at AS metadata_fetched_at,
+                presence.id AS presence_decision_id,
+                candidate.id AS presence_candidate_id,
+                presence.state AS presence_state,
+                presence.decision_origin,
+                presence.evidence_ref AS presence_evidence_ref,
+                presence.evidence_hash AS presence_evidence_hash,
+                presence.decision_hash AS presence_decision_hash,
+                presence.created_at AS presence_created_at,
+                assignment.id AS speaker_assignment_id,
                 assignment.assignment_kind,
                 assignment.assignment_origin,
                 assignment.assigned_subject_id,
                 assignment.assigned_at AS assignment_updated_at,
                 assignment.evidence_hash AS assignment_evidence_hash
             FROM analysis_subjects AS subject
-            JOIN subject_video_eligibility AS eligibility
-                ON eligibility.subject_id = subject.id
-                AND eligibility.policy_id = ?
-                AND eligibility.policy_hash = ?
-                AND eligibility.status = ?
-            JOIN videos AS video ON video.id = eligibility.video_id
+            JOIN discovery_profiles AS profile
+                ON profile.subject_id=subject.id AND profile.is_active=1
+            JOIN subject_video_candidates AS candidate
+                ON candidate.profile_id=profile.id
+            JOIN presence_decisions AS presence
+                ON presence.id=candidate.current_presence_decision_id
+                AND presence.candidate_id=candidate.id
+                AND presence.state=?
+            JOIN videos AS video ON video.id=candidate.video_id
+            JOIN video_metadata_snapshots AS metadata
+                ON metadata.id=video.current_metadata_snapshot_id
+                AND metadata.video_id=video.id
             JOIN transcript_segments AS segment ON segment.video_id = video.id
             JOIN speaker_assignments AS assignment
                 ON assignment.segment_id = segment.id
             WHERE subject.id = ?
                 AND subject.is_active = 1
-                AND subject.subject_kind = ?
-                AND (
-                    ? = ?
-                    OR (
-                        ? = ?
-                        AND video.youtube_channel_id = ?
-                    )
-                )
-                AND video.published_at < ?
+                AND metadata.published_at < ?
                 AND segment.text_body IS NOT NULL
                 AND assignment.assignment_kind = ?
                 AND assignment.assigned_subject_id IS NULL
-                AND assignment.assignment_origin != ?
             ORDER BY
-                video.published_at,
+                metadata.published_at,
                 video.youtube_video_id,
                 segment.segment_no
             """,
             (
-                policy.id,
-                policy.policy_hash,
-                EligibilityStatus.ELIGIBLE.value,
+                PresenceState.CONFIRMED.value,
                 subject_id,
-                SubjectKind.PERSON.value,
-                policy.policy_kind.value,
-                PolicyKind.ALL_CHANNELS.value,
-                policy.policy_kind.value,
-                PolicyKind.FIXED_CHANNEL.value,
-                policy.youtube_channel_id,
                 utc_iso(cutoff_exclusive),
                 AssignmentKind.INTERVIEWER.value,
-                AssignmentOrigin.CHANNEL_ORGANIZATION.value,
             ),
         ).fetchall()
         return tuple(_selected_segment_from_row(row) for row in rows)
@@ -361,13 +357,16 @@ class AnalysisRepository:
                 ordinal,
                 video_id,
                 published_at,
-                policy_id,
-                policy_hash,
+                metadata_snapshot_id,
+                metadata_snapshot_hash,
+                presence_decision_id,
+                presence_decision_hash,
+                speaker_assignment_id,
                 assignment_kind,
                 assigned_subject_id,
                 assignment_updated_at,
                 assignment_evidence_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -376,8 +375,11 @@ class AnalysisRepository:
                     ordinal,
                     segment.video_id,
                     utc_iso(segment.published_at),
-                    segment.policy_id,
-                    segment.policy_hash,
+                    segment.metadata_snapshot_id,
+                    segment.metadata_snapshot_hash,
+                    segment.presence_decision_id,
+                    segment.presence_decision_hash,
+                    segment.speaker_assignment_id,
                     segment.assignment_kind.value,
                     segment.assigned_subject_id,
                     utc_iso(segment.assignment_updated_at),
@@ -726,20 +728,6 @@ class AnalysisRepository:
         )
         return self.mark_scope_ids_stale(scope_ids, reason)
 
-    def mark_scopes_using_policy_stale(
-        self, policy_id: int, reason: str
-    ) -> tuple[int, ...]:
-        self._validate_stale_input(policy_id, reason)
-        self._require_transaction()
-        row = self._conn.execute(
-            "SELECT subject_id FROM subject_channel_policies WHERE id=?",
-            (policy_id,),
-        ).fetchone()
-        scope_ids = () if row is None else self.scope_ids_for_subject(
-            row["subject_id"]
-        )
-        return self.mark_scope_ids_stale(scope_ids, reason)
-
     @staticmethod
     def _validate_stale_input(identifier: int, reason: str) -> None:
         if (
@@ -762,6 +750,37 @@ class AnalysisRepository:
 
 
 def _selected_segment_from_row(row: sqlite3.Row) -> SelectedInputSegment:
+    metadata = CanonicalVideoMetadata.build(
+        youtube_video_id=row["metadata_youtube_video_id"],
+        channel_id=row["youtube_channel_id"],
+        channel_title=row["channel_display_name"],
+        title=row["video_title"],
+        description=row["metadata_description"],
+        published_at=_parse_utc(row["published_at"]),
+        duration_seconds=row["metadata_duration_seconds"],
+        live_state=LiveState(row["metadata_live_state"]),
+        actual_start_time=_parse_optional_utc(row["metadata_actual_start_time"]),
+        schema_version=row["metadata_schema_version"],
+        fetched_at=_parse_utc(row["metadata_fetched_at"]),
+    )
+    if metadata.canonical_hash != row["metadata_snapshot_hash"]:
+        raise DomainError(
+            "STORED_METADATA_HASH_MISMATCH",
+            "stored metadata snapshot does not match its canonical hash",
+        )
+    decision_hash = canonical_presence_decision_hash(
+        candidate_id=row["presence_candidate_id"],
+        state=PresenceState(row["presence_state"]),
+        decision_origin=PresenceOrigin(row["decision_origin"]),
+        evidence_ref=row["presence_evidence_ref"],
+        evidence_hash=row["presence_evidence_hash"],
+        created_at=_parse_utc(row["presence_created_at"]),
+    )
+    if decision_hash != row["presence_decision_hash"]:
+        raise DomainError(
+            "STORED_PRESENCE_HASH_MISMATCH",
+            "stored presence decision does not match its canonical hash",
+        )
     return SelectedInputSegment(
         segment_id=row["segment_id"],
         video_id=row["video_id"],
@@ -775,8 +794,11 @@ def _selected_segment_from_row(row: sqlite3.Row) -> SelectedInputSegment:
         end_ms=row["end_ms"],
         text_body=row["text_body"],
         text_sha256=row["text_sha256"],
-        policy_id=row["policy_id"],
-        policy_hash=row["policy_hash"],
+        metadata_snapshot_id=row["metadata_snapshot_id"],
+        metadata_snapshot_hash=row["metadata_snapshot_hash"],
+        presence_decision_id=row["presence_decision_id"],
+        presence_decision_hash=row["presence_decision_hash"],
+        speaker_assignment_id=row["speaker_assignment_id"],
         assignment_kind=AssignmentKind(row["assignment_kind"]),
         assignment_origin=row["assignment_origin"],
         assigned_subject_id=row["assigned_subject_id"],
@@ -843,8 +865,11 @@ def _run_segment_from_row(row: sqlite3.Row) -> RunSegment:
         ordinal=row["ordinal"],
         video_id=row["video_id"],
         published_at=_parse_utc(row["published_at"]),
-        policy_id=row["policy_id"],
-        policy_hash=row["policy_hash"],
+        metadata_snapshot_id=row["metadata_snapshot_id"],
+        metadata_snapshot_hash=row["metadata_snapshot_hash"],
+        presence_decision_id=row["presence_decision_id"],
+        presence_decision_hash=row["presence_decision_hash"],
+        speaker_assignment_id=row["speaker_assignment_id"],
         assignment_kind=AssignmentKind(row["assignment_kind"]),
         assigned_subject_id=row["assigned_subject_id"],
         assignment_updated_at=_parse_utc(row["assignment_updated_at"]),

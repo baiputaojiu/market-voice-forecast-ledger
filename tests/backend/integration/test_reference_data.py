@@ -3,12 +3,8 @@ import pytest
 from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
-from market_voice_forecast_ledger.domain.enums import (
-    ConfigurationStatus,
-    PolicyKind,
-    SubjectKind,
-)
-from market_voice_forecast_ledger.repositories.sources import SourceRepository
+from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
 
 
 @pytest.fixture
@@ -21,110 +17,34 @@ def db(tmp_path):
         conn.close()
 
 
-def test_confirmed_channel_ids_are_seeded(db):
+def test_reference_people_and_profiles_are_seeded_exactly(db):
     bootstrap_reference_data(db)
-    repo = SourceRepository(db)
-    assert (
-        repo.get_policy_by_subject_name("江守哲").youtube_channel_id
-        == "UCVXka7buS_WptsAzSE0LcKg"
+    rows = db.execute(
+        "SELECT id, canonical_name, is_active FROM analysis_subjects ORDER BY id"
+    ).fetchall()
+    assert tuple((row["canonical_name"], row["is_active"]) for row in rows) == (
+        ("木野内栄治", 1),
+        ("大川智宏", 1),
+        ("江守哲", 1),
+        ("千竈 鉄平", 1),
     )
-    assert (
-        repo.get_policy_by_subject_name("暁投資顧問").youtube_channel_id
-        == "UCOfzLmXpI3qmZfV7_Cs1sYA"
-    )
-    assert (
-        repo.get_policy_by_subject_name("木野内栄治").policy_kind
-        is PolicyKind.ALL_CHANNELS
-    )
-    assert (
-        repo.get_policy_by_subject_name("大川智宏").policy_kind
-        is PolicyKind.ALL_CHANNELS
-    )
-
-
-def test_reference_subjects_kinds_and_aliases_are_seeded_exactly(db):
-    bootstrap_reference_data(db)
-
-    subjects = {
-        row["canonical_name"]: (row["subject_kind"], row["is_active"])
-        for row in db.execute(
-            "SELECT canonical_name, subject_kind, is_active FROM analysis_subjects"
-        )
+    profiles = DiscoveryRepository(db)
+    expected = {
+        "木野内栄治": (("UCJ1DVBLVpe4FvBZZ94kreaQ",), ("木野内栄治",)),
+        "大川智宏": ((), ("大川智宏",)),
+        "江守哲": (("UCVXka7buS_WptsAzSE0LcKg",), ("江守哲",)),
+        "千竈 鉄平": (("UCOfzLmXpI3qmZfV7_Cs1sYA",), ("千竈鉄平", "千竃鉄平")),
     }
-    aliases = {
-        (row["canonical_name"], row["alias"])
-        for row in db.execute(
-            """
-            SELECT subject.canonical_name, alias.alias
-            FROM subject_aliases AS alias
-            JOIN analysis_subjects AS subject ON subject.id = alias.subject_id
-            """
-        )
-    }
-
-    assert subjects == {
-        "木野内栄治": (SubjectKind.PERSON.value, 1),
-        "暁投資顧問": (SubjectKind.ORGANIZATION.value, 1),
-        "江守哲": (SubjectKind.PERSON.value, 1),
-        "大川智宏": (SubjectKind.PERSON.value, 1),
-    }
-    assert aliases == {("木野内栄治", "木野内英二"), ("大川智宏", "大川智ひろ")}
+    for row in rows:
+        profile = profiles.get_current_profile_version(row["id"])
+        assert (profile.seed_channel_ids, profile.search_terms) == expected[row["canonical_name"]]
 
 
-def test_bootstrap_is_idempotent_and_aliases_resolve_to_the_same_policy(db):
+def test_bootstrap_is_idempotent_and_detects_drift(db):
     bootstrap_reference_data(db)
     bootstrap_reference_data(db)
-    repo = SourceRepository(db)
-
-    counts = {
-        table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        for table in (
-            "analysis_subjects",
-            "subject_aliases",
-            "subject_channel_policies",
-        )
-    }
-    assert counts == {
-        "analysis_subjects": 4,
-        "subject_aliases": 2,
-        "subject_channel_policies": 4,
-    }
-    assert (
-        repo.get_policy_by_subject_name("木野内英二").id
-        == repo.get_policy_by_subject_name("木野内栄治").id
-    )
-    assert (
-        repo.get_policy_by_subject_name("大川智ひろ").id
-        == repo.get_policy_by_subject_name("大川智宏").id
-    )
-
-
-def test_bootstrap_does_not_overwrite_a_user_modified_policy(db):
-    bootstrap_reference_data(db)
-    repo = SourceRepository(db)
-    original = repo.get_policy_by_subject_name("江守哲")
-    user_hash = "user-modified-policy-hash"
-    db.execute(
-        """
-        UPDATE subject_channel_policies
-        SET configuration_status = ?, youtube_channel_id = ?,
-            channel_display_name = ?, policy_hash = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            ConfigurationStatus.CONFIGURED.value,
-            "UC1234567890123456789012",
-            "User Selected Channel",
-            user_hash,
-            "2026-08-15T12:34:56.000000Z",
-            original.id,
-        ),
-    )
-
-    bootstrap_reference_data(db)
-
-    modified = repo.get_policy_by_subject_name("江守哲")
-    assert modified.youtube_channel_id == "UC1234567890123456789012"
-    assert modified.channel_display_name == "User Selected Channel"
-    assert modified.policy_hash == user_hash
-    assert modified.updated_at.isoformat() == "2026-08-15T12:34:56+00:00"
+    assert db.execute("SELECT COUNT(*) FROM analysis_subjects").fetchone()[0] == 4
+    db.execute("UPDATE analysis_subjects SET canonical_name='drift' WHERE id=1")
+    with pytest.raises(DomainError) as caught:
+        bootstrap_reference_data(db)
+    assert caught.value.code == "BOOTSTRAP_REFERENCE_MISMATCH"

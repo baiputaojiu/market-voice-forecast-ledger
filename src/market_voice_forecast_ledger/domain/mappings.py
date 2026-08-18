@@ -6,7 +6,6 @@ from market_voice_forecast_ledger.domain.enums import (
     Asset,
     Confidence,
     MappingKind,
-    SubjectKind,
 )
 from market_voice_forecast_ledger.domain.statements import NormalizedStatement
 
@@ -23,7 +22,6 @@ class RuleEvidenceKind(StrEnum):
     GENERIC_EXPRESSION = "generic_expression"
     SURROUNDING_SUBJECT_STATEMENT = "surrounding_subject_statement"
     INTERVIEWER_CONTEXT = "interviewer_context"
-    ORGANIZATION_ASSIGNED_STATEMENT = "organization_assigned_statement"
 
 
 class AssetHintLike(Protocol):
@@ -40,7 +38,6 @@ class MarketEvidence:
 
 @dataclass(frozen=True, slots=True)
 class StatementContext:
-    subject_kind: SubjectKind
     codex_asset_hints: tuple[AssetHintLike, ...] = ()
     adopted_subject_evidence: tuple[MarketEvidence, ...] = ()
     interviewer_evidence: tuple[MarketEvidence, ...] = ()
@@ -266,12 +263,6 @@ def _effective_context(
         for evidence in _ordered_evidence(context.adopted_subject_evidence)
     )
     interviewer_evidence = _ordered_evidence(context.interviewer_evidence)
-    if context.subject_kind is SubjectKind.ORGANIZATION:
-        adopted += tuple(
-            (evidence, RuleEvidenceKind.ORGANIZATION_ASSIGNED_STATEMENT)
-            for evidence in interviewer_evidence
-        )
-        return adopted, ()
     return adopted, tuple(
         (evidence, RuleEvidenceKind.INTERVIEWER_CONTEXT)
         for evidence in interviewer_evidence

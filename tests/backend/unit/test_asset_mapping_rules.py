@@ -9,7 +9,6 @@ from market_voice_forecast_ledger.domain.enums import (
     ForecastBasis,
     MappingKind,
     StatementType,
-    SubjectKind,
 )
 from market_voice_forecast_ledger.domain.mappings import (
     MarketCode,
@@ -73,13 +72,11 @@ def _hint(
 def _context(
     expression: str,
     *assets: Asset,
-    subject_kind: SubjectKind = SubjectKind.PERSON,
     adopted: tuple[MarketEvidence, ...] = (),
     interviewer: tuple[MarketEvidence, ...] = (),
     confidence: Confidence = Confidence.HIGH,
 ) -> StatementContext:
     return StatementContext(
-        subject_kind=subject_kind,
         codex_asset_hints=tuple(
             _hint(expression, asset, confidence) for asset in assets
         ),
@@ -229,7 +226,6 @@ def test_interviewer_only_market_hint_cannot_raise_personal_confidence():
         statement.target_expression,
         Asset.SP500,
         interviewer=(MarketEvidence(41, MarketCode.US),),
-        subject_kind=SubjectKind.PERSON,
     )
 
     mappings = map_statement(statement, context)
@@ -243,20 +239,19 @@ def test_interviewer_only_market_hint_cannot_raise_personal_confidence():
     )
 
 
-def test_organization_assigned_context_is_adopted_regardless_speaker_role():
+def test_interviewer_context_is_never_adopted_as_subject_evidence():
     statement = _statement("株式市場")
     context = _context(
         statement.target_expression,
         Asset.SP500,
         interviewer=(MarketEvidence(51, MarketCode.US),),
-        subject_kind=SubjectKind.ORGANIZATION,
     )
 
     mapping = map_statement(statement, context)[0]
 
-    assert mapping.rule_confidence is Confidence.MEDIUM
+    assert mapping.rule_confidence is Confidence.UNRESOLVED
     assert mapping.rule_evidence[-1].evidence_kind is (
-        RuleEvidenceKind.ORGANIZATION_ASSIGNED_STATEMENT
+        RuleEvidenceKind.INTERVIEWER_CONTEXT
     )
 
 
@@ -283,7 +278,7 @@ def test_missing_codex_support_caps_an_application_mapping_at_unresolved():
 
     mapping = map_statement(
         statement,
-        StatementContext(subject_kind=SubjectKind.PERSON),
+        StatementContext(),
     )[0]
 
     assert mapping.codex_confidence is Confidence.UNRESOLVED

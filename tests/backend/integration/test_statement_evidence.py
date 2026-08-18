@@ -15,7 +15,6 @@ from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     DirectionKind,
     StatementType,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -32,9 +31,6 @@ from market_voice_forecast_ledger.services.codex_contract import (
     CodexRunReceipt,
 )
 from market_voice_forecast_ledger.services.job_state import JobStateService
-from market_voice_forecast_ledger.services.speaker_assignment import (
-    SpeakerAssignmentService,
-)
 from market_voice_forecast_ledger.services.statements import StatementService
 from tests.backend.integration.test_analysis_input_boundaries import (
     _add_video_with_segments,
@@ -104,36 +100,29 @@ def _prepare_output(
     texts: tuple[str, ...],
     build_statements,
     *,
-    subject_kind: SubjectKind = SubjectKind.PERSON,
     start_normalization: bool = True,
 ) -> PreparedOutput:
     subject_id = _create_subject(
         db,
-        f"Synthetic Statement {subject_kind.value}",
-        subject_kind,
+        "Synthetic Statement Person",
         channel_index=71,
     )
     video_id, segment_ids = _add_video_with_segments(
         db,
         subject_id=subject_id,
-        youtube_video_id=f"synthetic-statement-{subject_kind.value}",
+        youtube_video_id="synthetic-statement-person",
         published_at=datetime(2026, 8, 14, 12, tzinfo=timezone.utc),
         texts=texts,
         channel_index=71,
     )
-    if subject_kind is SubjectKind.ORGANIZATION:
-        SpeakerAssignmentService(db).assign_organization_video(
-            subject_id, video_id
+    for ordinal, segment_id in enumerate(segment_ids, start=1):
+        _save_assignment(
+            db,
+            segment_id=segment_id,
+            kind=AssignmentKind.SUBJECT,
+            subject_id=subject_id,
+            evidence_hash=f"statement-subject-evidence-{ordinal}",
         )
-    else:
-        for ordinal, segment_id in enumerate(segment_ids, start=1):
-            _save_assignment(
-                db,
-                segment_id=segment_id,
-                kind=AssignmentKind.SUBJECT,
-                subject_id=subject_id,
-                evidence_hash=f"statement-subject-evidence-{ordinal}",
-            )
 
     prepared = _create_job_for_input(db, subject_id)
     run = _begin(db, prepared)
@@ -393,25 +382,24 @@ def test_person_evidence_must_still_be_assigned_to_the_run_subject(db):
     assert db.execute("SELECT COUNT(*) FROM analysis_statements").fetchone()[0] == 0
 
 
-def test_organization_evidence_must_still_be_channel_organization_assigned(db):
+def test_person_evidence_rejects_a_later_hold_assignment(db):
     prepared = _prepare_output(
         db,
         ("Synthetic first subject evidence.",),
         _one_forecast,
-        subject_kind=SubjectKind.ORGANIZATION,
     )
     _save_assignment(
         db,
         segment_id=prepared.segment_ids[0],
-        kind=AssignmentKind.SUBJECT,
-        subject_id=prepared.subject_id,
-        evidence_hash="statement-drifted-to-manual",
+        kind=AssignmentKind.HOLD,
+        subject_id=None,
+        evidence_hash="statement-drifted-to-hold-again",
     )
 
     with pytest.raises(DomainError) as error:
         StatementService(db).normalize_and_store(prepared.run_id)
 
-    assert error.value.code == "EVIDENCE_ORGANIZATION_ASSIGNMENT_REQUIRED"
+    assert error.value.code == "EVIDENCE_SUBJECT_ASSIGNMENT_REQUIRED"
     assert db.execute("SELECT COUNT(*) FROM analysis_statements").fetchone()[0] == 0
 
 
@@ -419,7 +407,6 @@ def test_normalization_requires_one_output_for_every_successful_codex_batch(db):
     subject_id = _create_subject(
         db,
         "Synthetic Missing Codex Output Person",
-        SubjectKind.PERSON,
         channel_index=72,
     )
     _, segment_ids = _add_video_with_segments(

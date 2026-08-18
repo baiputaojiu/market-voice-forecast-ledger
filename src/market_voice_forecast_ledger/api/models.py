@@ -114,11 +114,7 @@ class SubjectResponse(StrictApiModel):
     id: int = Field(gt=0)
     key: str = Field(min_length=1, max_length=64)
     display_name: str = Field(min_length=1, max_length=200)
-    subject_kind: Literal["person", "organization"]
     is_active: bool
-    policy_kind: Literal["all_channels", "fixed_channel"]
-    configuration_status: Literal["configured", "configuration_required"]
-    youtube_channel_id: str | None = Field(default=None, min_length=24, max_length=24)
 
     @field_validator("display_name")
     @classmethod

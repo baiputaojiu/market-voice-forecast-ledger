@@ -9,7 +9,6 @@ from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.enums import (
     AnalysisRunStatus,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -257,7 +256,6 @@ def test_raw_output_row_rejects_non_codex_or_foreign_job_unit(
         subject_id = _create_subject(
             db,
             "Synthetic Foreign Output Person",
-            SubjectKind.PERSON,
             channel_index=41,
         )
         job_id = _create_job_for_input(db, subject_id).job_id

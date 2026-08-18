@@ -59,7 +59,7 @@ class JobStateService:
     def create_video_pipeline(
         self,
         manifest: JobManifest,
-        eligibility_ids: list[int] | tuple[int, ...],
+        candidate_ids: list[int] | tuple[int, ...],
     ) -> int:
         normalized = self._validate_manifest(manifest)
         if normalized.kind is not JobKind.VIDEO_PIPELINE:
@@ -67,30 +67,30 @@ class JobStateService:
                 "VIDEO_PIPELINE_MANIFEST_REQUIRED",
                 "bound video creation requires a video-pipeline manifest",
             )
-        if type(eligibility_ids) not in {list, tuple}:
+        if type(candidate_ids) not in {list, tuple}:
             raise DomainError(
                 "INVALID_VIDEO_PIPELINE_BINDINGS",
                 "video-pipeline bindings require a list or tuple of ids",
             )
-        bindings = tuple(eligibility_ids)
+        bindings = tuple(candidate_ids)
         if (
             not bindings
             or any(
-                type(eligibility_id) is not int or eligibility_id <= 0
-                for eligibility_id in bindings
+                type(candidate_id) is not int or candidate_id <= 0
+                for candidate_id in bindings
             )
             or len(set(bindings)) != len(bindings)
         ):
             raise DomainError(
                 "INVALID_VIDEO_PIPELINE_BINDINGS",
-                "video-pipeline bindings require unique positive eligibility ids",
+                "video-pipeline bindings require unique positive candidate ids",
             )
         with transaction(self._conn):
             job_id = self._jobs.create(
                 normalized, source_job_id=None, created_at=self._clock()
             )
             self._jobs.create_sealed_video_pipeline_bindings(job_id, bindings)
-            self._require_video_pipeline_eligible(self._jobs.get(job_id))
+            self._require_video_pipeline_runnable(self._jobs.get(job_id))
             return job_id
 
     def create_successor(
@@ -122,7 +122,7 @@ class JobStateService:
                     "SUCCESSOR_KIND_MISMATCH",
                     "a successor must use the source job kind",
                 )
-            self._require_video_pipeline_eligible(source_job)
+            self._require_video_pipeline_runnable(source_job)
             self._stored_manifest(source_job)
             source_units = self._jobs.list_units(source_job_id)
             if any(
@@ -227,7 +227,7 @@ class JobStateService:
         input_changed = False
         with transaction(self._conn):
             job = self._jobs.get(job_id)
-            self._require_video_pipeline_eligible(job)
+            self._require_video_pipeline_runnable(job)
             unit = self._jobs.get_unit(job_id, unit_key)
             if unit.status is not UnitStatus.PENDING:
                 raise DomainError(
@@ -463,7 +463,7 @@ class JobStateService:
             self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
         with transaction(self._conn):
             job = self._jobs.get(job_id)
-            self._require_video_pipeline_eligible(job)
+            self._require_video_pipeline_runnable(job)
             self._stored_manifest(job)
             if job.status in {JobStatus.STOPPED, JobStatus.CANCEL_REQUESTED}:
                 raise DomainError(
@@ -543,7 +543,7 @@ class JobStateService:
                 self._transition(job, JobStatus.STOPPED)
                 stopped = True
             else:
-                self._require_video_pipeline_eligible(job)
+                self._require_video_pipeline_runnable(job)
                 if job.status is JobStatus.PAUSE_REQUESTED:
                     plan = self._reset_and_plan(
                         job_id,
@@ -657,14 +657,14 @@ class JobStateService:
             )
         return normalized
 
-    def _require_video_pipeline_eligible(self, job: StoredJob) -> None:
+    def _require_video_pipeline_runnable(self, job: StoredJob) -> None:
         if job.kind is not JobKind.VIDEO_PIPELINE:
             return
         bindings = self._jobs.list_video_pipeline_binding_ids(job.id)
-        if bindings and not self._jobs.has_current_eligible_video_binding(job.id):
+        if bindings and not self._jobs.has_current_runnable_video_binding(job.id):
             raise DomainError(
                 "VIDEO_PIPELINE_INELIGIBLE",
-                "bound video work requires a current eligible subject binding",
+                "bound video work requires a current non-rejected candidate",
             )
 
     def _stored_manifest(self, job: StoredJob) -> JobManifest:

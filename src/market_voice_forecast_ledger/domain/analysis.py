@@ -101,8 +101,11 @@ class RunSegment:
     ordinal: int
     video_id: int
     published_at: datetime
-    policy_id: int
-    policy_hash: str
+    metadata_snapshot_id: int
+    metadata_snapshot_hash: str
+    presence_decision_id: int
+    presence_decision_hash: str
+    speaker_assignment_id: int
     assignment_kind: AssignmentKind
     assigned_subject_id: int | None
     assignment_updated_at: datetime
@@ -135,8 +138,11 @@ class SelectedInputSegment:
     end_ms: int
     text_body: str
     text_sha256: str
-    policy_id: int
-    policy_hash: str
+    metadata_snapshot_id: int
+    metadata_snapshot_hash: str
+    presence_decision_id: int
+    presence_decision_hash: str
+    speaker_assignment_id: int
     assignment_kind: AssignmentKind
     assignment_origin: str
     assigned_subject_id: int | None

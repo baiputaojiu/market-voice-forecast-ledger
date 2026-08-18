@@ -9,14 +9,10 @@ from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
-from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.enums import (
-    ConfigurationStatus,
     JobKind,
     JobStage,
     JobStatus,
-    PolicyKind,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -37,7 +33,6 @@ from market_voice_forecast_ledger.api.models import (
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_ERROR = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
-_CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 
 
 def initialize_database(settings: Settings) -> None:
@@ -101,16 +96,8 @@ class PublicReadAdapter:
                 SELECT
                     subject.id,
                     subject.canonical_name,
-                    subject.subject_kind,
-                    subject.is_active,
-                    policy.id AS policy_id,
-                    policy.policy_kind,
-                    policy.configuration_status,
-                    policy.youtube_channel_id,
-                    policy.policy_hash
+                    subject.is_active
                 FROM analysis_subjects AS subject
-                LEFT JOIN subject_channel_policies AS policy
-                    ON policy.subject_id=subject.id
                 ORDER BY subject.id
                 """
             )
@@ -119,47 +106,15 @@ class PublicReadAdapter:
         try:
             for row in rows:
                 subject_id = _positive_int(row["id"])
-                _positive_int(row["policy_id"])
                 display_name = _bounded_text(row["canonical_name"], 200)
-                kind = SubjectKind(row["subject_kind"])
-                policy_kind = PolicyKind(row["policy_kind"])
-                configuration = ConfigurationStatus(row["configuration_status"])
                 if type(row["is_active"]) is not int or row["is_active"] not in (0, 1):
                     raise ValueError("invalid active flag")
-                channel_id = row["youtube_channel_id"]
-                if channel_id is not None and (
-                    type(channel_id) is not str or not _CHANNEL_ID.fullmatch(channel_id)
-                ):
-                    raise ValueError("invalid channel id")
-                if policy_kind is PolicyKind.ALL_CHANNELS and channel_id is not None:
-                    raise ValueError("invalid public policy shape")
-                if (
-                    policy_kind is PolicyKind.FIXED_CHANNEL
-                    and configuration is ConfigurationStatus.CONFIGURED
-                    and channel_id is None
-                ):
-                    raise ValueError("invalid public policy shape")
-                expected_policy_hash = sha256_text(
-                    canonical_json(
-                        {
-                            "configuration_status": configuration.value,
-                            "policy_kind": policy_kind.value,
-                            "youtube_channel_id": channel_id,
-                        }
-                    )
-                )
-                if row["policy_hash"] != expected_policy_hash:
-                    raise ValueError("stored policy hash mismatch")
                 subjects.append(
                     SubjectResponse(
                         id=subject_id,
                         key=f"subject-{subject_id}",
                         display_name=display_name,
-                        subject_kind=kind.value,
                         is_active=bool(row["is_active"]),
-                        policy_kind=policy_kind.value,
-                        configuration_status=configuration.value,
-                        youtube_channel_id=channel_id,
                     )
                 )
         except (KeyError, TypeError, ValueError) as cause:
