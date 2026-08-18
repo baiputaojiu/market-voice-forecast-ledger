@@ -190,6 +190,23 @@ def synthetic_video_item(
     }
 
 
+def synthetic_playlist_item(
+    video_id: str,
+    playlist_id: str,
+) -> dict[str, object]:
+    return {
+        "kind": "youtube#playlistItem",
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {
+                "kind": "youtube#video",
+                "videoId": video_id,
+            },
+        },
+        "contentDetails": {"videoId": video_id},
+    }
+
+
 class RecordingReservation:
     def __init__(self, events: list[str] | None = None) -> None:
         self.calls: list[tuple[object, int, datetime]] = []

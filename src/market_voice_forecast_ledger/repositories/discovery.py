@@ -42,6 +42,8 @@ from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
 _UTC_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _CANONICAL_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_YOUTUBE_UPLOADS_PLAYLIST_ID = re.compile(r"^UU[A-Za-z0-9_-]{22}$")
+_YOUTUBE_PAGE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
 _YOUTUBE_ENDPOINT_CLASSES = frozenset({
     "search_list",
     "channels_list",
@@ -806,6 +808,223 @@ class DiscoveryRepository:
         )
         return {row["unit_key"]: row["output_hash"] for row in rows}
 
+    def get_youtube_sync_checkpoint(
+        self, job_id: int, unit_key: str
+    ) -> YouTubeSyncCheckpoint:
+        self.get_youtube_sync_manifest(job_id)
+        row = self._conn.execute(
+            "SELECT * FROM youtube_sync_checkpoints "
+            "WHERE job_id=? AND unit_key=?",
+            (job_id, unit_key),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                "stored YouTube sync checkpoint is invalid",
+            )
+        return self._checkpoint_value(row)
+
+    def bind_seed_uploads_playlist(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        uploads_playlist_id: str,
+    ) -> YouTubeSyncCheckpoint:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        if (
+            checkpoint.source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            or type(uploads_playlist_id) is not str
+            or _YOUTUBE_UPLOADS_PLAYLIST_ID.fullmatch(uploads_playlist_id)
+            is None
+            or checkpoint.completed_at is not None
+        ):
+            self._raise_seed_checkpoint_invalid()
+        if checkpoint.uploads_playlist_id is not None:
+            if checkpoint.uploads_playlist_id != uploads_playlist_id:
+                self._raise_seed_checkpoint_invalid()
+            return checkpoint
+        return self._replace_youtube_checkpoint(
+            checkpoint,
+            uploads_playlist_id=uploads_playlist_id,
+            next_page_token=checkpoint.next_page_token,
+            page_count=checkpoint.page_count,
+            batch_ordinal=checkpoint.batch_ordinal,
+            completed_at=None,
+        )
+
+    def advance_seed_checkpoint(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        next_page_token: str | None,
+    ) -> YouTubeSyncCheckpoint:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        if (
+            checkpoint.source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            or checkpoint.uploads_playlist_id is None
+            or checkpoint.completed_at is not None
+            or (
+                next_page_token is not None
+                and (
+                    type(next_page_token) is not str
+                    or _YOUTUBE_PAGE_TOKEN.fullmatch(next_page_token) is None
+                )
+            )
+        ):
+            self._raise_seed_checkpoint_invalid()
+        return self._replace_youtube_checkpoint(
+            checkpoint,
+            uploads_playlist_id=checkpoint.uploads_playlist_id,
+            next_page_token=next_page_token,
+            page_count=checkpoint.page_count + 1,
+            batch_ordinal=checkpoint.batch_ordinal + 1,
+            completed_at=None,
+        )
+
+    def complete_seed_checkpoint(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        completed_at: datetime,
+    ) -> YouTubeSyncCheckpoint:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        if (
+            checkpoint.source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            or checkpoint.uploads_playlist_id is None
+            or checkpoint.next_page_token is not None
+            or checkpoint.page_count <= 0
+            or checkpoint.completed_at is not None
+            or not _is_exact_utc(completed_at)
+        ):
+            self._raise_seed_checkpoint_invalid()
+        return self._replace_youtube_checkpoint(
+            checkpoint,
+            uploads_playlist_id=checkpoint.uploads_playlist_id,
+            next_page_token=None,
+            page_count=checkpoint.page_count,
+            batch_ordinal=checkpoint.batch_ordinal,
+            completed_at=completed_at,
+        )
+
+    def seed_unit_artifact(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        profile_version_id: int,
+        profile_id: int,
+        source_key: str,
+    ) -> tuple[str, tuple[int, ...]]:
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        try:
+            profile_version = self.get_profile_version(profile_version_id)
+        except (LookupError, DomainError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        if (
+            checkpoint.source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            or checkpoint.source_key != source_key
+            or profile_version.profile_id != profile_id
+        ):
+            self._raise_seed_artifact_invalid()
+        return self._canonical_seed_artifact(profile_version, checkpoint)
+
+    def seed_unit_seen_video_ids(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        profile_version_id: int,
+        profile_id: int,
+        source_key: str,
+    ) -> tuple[str, ...]:
+        self.seed_unit_artifact(
+            job_id=job_id,
+            unit_key=unit_key,
+            profile_version_id=profile_version_id,
+            profile_id=profile_id,
+            source_key=source_key,
+        )
+        return tuple(
+            row["youtube_video_id"]
+            for row in self._conn.execute(
+                "SELECT video.youtube_video_id "
+                "FROM discovery_observations AS observation "
+                "JOIN videos AS video ON video.id=observation.video_id "
+                "WHERE observation.job_id=? AND observation.profile_id=? "
+                "AND observation.source_kind='seed_uploads' "
+                "AND observation.source_key=? ORDER BY observation.id",
+                (job_id, profile_id, source_key),
+            )
+        )
+
+    def record_seed_proposed_cursor(
+        self,
+        *,
+        job_id: int,
+        profile_id: int,
+        source_key: str,
+        completed_upper_bound: datetime,
+    ) -> str:
+        self._require_transaction()
+        manifest = self.get_youtube_sync_manifest(job_id)
+        if (
+            manifest.sync_kind != YouTubeSyncKind.FULL_DISCOVERY.value
+            or type(profile_id) is not int
+            or profile_id <= 0
+            or type(source_key) is not str
+            or _SAFE_SOURCE_KEY.fullmatch(source_key) is None
+            or not _is_exact_utc(completed_upper_bound)
+            or completed_upper_bound != manifest.upper_bound
+            or not any(item.profile_id == profile_id for item in manifest.profiles)
+        ):
+            self._raise_seed_artifact_invalid()
+        cursor_hash = sha256_text(canonical_json({
+            "completed_upper_bound": utc_iso(completed_upper_bound),
+            "profile_id": profile_id,
+            "schema": "youtube-source-cursor.v1",
+            "source_key": source_key,
+            "source_kind": DiscoverySourceKind.SEED_UPLOADS.value,
+        }))
+        existing = self._conn.execute(
+            "SELECT * FROM youtube_sync_proposed_cursors "
+            "WHERE job_id=? AND profile_id=? AND source_kind=? AND source_key=?",
+            (
+                job_id,
+                profile_id,
+                DiscoverySourceKind.SEED_UPLOADS.value,
+                source_key,
+            ),
+        ).fetchone()
+        if existing is None:
+            self._conn.execute(
+                "INSERT INTO youtube_sync_proposed_cursors("
+                "job_id, profile_id, source_kind, source_key, "
+                "completed_upper_bound, cursor_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    profile_id,
+                    DiscoverySourceKind.SEED_UPLOADS.value,
+                    source_key,
+                    utc_iso(completed_upper_bound),
+                    cursor_hash,
+                ),
+            )
+        elif (
+            existing["completed_upper_bound"] != utc_iso(completed_upper_bound)
+            or existing["cursor_hash"] != cursor_hash
+        ):
+            self._raise_seed_artifact_invalid()
+        return cursor_hash
+
     def set_youtube_resume_not_before(
         self, job_id: int, value: datetime | None
     ) -> None:
@@ -1066,38 +1285,210 @@ class DiscoveryRepository:
                     "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                     "stored YouTube sync checkpoint hash is invalid",
                 )
+            checkpoint = YouTubeSyncCheckpoint(
+                job_id=job_id,
+                unit_key=spec.unit_key,
+                source_kind=source_kind,
+                source_key=row["source_key"],
+                effective_lower_bound=effective_lower,
+                upper_bound=upper_bound,
+                uploads_playlist_id=row["uploads_playlist_id"],
+                next_page_token=row["next_page_token"],
+                page_count=row["page_count"],
+                batch_ordinal=row["batch_ordinal"],
+                completed_at=completed_at,
+                checkpoint_hash=row["checkpoint_hash"],
+            )
             if unit["status"] == UnitStatus.SUCCESS.value:
                 if (
                     completed_at is None
-                    or unit["output_hash"] != expected_hash
+                    or type(unit["output_hash"]) is not str
+                    or _CANONICAL_HASH.fullmatch(unit["output_hash"]) is None
                 ):
                     raise DomainError(
                         "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                         "stored YouTube sync artifact is invalid",
                     )
+                if unit["output_hash"] != expected_hash:
+                    if source_kind is not DiscoverySourceKind.SEED_UPLOADS:
+                        raise DomainError(
+                            "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                            "stored YouTube sync artifact is invalid",
+                        )
+                    profile_version = self.get_profile_version(
+                        spec.profile_version_id
+                    )
+                    artifact_hash, _ = self._canonical_seed_artifact(
+                        profile_version, checkpoint
+                    )
+                    if unit["output_hash"] != artifact_hash:
+                        self._raise_seed_artifact_invalid()
             else:
                 if completed_at is not None:
                     raise DomainError(
                         "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                         "stored YouTube sync checkpoint is invalid",
                     )
-            values.append(
-                YouTubeSyncCheckpoint(
-                    job_id=job_id,
-                    unit_key=spec.unit_key,
-                    source_kind=source_kind,
-                    source_key=row["source_key"],
-                    effective_lower_bound=effective_lower,
-                    upper_bound=upper_bound,
-                    uploads_playlist_id=row["uploads_playlist_id"],
-                    next_page_token=row["next_page_token"],
-                    page_count=row["page_count"],
-                    batch_ordinal=row["batch_ordinal"],
-                    completed_at=completed_at,
-                    checkpoint_hash=row["checkpoint_hash"],
-                )
-            )
+            values.append(checkpoint)
         return tuple(values)
+
+    def _checkpoint_value(self, row: sqlite3.Row) -> YouTubeSyncCheckpoint:
+        try:
+            source_kind = DiscoverySourceKind(row["source_kind"])
+            effective_lower = _parse_canonical_utc(
+                row["effective_lower_bound"]
+            )
+            upper_bound = _parse_canonical_utc(row["upper_bound"])
+            completed_at = (
+                None
+                if row["completed_at"] is None
+                else _parse_canonical_utc(row["completed_at"])
+            )
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                "stored YouTube sync checkpoint is invalid",
+            ) from cause
+        return YouTubeSyncCheckpoint(
+            job_id=row["job_id"],
+            unit_key=row["unit_key"],
+            source_kind=source_kind,
+            source_key=row["source_key"],
+            effective_lower_bound=effective_lower,
+            upper_bound=upper_bound,
+            uploads_playlist_id=row["uploads_playlist_id"],
+            next_page_token=row["next_page_token"],
+            page_count=row["page_count"],
+            batch_ordinal=row["batch_ordinal"],
+            completed_at=completed_at,
+            checkpoint_hash=row["checkpoint_hash"],
+        )
+
+    def _replace_youtube_checkpoint(
+        self,
+        checkpoint: YouTubeSyncCheckpoint,
+        *,
+        uploads_playlist_id: str | None,
+        next_page_token: str | None,
+        page_count: int,
+        batch_ordinal: int,
+        completed_at: datetime | None,
+    ) -> YouTubeSyncCheckpoint:
+        checkpoint_hash = canonical_youtube_sync_checkpoint_hash(
+            job_id=checkpoint.job_id,
+            unit_key=checkpoint.unit_key,
+            source_kind=checkpoint.source_kind,
+            source_key=checkpoint.source_key,
+            effective_lower_bound=checkpoint.effective_lower_bound,
+            upper_bound=checkpoint.upper_bound,
+            uploads_playlist_id=uploads_playlist_id,
+            next_page_token=next_page_token,
+            page_count=page_count,
+            batch_ordinal=batch_ordinal,
+            completed_at=completed_at,
+        )
+        cursor = self._conn.execute(
+            "UPDATE youtube_sync_checkpoints SET uploads_playlist_id=?, "
+            "next_page_token=?, page_count=?, batch_ordinal=?, completed_at=?, "
+            "checkpoint_hash=? WHERE job_id=? AND unit_key=? AND checkpoint_hash=?",
+            (
+                uploads_playlist_id,
+                next_page_token,
+                page_count,
+                batch_ordinal,
+                None if completed_at is None else utc_iso(completed_at),
+                checkpoint_hash,
+                checkpoint.job_id,
+                checkpoint.unit_key,
+                checkpoint.checkpoint_hash,
+            ),
+        )
+        if cursor.rowcount != 1:
+            self._raise_seed_checkpoint_invalid()
+        return self._checkpoint_value(
+            self._conn.execute(
+                "SELECT * FROM youtube_sync_checkpoints "
+                "WHERE job_id=? AND unit_key=?",
+                (checkpoint.job_id, checkpoint.unit_key),
+            ).fetchone()
+        )
+
+    def _canonical_seed_artifact(
+        self,
+        profile_version: DiscoveryProfileVersion,
+        checkpoint: YouTubeSyncCheckpoint,
+    ) -> tuple[str, tuple[int, ...]]:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT observation.*, video.youtube_video_id "
+                "FROM discovery_observations AS observation "
+                "JOIN videos AS video ON video.id=observation.video_id "
+                "WHERE observation.job_id=? AND observation.profile_id=? "
+                "AND observation.source_kind='seed_uploads' "
+                "AND observation.source_key=? ORDER BY observation.id",
+                (
+                    checkpoint.job_id,
+                    profile_version.profile_id,
+                    checkpoint.source_key,
+                ),
+            )
+        )
+        for row in rows:
+            self._validate_stored_observation(row)
+            snapshot = self._conn.execute(
+                "SELECT published_at FROM video_metadata_snapshots WHERE id=?",
+                (row["metadata_snapshot_id"],),
+            ).fetchone()
+            try:
+                published_at = _parse_canonical_utc(snapshot["published_at"])
+            except (TypeError, ValueError) as cause:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                    "stored YouTube sync artifact is invalid",
+                ) from cause
+            if not (
+                checkpoint.effective_lower_bound
+                <= published_at
+                < checkpoint.upper_bound
+            ):
+                self._raise_seed_artifact_invalid()
+            candidate = self._conn.execute(
+                "SELECT * FROM subject_video_candidates "
+                "WHERE profile_id=? AND video_id=?",
+                (profile_version.profile_id, row["video_id"]),
+            ).fetchone()
+            if candidate is None:
+                self._raise_seed_artifact_invalid()
+            self._validate_candidate_row(
+                candidate,
+                profile_id=profile_version.profile_id,
+                video_id=row["video_id"],
+            )
+        observation_ids = tuple(row["id"] for row in rows)
+        return (
+            sha256_text(canonical_json({
+                "completed_upper_bound": utc_iso(checkpoint.upper_bound),
+                "persisted_observation_ids": list(observation_ids),
+                "profile_version_id": profile_version.id,
+                "schema": "youtube-seed-unit-output.v1",
+                "source_key": checkpoint.source_key,
+            })),
+            observation_ids,
+        )
+
+    @staticmethod
+    def _raise_seed_checkpoint_invalid() -> None:
+        raise DomainError(
+            "YOUTUBE_SEED_CHECKPOINT_INVALID",
+            "YouTube seed checkpoint is invalid",
+        )
+
+    @staticmethod
+    def _raise_seed_artifact_invalid() -> None:
+        raise DomainError(
+            "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+            "stored YouTube sync artifact is invalid",
+        )
 
     def persist_metadata_batch(
         self,
