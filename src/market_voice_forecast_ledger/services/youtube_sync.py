@@ -231,9 +231,11 @@ class YouTubeSyncService:
                 if (
                     status is JobStatus.RETRYING
                     and manifest.resume_not_before_utc is not None
-                    and manifest.resume_not_before_utc > now
                 ):
-                    continue
+                    if manifest.resume_not_before_utc > now:
+                        continue
+                    self._discovery.set_youtube_resume_not_before(job_id, None)
+                    manifest = self.get_sync_manifest(job_id)
                 return self._claim_pending(job_id, manifest, now)
             return None
 

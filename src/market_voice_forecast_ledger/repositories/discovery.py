@@ -29,7 +29,12 @@ from market_voice_forecast_ledger.domain.discovery import (
     validate_canonical_video_metadata,
     youtube_profile_set_hash,
 )
-from market_voice_forecast_ledger.domain.enums import JobKind, JobStage, UnitStatus
+from market_voice_forecast_ledger.domain.enums import (
+    JobKind,
+    JobStage,
+    JobStatus,
+    UnitStatus,
+)
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
 
@@ -636,7 +641,8 @@ class DiscoveryRepository:
     def get_youtube_sync_manifest(self, job_id: int) -> YouTubeSyncManifest:
         generic = self._stored_youtube_job_manifest(job_id)
         row = self._conn.execute(
-            "SELECT manifest.*, job.created_at AS job_created_at "
+            "SELECT manifest.*, job.created_at AS job_created_at, "
+            "job.status AS job_status "
             "FROM youtube_sync_manifests AS manifest "
             "JOIN jobs AS job ON job.id=manifest.job_id WHERE manifest.job_id=?",
             (job_id,),
@@ -652,6 +658,7 @@ class DiscoveryRepository:
             backfill_floor = _parse_canonical_utc(row["backfill_floor"])
             created_at = _parse_canonical_utc(row["created_at"])
             job_created_at = _parse_canonical_utc(row["job_created_at"])
+            job_status = JobStatus(row["job_status"])
             resume_not_before = (
                 None
                 if row["resume_not_before_utc"] is None
@@ -673,6 +680,10 @@ class DiscoveryRepository:
             or type(row["profile_set_hash"]) is not str
             or _CANONICAL_HASH.fullmatch(row["profile_set_hash"]) is None
             or (resume_not_before is not None and resume_not_before < created_at)
+            or (
+                resume_not_before is not None
+                and job_status is not JobStatus.RETRYING
+            )
         ):
             raise DomainError(
                 "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
@@ -800,8 +811,20 @@ class DiscoveryRepository:
     ) -> None:
         self._require_transaction()
         manifest = self.get_youtube_sync_manifest(job_id)
+        status_row = self._conn.execute(
+            "SELECT status FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        try:
+            status = JobStatus(status_row["status"])
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync job status is invalid",
+            ) from cause
         if value is not None and (
-            not _is_exact_utc(value) or value < manifest.created_at
+            not _is_exact_utc(value)
+            or value < manifest.created_at
+            or status is not JobStatus.RETRYING
         ):
             raise DomainError(
                 "YOUTUBE_SYNC_DEFER_INVALID",
@@ -1025,33 +1048,38 @@ class DiscoveryRepository:
                     "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                     "stored YouTube sync checkpoint is invalid",
                 )
+            expected_hash = canonical_youtube_sync_checkpoint_hash(
+                job_id=job_id,
+                unit_key=spec.unit_key,
+                source_kind=source_kind,
+                source_key=row["source_key"],
+                effective_lower_bound=effective_lower,
+                upper_bound=upper_bound,
+                uploads_playlist_id=row["uploads_playlist_id"],
+                next_page_token=row["next_page_token"],
+                page_count=row["page_count"],
+                batch_ordinal=row["batch_ordinal"],
+                completed_at=completed_at,
+            )
+            if row["checkpoint_hash"] != expected_hash:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                    "stored YouTube sync checkpoint hash is invalid",
+                )
             if unit["status"] == UnitStatus.SUCCESS.value:
                 if (
                     completed_at is None
-                    or unit["output_hash"] != row["checkpoint_hash"]
+                    or unit["output_hash"] != expected_hash
                 ):
                     raise DomainError(
                         "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                         "stored YouTube sync artifact is invalid",
                     )
             else:
-                expected_hash = canonical_youtube_sync_checkpoint_hash(
-                    job_id=job_id,
-                    unit_key=spec.unit_key,
-                    source_kind=source_kind,
-                    source_key=row["source_key"],
-                    effective_lower_bound=effective_lower,
-                    upper_bound=upper_bound,
-                    uploads_playlist_id=row["uploads_playlist_id"],
-                    next_page_token=row["next_page_token"],
-                    page_count=row["page_count"],
-                    batch_ordinal=row["batch_ordinal"],
-                    completed_at=completed_at,
-                )
-                if completed_at is not None or row["checkpoint_hash"] != expected_hash:
+                if completed_at is not None:
                     raise DomainError(
                         "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
-                        "stored YouTube sync checkpoint hash is invalid",
+                        "stored YouTube sync checkpoint is invalid",
                     )
             values.append(
                 YouTubeSyncCheckpoint(

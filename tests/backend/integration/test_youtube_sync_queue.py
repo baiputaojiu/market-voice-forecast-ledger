@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import threading
@@ -41,6 +42,35 @@ def db(db_path):
 
 def _utc_text(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _hash(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _completed_checkpoint_hash(row, completed_at: datetime) -> str:
+    return _hash(
+        {
+            "batch_ordinal": row["batch_ordinal"],
+            "completed_at": _utc_text(completed_at),
+            "effective_lower_bound": row["effective_lower_bound"],
+            "job_id": row["job_id"],
+            "next_page_token": row["next_page_token"],
+            "page_count": row["page_count"],
+            "schema": "youtube-sync-checkpoint.v1",
+            "source_key": row["source_key"],
+            "source_kind": row["source_kind"],
+            "unit_key": row["unit_key"],
+            "uploads_playlist_id": row["uploads_playlist_id"],
+            "upper_bound": row["upper_bound"],
+        }
+    )
 
 
 def _bootstrap(db):
@@ -121,15 +151,16 @@ def _complete_first_and_fail_second(db, job_id: int) -> tuple[str, str, str]:
     first_claim = service.claim_next_runnable(FIXED_NOW)
     assert first_claim is not None and first_claim.job_id == job_id
     first_key = _running_unit_key(db, job_id)
-    checkpoint_hash = db.execute(
-        "SELECT checkpoint_hash FROM youtube_sync_checkpoints "
+    checkpoint = db.execute(
+        "SELECT * FROM youtube_sync_checkpoints "
         "WHERE job_id=? AND unit_key=?",
         (job_id, first_key),
-    ).fetchone()["checkpoint_hash"]
+    ).fetchone()
+    checkpoint_hash = _completed_checkpoint_hash(checkpoint, FIXED_NOW)
     db.execute(
-        "UPDATE youtube_sync_checkpoints SET completed_at=? "
+        "UPDATE youtube_sync_checkpoints SET completed_at=?, checkpoint_hash=? "
         "WHERE job_id=? AND unit_key=?",
-        (_utc_text(FIXED_NOW), job_id, first_key),
+        (_utc_text(FIXED_NOW), checkpoint_hash, job_id, first_key),
     )
     JobStateService(db, clock=lambda: FIXED_NOW).complete_unit(
         job_id, first_key, checkpoint_hash
@@ -143,6 +174,32 @@ def _complete_first_and_fail_second(db, job_id: int) -> tuple[str, str, str]:
     )
     assert JobStateService(db).status(job_id) is JobStatus.FAILED
     return first_key, second_key, checkpoint_hash
+
+
+def _sync_retry_state(db, job_id: int) -> dict[str, tuple[dict, ...]]:
+    order_by = {
+        "job_units": " ORDER BY ordinal",
+        "job_events": " ORDER BY id",
+        "youtube_sync_checkpoints": " ORDER BY unit_key",
+    }
+    return {
+        table: tuple(
+            dict(row)
+            for row in db.execute(
+                f"SELECT * FROM {table} WHERE "
+                + ("id=?" if table == "jobs" else "job_id=?")
+                + order_by.get(table, ""),
+                (job_id,),
+            )
+        )
+        for table in (
+            "jobs",
+            "job_units",
+            "job_events",
+            "youtube_sync_manifests",
+            "youtube_sync_checkpoints",
+        )
+    }
 
 
 @pytest.mark.parametrize("prepared_status", ("queued", "running", "retrying"))
@@ -253,6 +310,51 @@ def test_failed_coalescing_rejects_checkpoint_artifact_tamper_without_retry(db):
     assert _unit_rows(db, first.job_id) == before_units
 
 
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    (
+        ("page_count", 1),
+        ("batch_ordinal", 1),
+        ("next_page_token", "tampered-next-page"),
+        ("uploads_playlist_id", "UUtamperedPlaylistIdentity"),
+        (
+            "effective_lower_bound",
+            "2024-08-19T03:04:05.000000Z",
+        ),
+        ("completed_at", _utc_text(LATER)),
+    ),
+)
+def test_successful_checkpoint_payload_corruption_blocks_read_and_failed_retry(
+    db, column, corrupt_value
+):
+    _bootstrap(db)
+    result = _service(db).request_full_sync(FIXED_NOW)
+    successful_key, _, _ = _complete_first_and_fail_second(db, result.job_id)
+    db.execute(
+        f"UPDATE youtube_sync_checkpoints SET {column}=? "
+        "WHERE job_id=? AND unit_key=?",
+        (corrupt_value, result.job_id, successful_key),
+    )
+    before = _sync_retry_state(db, result.job_id)
+
+    for read in (
+        lambda: _service(db).get_sync_manifest(result.job_id),
+        lambda: DiscoveryRepository(db).verified_youtube_artifact_hashes(
+            result.job_id
+        ),
+    ):
+        with pytest.raises(DomainError) as caught:
+            read()
+        assert caught.value.code == "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID"
+        assert _sync_retry_state(db, result.job_id) == before
+
+    with pytest.raises(DomainError) as caught:
+        _service(db, LATER).request_full_sync(LATER)
+
+    assert caught.value.code == "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID"
+    assert _sync_retry_state(db, result.job_id) == before
+
+
 def test_profile_change_queues_incompatible_full_job_behind_current_active_job(db):
     profiles = _bootstrap(db)
     original = _service(db).request_full_sync(FIXED_NOW)
@@ -331,9 +433,112 @@ def test_deferred_retrying_head_is_skipped_and_next_fifo_job_is_claimed(db):
     assert claimed is not None and claimed.job_id == second.job_id
     assert claimed.kind == "manual"
     assert JobStateService(db).status(first.job_id) is JobStatus.RETRYING
+    assert (
+        DiscoveryRepository(db)
+        .get_youtube_sync_manifest(first.job_id)
+        .resume_not_before_utc
+        == TOMORROW
+    )
     assert all(
         row["status"] == "pending" for row in _unit_rows(db, first.job_id)
     )
+
+
+@pytest.mark.parametrize("prepared_status", ("queued", "running", "failed"))
+def test_future_defer_is_rejected_for_every_non_retrying_job(
+    db, prepared_status
+):
+    _bootstrap(db)
+    result = _service(db).request_full_sync(FIXED_NOW)
+    if prepared_status == "running":
+        assert _service(db).claim_next_runnable(FIXED_NOW) is not None
+    elif prepared_status == "failed":
+        _claim_and_fail_first(db, result.job_id)
+    before = _sync_retry_state(db, result.job_id)
+
+    with pytest.raises(DomainError) as caught:
+        with transaction(db):
+            DiscoveryRepository(db).set_youtube_resume_not_before(
+                result.job_id, TOMORROW
+            )
+
+    assert caught.value.code == "YOUTUBE_SYNC_DEFER_INVALID"
+    assert _sync_retry_state(db, result.job_id) == before
+    assert not db.in_transaction
+
+
+def test_retry_defer_can_be_explicitly_cleared_to_null(db):
+    _bootstrap(db)
+    result = _service(db).request_full_sync(FIXED_NOW)
+    _claim_and_fail_first(db, result.job_id)
+    with transaction(db):
+        JobStateService(db, clock=lambda: FIXED_NOW).retry_failed_in_transaction(
+            result.job_id, {}
+        )
+        repository = DiscoveryRepository(db)
+        repository.set_youtube_resume_not_before(result.job_id, TOMORROW)
+        repository.set_youtube_resume_not_before(result.job_id, None)
+
+    assert JobStateService(db).status(result.job_id) is JobStatus.RETRYING
+    assert (
+        DiscoveryRepository(db)
+        .get_youtube_sync_manifest(result.job_id)
+        .resume_not_before_utc
+        is None
+    )
+
+
+@pytest.mark.parametrize("prepared_status", ("queued", "running"))
+def test_raw_status_defer_mismatch_blocks_read_and_claim_before_mutation(
+    db, prepared_status
+):
+    _bootstrap(db)
+    result = _service(db).request_full_sync(FIXED_NOW)
+    if prepared_status == "running":
+        assert _service(db).claim_next_runnable(FIXED_NOW) is not None
+    db.execute(
+        "UPDATE youtube_sync_manifests SET resume_not_before_utc=? "
+        "WHERE job_id=?",
+        (_utc_text(TOMORROW), result.job_id),
+    )
+    before = _sync_retry_state(db, result.job_id)
+
+    with pytest.raises(DomainError) as caught:
+        _service(db).get_sync_manifest(result.job_id)
+    assert caught.value.code == "STORED_YOUTUBE_SYNC_MANIFEST_INVALID"
+    assert _sync_retry_state(db, result.job_id) == before
+
+    with pytest.raises(DomainError) as caught:
+        _service(db).claim_next_runnable(FIXED_NOW)
+    assert caught.value.code == "STORED_YOUTUBE_SYNC_MANIFEST_INVALID"
+    assert _sync_retry_state(db, result.job_id) == before
+    assert not db.in_transaction
+
+
+def test_due_retry_claim_clears_defer_and_starts_one_unit_atomically(db):
+    _bootstrap(db)
+    result = _service(db).request_full_sync(FIXED_NOW)
+    _claim_and_fail_first(db, result.job_id)
+    with transaction(db):
+        JobStateService(db, clock=lambda: FIXED_NOW).retry_failed_in_transaction(
+            result.job_id, {}
+        )
+        DiscoveryRepository(db).set_youtube_resume_not_before(
+            result.job_id, LATER
+        )
+
+    claimed = _service(db, LATER).claim_next_runnable(LATER)
+
+    assert claimed is not None and claimed.job_id == result.job_id
+    assert claimed.manifest.resume_not_before_utc is None
+    assert JobStateService(db).status(result.job_id) is JobStatus.RUNNING
+    assert [
+        row["status"] for row in _unit_rows(db, result.job_id)
+    ].count("running") == 1
+    assert db.execute(
+        "SELECT resume_not_before_utc FROM youtube_sync_manifests WHERE job_id=?",
+        (result.job_id,),
+    ).fetchone()["resume_not_before_utc"] is None
 
 
 def test_database_partial_unique_index_rejects_second_active_youtube_job(db):
