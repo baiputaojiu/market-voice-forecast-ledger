@@ -2660,7 +2660,10 @@ CREATE TRIGGER discovery_profiles_no_delete BEFORE DELETE ON discovery_profiles
 BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_DISCOVERY_PROFILE'); END;
 
 CREATE TRIGGER discovery_profiles_no_replace BEFORE INSERT ON discovery_profiles
-WHEN EXISTS (SELECT 1 FROM discovery_profiles WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM discovery_profiles
+    WHERE id=NEW.id OR subject_id=NEW.subject_id
+)
 BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_DISCOVERY_PROFILE'); END;
 
 CREATE TRIGGER videos_limited_update
@@ -2692,7 +2695,11 @@ BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_CANDIDATE'); END;
 
 CREATE TRIGGER subject_video_candidates_no_replace
 BEFORE INSERT ON subject_video_candidates
-WHEN EXISTS (SELECT 1 FROM subject_video_candidates WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM subject_video_candidates
+    WHERE id=NEW.id
+       OR (profile_id=NEW.profile_id AND video_id=NEW.video_id)
+)
 BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_CANDIDATE'); END;
 
 CREATE TRIGGER youtube_sync_manifests_limited_update
@@ -2902,7 +2909,11 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_profile_versions_no_delete BEFORE DELETE ON discovery_profile_versions
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_profile_versions_no_replace BEFORE INSERT ON discovery_profile_versions
-WHEN EXISTS (SELECT 1 FROM discovery_profile_versions WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM discovery_profile_versions
+    WHERE id=NEW.id
+       OR (profile_id=NEW.profile_id AND config_hash=NEW.config_hash)
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER discovery_seed_channels_no_update BEFORE UPDATE ON discovery_seed_channels
@@ -2910,7 +2921,14 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_seed_channels_no_delete BEFORE DELETE ON discovery_seed_channels
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_seed_channels_no_replace BEFORE INSERT ON discovery_seed_channels
-WHEN EXISTS (SELECT 1 FROM discovery_seed_channels WHERE profile_version_id=NEW.profile_version_id AND ordinal=NEW.ordinal)
+WHEN EXISTS (
+    SELECT 1 FROM discovery_seed_channels
+    WHERE profile_version_id=NEW.profile_version_id
+      AND (
+        ordinal=NEW.ordinal
+        OR youtube_channel_id=NEW.youtube_channel_id
+      )
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER discovery_search_terms_no_update BEFORE UPDATE ON discovery_search_terms
@@ -2918,7 +2936,11 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_search_terms_no_delete BEFORE DELETE ON discovery_search_terms
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_search_terms_no_replace BEFORE INSERT ON discovery_search_terms
-WHEN EXISTS (SELECT 1 FROM discovery_search_terms WHERE profile_version_id=NEW.profile_version_id AND ordinal=NEW.ordinal)
+WHEN EXISTS (
+    SELECT 1 FROM discovery_search_terms
+    WHERE profile_version_id=NEW.profile_version_id
+      AND (ordinal=NEW.ordinal OR search_term=NEW.search_term)
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER video_metadata_snapshots_no_update BEFORE UPDATE ON video_metadata_snapshots
@@ -2926,7 +2948,11 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER video_metadata_snapshots_no_delete BEFORE DELETE ON video_metadata_snapshots
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER video_metadata_snapshots_no_replace BEFORE INSERT ON video_metadata_snapshots
-WHEN EXISTS (SELECT 1 FROM video_metadata_snapshots WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM video_metadata_snapshots
+    WHERE id=NEW.id
+       OR (video_id=NEW.video_id AND canonical_hash=NEW.canonical_hash)
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER discovery_observations_no_update BEFORE UPDATE ON discovery_observations
@@ -2934,7 +2960,10 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_observations_no_delete BEFORE DELETE ON discovery_observations
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER discovery_observations_no_replace BEFORE INSERT ON discovery_observations
-WHEN EXISTS (SELECT 1 FROM discovery_observations WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM discovery_observations
+    WHERE id=NEW.id OR idempotency_key=NEW.idempotency_key
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER presence_decisions_no_update BEFORE UPDATE ON presence_decisions
@@ -2942,7 +2971,11 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER presence_decisions_no_delete BEFORE DELETE ON presence_decisions
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER presence_decisions_no_replace BEFORE INSERT ON presence_decisions
-WHEN EXISTS (SELECT 1 FROM presence_decisions WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM presence_decisions
+    WHERE id=NEW.id
+       OR (candidate_id=NEW.candidate_id AND decision_hash=NEW.decision_hash)
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER youtube_quota_reservations_no_update BEFORE UPDATE ON youtube_quota_reservations
@@ -2950,7 +2983,16 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER youtube_quota_reservations_no_delete BEFORE DELETE ON youtube_quota_reservations
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER youtube_quota_reservations_no_replace BEFORE INSERT ON youtube_quota_reservations
-WHEN EXISTS (SELECT 1 FROM youtube_quota_reservations WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM youtube_quota_reservations
+    WHERE id=NEW.id
+       OR (
+        job_id=NEW.job_id
+        AND unit_key=NEW.unit_key
+        AND request_ordinal=NEW.request_ordinal
+        AND attempt_no=NEW.attempt_no
+       )
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER manual_discovery_requests_no_update BEFORE UPDATE ON manual_discovery_requests
@@ -2958,7 +3000,14 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER manual_discovery_requests_no_delete BEFORE DELETE ON manual_discovery_requests
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER manual_discovery_requests_no_replace BEFORE INSERT ON manual_discovery_requests
-WHEN EXISTS (SELECT 1 FROM manual_discovery_requests WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM manual_discovery_requests
+    WHERE id=NEW.id
+       OR (
+        profile_id=NEW.profile_id
+        AND youtube_video_id=NEW.youtube_video_id
+       )
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER youtube_sync_manifest_profiles_no_update BEFORE UPDATE ON youtube_sync_manifest_profiles
@@ -2966,7 +3015,11 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER youtube_sync_manifest_profiles_no_delete BEFORE DELETE ON youtube_sync_manifest_profiles
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER youtube_sync_manifest_profiles_no_replace BEFORE INSERT ON youtube_sync_manifest_profiles
-WHEN EXISTS (SELECT 1 FROM youtube_sync_manifest_profiles WHERE job_id=NEW.job_id AND ordinal=NEW.ordinal)
+WHEN EXISTS (
+    SELECT 1 FROM youtube_sync_manifest_profiles
+    WHERE job_id=NEW.job_id
+      AND (ordinal=NEW.ordinal OR profile_id=NEW.profile_id)
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 
 CREATE TRIGGER youtube_daily_sync_requests_no_update BEFORE UPDATE ON youtube_daily_sync_requests
@@ -2974,5 +3027,8 @@ BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER youtube_daily_sync_requests_no_delete BEFORE DELETE ON youtube_daily_sync_requests
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;
 CREATE TRIGGER youtube_daily_sync_requests_no_replace BEFORE INSERT ON youtube_daily_sync_requests
-WHEN EXISTS (SELECT 1 FROM youtube_daily_sync_requests WHERE jst_day=NEW.jst_day)
+WHEN EXISTS (
+    SELECT 1 FROM youtube_daily_sync_requests
+    WHERE jst_day=NEW.jst_day OR job_id=NEW.job_id
+)
 BEGIN SELECT RAISE(ABORT, 'APPEND_ONLY'); END;

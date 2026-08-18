@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import dataclass
 from importlib import resources
 
 import pytest
@@ -256,6 +257,122 @@ NEW_APPEND_ONLY_TABLES = (
     "discovery_observations",
     "presence_decisions",
     "youtube_quota_reservations",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalIdentityCase:
+    table: str
+    logical_columns: tuple[str, ...]
+    primary_columns: tuple[str, ...]
+    primary_overrides: dict[str, object]
+    primary_guard: str
+    error_code: str
+
+
+COLLECTION_LOGICAL_IDENTITIES = (
+    LogicalIdentityCase(
+        "discovery_profile_versions",
+        ("profile_id", "config_hash"),
+        ("id",),
+        {"id": 302},
+        "id=NEW.id",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "discovery_profiles",
+        ("subject_id",),
+        ("id",),
+        {"id": 202, "current_version_id": None},
+        "id=NEW.id",
+        "IMMUTABLE_DISCOVERY_PROFILE",
+    ),
+    LogicalIdentityCase(
+        "discovery_seed_channels",
+        ("profile_version_id", "youtube_channel_id"),
+        ("profile_version_id", "ordinal"),
+        {"ordinal": 2},
+        (
+            "profile_version_id=NEW.profile_version_id "
+            "AND ordinal=NEW.ordinal"
+        ),
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "discovery_search_terms",
+        ("profile_version_id", "search_term"),
+        ("profile_version_id", "ordinal"),
+        {"ordinal": 2},
+        (
+            "profile_version_id=NEW.profile_version_id "
+            "AND ordinal=NEW.ordinal"
+        ),
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "video_metadata_snapshots",
+        ("video_id", "canonical_hash"),
+        ("id",),
+        {"id": 502},
+        "id=NEW.id",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "discovery_observations",
+        ("idempotency_key",),
+        ("id",),
+        {"id": 702},
+        "id=NEW.id",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "subject_video_candidates",
+        ("profile_id", "video_id"),
+        ("id",),
+        {"id": 802, "current_presence_decision_id": None},
+        "id=NEW.id",
+        "IMMUTABLE_CANDIDATE",
+    ),
+    LogicalIdentityCase(
+        "presence_decisions",
+        ("candidate_id", "decision_hash"),
+        ("id",),
+        {"id": 902},
+        "id=NEW.id",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "manual_discovery_requests",
+        ("profile_id", "youtube_video_id"),
+        ("id",),
+        {"id": 1002},
+        "id=NEW.id",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "youtube_daily_sync_requests",
+        ("job_id",),
+        ("jst_day",),
+        {"jst_day": "2026-08-19"},
+        "jst_day=NEW.jst_day",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "youtube_quota_reservations",
+        ("job_id", "unit_key", "request_ordinal", "attempt_no"),
+        ("id",),
+        {"id": 1102},
+        "id=NEW.id",
+        "APPEND_ONLY",
+    ),
+    LogicalIdentityCase(
+        "youtube_sync_manifest_profiles",
+        ("job_id", "profile_id"),
+        ("job_id", "ordinal"),
+        {"ordinal": 2},
+        "job_id=NEW.job_id AND ordinal=NEW.ordinal",
+        "APPEND_ONLY",
+    ),
 )
 
 
@@ -544,3 +661,274 @@ def test_only_one_youtube_sync_job_can_be_active(db):
             "'2026-08-18T00:00:00.000000Z')",
             ("manifest-pause", "pause_requested"),
         )
+
+
+def _seed_collection_logical_identity_graph(conn: sqlite3.Connection) -> None:
+    timestamp = "2026-08-18T00:00:00.000000Z"
+    conn.execute(
+        "INSERT INTO analysis_subjects(id, canonical_name, is_active, created_at) "
+        "VALUES (101, 'Synthetic identity subject', 1, ?)",
+        (timestamp,),
+    )
+    conn.execute(
+        "INSERT INTO discovery_profiles("
+        "id, subject_id, current_version_id, is_active, created_at"
+        ") VALUES (201, 101, NULL, 1, ?)",
+        (timestamp,),
+    )
+    conn.execute(
+        "INSERT INTO discovery_profile_versions("
+        "id, profile_id, config_hash, created_at"
+        ") VALUES (301, 201, 'profile-config-v1', ?)",
+        (timestamp,),
+    )
+    conn.execute(
+        "UPDATE discovery_profiles SET current_version_id=301 WHERE id=201"
+    )
+    conn.execute(
+        "INSERT INTO discovery_seed_channels("
+        "profile_version_id, ordinal, youtube_channel_id"
+        ") VALUES (301, 1, 'UCidentity0000000000000001')"
+    )
+    conn.execute(
+        "INSERT INTO discovery_search_terms("
+        "profile_version_id, ordinal, search_term"
+        ") VALUES (301, 1, 'Synthetic identity term')"
+    )
+    conn.execute(
+        "INSERT INTO videos(id, youtube_video_id, current_metadata_snapshot_id, "
+        "created_at) VALUES (401, 'identity001', NULL, ?)",
+        (timestamp,),
+    )
+    conn.execute(
+        """
+        INSERT INTO video_metadata_snapshots(
+            id, video_id, youtube_video_id, channel_id, channel_title,
+            title, description, published_at, duration_seconds, live_state,
+            actual_start_time, schema_version, canonical_hash, fetched_at
+        ) VALUES (
+            501, 401, 'identity001', 'UCidentity0000000000000001',
+            'Synthetic identity channel', 'Synthetic identity video',
+            'Synthetic identity description', ?, 60, 'not_live', NULL,
+            'youtube-video-metadata-v1', 'metadata-hash-v1', ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    conn.execute(
+        "UPDATE videos SET current_metadata_snapshot_id=501 WHERE id=401"
+    )
+    conn.execute(
+        """
+        INSERT INTO jobs(
+            id, source_job_id, job_kind, manifest_hash, total_units,
+            status, created_at, updated_at
+        ) VALUES (
+            601, NULL, 'youtube_sync', 'youtube-manifest-v1', 1,
+            'queued', ?, ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    conn.execute(
+        """
+        INSERT INTO job_units(
+            job_id, unit_key, stage, ordinal, declared_input_hash,
+            dependency_keys_json, execution_contract_hash, status
+        ) VALUES (
+            601, 'youtube:search:identity', 'youtube_search_discovery', 1,
+            'identity-input-v1', '[]', 'identity-contract-v1', 'pending'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO discovery_observations(
+            id, job_id, profile_id, video_id, metadata_snapshot_id,
+            metadata_snapshot_hash, source_kind, source_key, observed_at,
+            observation_hash, idempotency_key
+        ) VALUES (
+            701, 601, 201, 401, 501, 'metadata-hash-v1',
+            'cross_channel_search', 'Synthetic identity term', ?,
+            'observation-hash-v1', 'observation-idempotency-v1'
+        )
+        """,
+        (timestamp,),
+    )
+    conn.execute(
+        "INSERT INTO subject_video_candidates("
+        "id, profile_id, video_id, first_observation_id, "
+        "current_presence_decision_id, created_at"
+        ") VALUES (801, 201, 401, 701, NULL, ?)",
+        (timestamp,),
+    )
+    conn.execute(
+        """
+        INSERT INTO presence_decisions(
+            id, candidate_id, state, decision_origin, evidence_ref,
+            evidence_hash, decision_hash, created_at
+        ) VALUES (
+            901, 801, 'presence_unverified', 'collection_initial',
+            'observation:701', 'presence-evidence-v1',
+            'presence-decision-v1', ?
+        )
+        """,
+        (timestamp,),
+    )
+    conn.execute(
+        "UPDATE subject_video_candidates "
+        "SET current_presence_decision_id=901 WHERE id=801"
+    )
+    conn.execute(
+        "INSERT INTO manual_discovery_requests("
+        "id, profile_id, youtube_video_id, requested_at"
+        ") VALUES (1001, 201, 'manual001', ?)",
+        (timestamp,),
+    )
+    conn.execute(
+        """
+        INSERT INTO youtube_sync_manifests(
+            job_id, sync_kind, upper_bound, backfill_floor,
+            quota_contract_version, profile_set_hash, manual_request_id,
+            resume_not_before_utc, manifest_hash, created_at
+        ) VALUES (
+            601, 'full_discovery', ?, ?, 'quota-v1', 'profile-set-v1',
+            NULL, NULL, 'youtube-manifest-v1', ?
+        )
+        """,
+        (timestamp, timestamp, timestamp),
+    )
+    conn.execute(
+        """
+        INSERT INTO youtube_sync_manifest_profiles(
+            job_id, ordinal, profile_id, profile_version_id,
+            config_hash, discoverer_set_hash
+        ) VALUES (
+            601, 1, 201, 301, 'profile-config-v1', 'discoverers-v1'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO youtube_quota_reservations(
+            id, job_id, unit_key, request_ordinal, attempt_no,
+            endpoint_class, attempted_at
+        ) VALUES (
+            1101, 601, 'youtube:search:identity', 1, 1,
+            'search_list', ?
+        )
+        """,
+        (timestamp,),
+    )
+    conn.execute(
+        "INSERT INTO youtube_daily_sync_requests(jst_day, job_id, requested_at) "
+        "VALUES ('2026-08-18', 601, ?)",
+        (timestamp,),
+    )
+
+
+def _table_snapshot(
+    conn: sqlite3.Connection, table: str
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(tuple(row) for row in conn.execute(f"SELECT * FROM {table}"))
+
+
+def _collection_pointer_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[object, ...]:
+    return (
+        conn.execute(
+            "SELECT current_version_id FROM discovery_profiles WHERE id=201"
+        ).fetchone()[0],
+        conn.execute(
+            "SELECT current_metadata_snapshot_id FROM videos WHERE id=401"
+        ).fetchone()[0],
+        conn.execute(
+            "SELECT current_presence_decision_id "
+            "FROM subject_video_candidates WHERE id=801"
+        ).fetchone()[0],
+    )
+
+
+def _replacement_values(
+    conn: sqlite3.Connection, case: LogicalIdentityCase
+) -> tuple[tuple[str, ...], dict[str, object], sqlite3.Row]:
+    original = conn.execute(f"SELECT * FROM {case.table}").fetchone()
+    assert original is not None
+    values = dict(original)
+    values.update(case.primary_overrides)
+    return tuple(values), values, original
+
+
+def _insert_or_replace(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: tuple[str, ...],
+    values: dict[str, object],
+) -> None:
+    conn.execute(
+        f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        tuple(values[column] for column in columns),
+    )
+
+
+@pytest.mark.parametrize("case", COLLECTION_LOGICAL_IDENTITIES, ids=lambda c: c.table)
+def test_collection_logical_identity_replace_is_rejected_without_mutation(
+    db, case: LogicalIdentityCase
+):
+    _seed_collection_logical_identity_graph(db)
+    db.execute("PRAGMA foreign_keys=OFF")
+    db.execute("PRAGMA recursive_triggers=OFF")
+    assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+    assert db.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+    before_rows = _table_snapshot(db, case.table)
+    before_pointers = _collection_pointer_snapshot(db)
+    columns, values, _ = _replacement_values(db, case)
+
+    db.execute("BEGIN")
+    with pytest.raises(sqlite3.IntegrityError, match=case.error_code):
+        _insert_or_replace(db, case.table, columns, values)
+    assert _table_snapshot(db, case.table) == before_rows
+    assert _collection_pointer_snapshot(db) == before_pointers
+    db.execute("ROLLBACK")
+
+    assert _table_snapshot(db, case.table) == before_rows
+    assert _collection_pointer_snapshot(db) == before_pointers
+
+
+@pytest.mark.parametrize("case", COLLECTION_LOGICAL_IDENTITIES, ids=lambda c: c.table)
+def test_collection_logical_identity_guard_is_mutation_sensitive(
+    db, case: LogicalIdentityCase
+):
+    _seed_collection_logical_identity_graph(db)
+    db.execute("PRAGMA foreign_keys=OFF")
+    db.execute("PRAGMA recursive_triggers=OFF")
+    trigger_name = f"{case.table}_no_replace"
+    db.execute(f"DROP TRIGGER {trigger_name}")
+    db.execute(
+        f"CREATE TRIGGER {trigger_name} BEFORE INSERT ON {case.table} "
+        f"WHEN EXISTS (SELECT 1 FROM {case.table} WHERE {case.primary_guard}) "
+        f"BEGIN SELECT RAISE(ABORT, '{case.error_code}'); END"
+    )
+    columns, values, original = _replacement_values(db, case)
+
+    db.execute("BEGIN")
+    _insert_or_replace(db, case.table, columns, values)
+    primary_predicate = " AND ".join(
+        f"{column}=?" for column in case.primary_columns
+    )
+    old_primary = tuple(original[column] for column in case.primary_columns)
+    new_primary = tuple(values[column] for column in case.primary_columns)
+    assert old_primary != new_primary
+    assert db.execute(
+        f"SELECT 1 FROM {case.table} WHERE {primary_predicate}", old_primary
+    ).fetchone() is None
+    replacement = db.execute(
+        f"SELECT * FROM {case.table} WHERE {primary_predicate}", new_primary
+    ).fetchone()
+    assert replacement is not None
+    assert tuple(replacement[column] for column in case.logical_columns) == tuple(
+        original[column] for column in case.logical_columns
+    )
+    db.execute("ROLLBACK")
