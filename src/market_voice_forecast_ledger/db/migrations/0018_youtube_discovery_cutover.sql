@@ -2677,7 +2677,10 @@ CREATE TRIGGER videos_no_delete BEFORE DELETE ON videos
 BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VIDEO'); END;
 
 CREATE TRIGGER videos_no_replace BEFORE INSERT ON videos
-WHEN EXISTS (SELECT 1 FROM videos WHERE id=NEW.id)
+WHEN EXISTS (
+    SELECT 1 FROM videos
+    WHERE id=NEW.id OR youtube_video_id=NEW.youtube_video_id
+)
 BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VIDEO'); END;
 
 CREATE TRIGGER subject_video_candidates_limited_update

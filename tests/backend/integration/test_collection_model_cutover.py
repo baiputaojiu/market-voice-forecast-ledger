@@ -310,6 +310,14 @@ COLLECTION_LOGICAL_IDENTITIES = (
         "APPEND_ONLY",
     ),
     LogicalIdentityCase(
+        "videos",
+        ("youtube_video_id",),
+        ("id",),
+        {"id": 402, "current_metadata_snapshot_id": None},
+        "id=NEW.id",
+        "IMMUTABLE_VIDEO",
+    ),
+    LogicalIdentityCase(
         "video_metadata_snapshots",
         ("video_id", "canonical_hash"),
         ("id",),
