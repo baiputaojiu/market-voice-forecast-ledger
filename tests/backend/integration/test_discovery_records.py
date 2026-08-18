@@ -106,6 +106,25 @@ def _counts(db):
     )
 
 
+def _stored_discovery_state(db):
+    return tuple(
+        (
+            table,
+            tuple(
+                tuple(row)
+                for row in db.execute(f"SELECT * FROM {table} ORDER BY id")
+            ),
+        )
+        for table in (
+            "videos",
+            "video_metadata_snapshots",
+            "discovery_observations",
+            "subject_video_candidates",
+            "presence_decisions",
+        )
+    )
+
+
 def _utc_text(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -618,6 +637,55 @@ def test_changed_metadata_rejects_a_corrupt_current_snapshot_before_pointer_move
         "SELECT current_metadata_snapshot_id FROM videos "
         "WHERE youtube_video_id='video000017'"
     ).fetchone()[0] == first.snapshot_ids[0]
+
+
+@pytest.mark.parametrize("changed", (False, True), ids=("same", "changed"))
+def test_rediscovery_rejects_a_cleared_current_snapshot_without_mutation(db, changed):
+    profile = _profile_version(db)
+    original = _metadata(video_id="video000020")
+    _persist(
+        db,
+        job_id=_job(db, 23),
+        profile_version_id=profile.id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key="d1" * 32,
+        items=(original,),
+    )
+    db.execute("DROP TRIGGER videos_current_metadata_snapshot_owner_update")
+    db.execute(
+        "UPDATE videos SET current_metadata_snapshot_id=NULL "
+        "WHERE youtube_video_id=?",
+        (original.youtube_video_id,),
+    )
+    next_job_id = _job(db, 24)
+    before = _stored_discovery_state(db)
+    incoming = (
+        _metadata(
+            video_id=original.youtube_video_id,
+            title="Changed after cleared pointer",
+            fetched_at=OBSERVED_AT + timedelta(minutes=1),
+        )
+        if changed
+        else original
+    )
+
+    with pytest.raises(DomainError) as caught:
+        _persist(
+            db,
+            job_id=next_job_id,
+            profile_version_id=profile.id,
+            source_kind=DiscoverySourceKind.SEED_UPLOADS,
+            source_key="UCJ1DVBLVpe4FvBZZ94kreaQ",
+            items=(incoming,),
+        )
+
+    assert caught.value.code == "STORED_DISCOVERY_METADATA_INVALID"
+    assert _stored_discovery_state(db) == before
+    assert db.execute(
+        "SELECT current_metadata_snapshot_id FROM videos "
+        "WHERE youtube_video_id=?",
+        (original.youtube_video_id,),
+    ).fetchone()[0] is None
 
 
 def test_rediscovery_rejects_a_corrupt_first_observation_and_rolls_back(db):

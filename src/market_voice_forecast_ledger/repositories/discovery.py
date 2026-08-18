@@ -391,17 +391,21 @@ class DiscoveryRepository:
                 "STORED_DISCOVERY_METADATA_INVALID",
                 "stored video identity is invalid",
             )
-        if row["current_metadata_snapshot_id"] is not None:
-            current = self._conn.execute(
-                "SELECT * FROM video_metadata_snapshots WHERE id=?",
-                (row["current_metadata_snapshot_id"],),
-            ).fetchone()
-            if current is None or current["video_id"] != row["id"]:
-                raise DomainError(
-                    "STORED_DISCOVERY_METADATA_INVALID",
-                    "stored video metadata pointer is invalid",
-                )
-            _validate_snapshot_integrity(current)
+        if row["current_metadata_snapshot_id"] is None:
+            raise DomainError(
+                "STORED_DISCOVERY_METADATA_INVALID",
+                "stored video metadata pointer is invalid",
+            )
+        current = self._conn.execute(
+            "SELECT * FROM video_metadata_snapshots WHERE id=?",
+            (row["current_metadata_snapshot_id"],),
+        ).fetchone()
+        if current is None or current["video_id"] != row["id"]:
+            raise DomainError(
+                "STORED_DISCOVERY_METADATA_INVALID",
+                "stored video metadata pointer is invalid",
+            )
+        _validate_snapshot_integrity(current)
         return row["id"]
 
     def _get_or_create_snapshot(

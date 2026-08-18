@@ -2606,10 +2606,13 @@ BEGIN SELECT RAISE(ABORT, 'POINTER_OWNER_MISMATCH'); END;
 
 CREATE TRIGGER discovery_profiles_current_version_owner_update
 BEFORE UPDATE OF current_version_id ON discovery_profiles
-WHEN NEW.current_version_id IS NOT NULL
- AND NOT EXISTS (
-    SELECT 1 FROM discovery_profile_versions
-    WHERE id=NEW.current_version_id AND profile_id=OLD.id
+WHEN (OLD.current_version_id IS NOT NULL AND NEW.current_version_id IS NULL)
+ OR (
+    NEW.current_version_id IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM discovery_profile_versions
+        WHERE id=NEW.current_version_id AND profile_id=OLD.id
+    )
  )
 BEGIN SELECT RAISE(ABORT, 'POINTER_OWNER_MISMATCH'); END;
 
@@ -2624,10 +2627,16 @@ BEGIN SELECT RAISE(ABORT, 'POINTER_OWNER_MISMATCH'); END;
 
 CREATE TRIGGER videos_current_metadata_snapshot_owner_update
 BEFORE UPDATE OF current_metadata_snapshot_id ON videos
-WHEN NEW.current_metadata_snapshot_id IS NOT NULL
- AND NOT EXISTS (
-    SELECT 1 FROM video_metadata_snapshots
-    WHERE id=NEW.current_metadata_snapshot_id AND video_id=OLD.id
+WHEN (
+    OLD.current_metadata_snapshot_id IS NOT NULL
+    AND NEW.current_metadata_snapshot_id IS NULL
+ )
+ OR (
+    NEW.current_metadata_snapshot_id IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM video_metadata_snapshots
+        WHERE id=NEW.current_metadata_snapshot_id AND video_id=OLD.id
+    )
  )
 BEGIN SELECT RAISE(ABORT, 'POINTER_OWNER_MISMATCH'); END;
 
@@ -2642,10 +2651,16 @@ BEGIN SELECT RAISE(ABORT, 'POINTER_OWNER_MISMATCH'); END;
 
 CREATE TRIGGER subject_video_candidates_current_presence_owner_update
 BEFORE UPDATE OF current_presence_decision_id ON subject_video_candidates
-WHEN NEW.current_presence_decision_id IS NOT NULL
- AND NOT EXISTS (
-    SELECT 1 FROM presence_decisions
-    WHERE id=NEW.current_presence_decision_id AND candidate_id=OLD.id
+WHEN (
+    OLD.current_presence_decision_id IS NOT NULL
+    AND NEW.current_presence_decision_id IS NULL
+ )
+ OR (
+    NEW.current_presence_decision_id IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM presence_decisions
+        WHERE id=NEW.current_presence_decision_id AND candidate_id=OLD.id
+    )
  )
 BEGIN SELECT RAISE(ABORT, 'POINTER_OWNER_MISMATCH'); END;
 
