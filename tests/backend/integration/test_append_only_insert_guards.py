@@ -54,6 +54,18 @@ def populated_database(tmp_path_factory) -> Path:
         subject_id = conn.execute(
             "SELECT id FROM analysis_subjects ORDER BY id LIMIT 1"
         ).fetchone()[0]
+        profile_version_id = conn.execute(
+            "SELECT id FROM discovery_profile_versions ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        if conn.execute(
+            "SELECT COUNT(*) FROM discovery_seed_channels"
+        ).fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO discovery_seed_channels("
+                "profile_version_id, ordinal, youtube_channel_id"
+                ") VALUES (?, 1, 'UCabcdefghijklmnopqrstuv')",
+                (profile_version_id,),
+            )
         conn.execute(
             """
             INSERT INTO voice_reference_profiles(
@@ -139,6 +151,12 @@ def populated_database(tmp_path_factory) -> Path:
 _COLLISION_TABLES = (
     ("schema_migrations", "APPEND_ONLY"),
     ("audit_events", "APPEND_ONLY"),
+    ("discovery_profile_versions", "APPEND_ONLY"),
+    ("discovery_seed_channels", "APPEND_ONLY"),
+    ("discovery_search_terms", "APPEND_ONLY"),
+    ("video_metadata_snapshots", "APPEND_ONLY"),
+    ("discovery_observations", "APPEND_ONLY"),
+    ("presence_decisions", "APPEND_ONLY"),
     ("transcription_chunks", "APPEND_ONLY"),
     ("transcript_segments", "IMMUTABLE_TRANSCRIPT_BODY"),
     ("speaker_threshold_configs", "APPEND_ONLY"),
@@ -166,6 +184,57 @@ _COLLISION_TABLES = (
     ("video_pipeline_job_binding_sets", "IMMUTABLE_JOB_BINDING"),
     ("video_pipeline_job_bindings", "IMMUTABLE_JOB_BINDING"),
 )
+
+
+@pytest.mark.parametrize(
+    "table",
+    (
+        "discovery_profile_versions",
+        "discovery_seed_channels",
+        "discovery_search_terms",
+        "video_metadata_snapshots",
+        "discovery_observations",
+        "presence_decisions",
+    ),
+)
+def test_plain_sqlite_discovery_records_reject_raw_update_and_delete(
+    populated_database, table
+):
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        before = tuple(
+            tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")
+        )
+        assert before, table
+        first_column = conn.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchone()[1]
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            conn.execute(
+                f"UPDATE {table} SET {first_column}={first_column} "
+                f"WHERE rowid=(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1)"
+            )
+        conn.execute("ROLLBACK")
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            conn.execute(
+                f"DELETE FROM {table} "
+                f"WHERE rowid=(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1)"
+            )
+        conn.execute("ROLLBACK")
+        assert tuple(
+            tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")
+        ) == before
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
 
 
 @pytest.mark.parametrize(("table", "error_code"), _COLLISION_TABLES)
