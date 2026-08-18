@@ -8,6 +8,12 @@
 *.p12
 secrets/
 credentials/
+!src/market_voice_forecast_ledger/credentials/
+src/market_voice_forecast_ledger/credentials/*
+!src/market_voice_forecast_ledger/credentials/__init__.py
+!src/market_voice_forecast_ledger/credentials/windows.py
+src/market_voice_forecast_ledger/credentials/__init__.py/
+src/market_voice_forecast_ledger/credentials/windows.py/
 
 # Application data: never publish collected or derived real data
 data/

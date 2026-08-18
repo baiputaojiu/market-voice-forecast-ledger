@@ -24,6 +24,10 @@ $forbiddenDirectories = @(
     '.pytest_cache', '.mypy_cache', '.ruff_cache', '.idea', '.vscode',
     '.worktrees', 'dist', 'build', 'coverage'
 )
+$allowedCredentialSourceFiles = @(
+    'src/market_voice_forecast_ledger/credentials/__init__.py',
+    'src/market_voice_forecast_ledger/credentials/windows.py'
+)
 $forbiddenExtensions = @(
     '.db', '.sqlite', '.sqlite3', '.wav', '.mp3', '.m4a', '.aac',
     '.flac', '.ogg', '.mp4', '.mkv', '.webm', '.mov', '.safetensors',
@@ -227,10 +231,13 @@ function Get-RelativeFiles {
     $relativeFiles = New-Object System.Collections.Generic.List[string]
     foreach ($file in $files) {
         $relative = $file.FullName.Substring($scanRoot.Length).TrimStart('\', '/')
-        $segments = @($relative -split '[\\/]')
+        $normalized = $relative -replace '\\', '/'
+        $segments = @($normalized -split '/')
+        $isAllowedCredentialSource = $allowedCredentialSourceFiles -ccontains $normalized
         $excluded = $false
         foreach ($segment in $segments) {
-            if ($forbiddenDirectories -contains $segment) {
+            if ($forbiddenDirectories -contains $segment -and
+                -not ($segment -eq 'credentials' -and $isAllowedCredentialSource)) {
                 $excluded = $true
                 break
             }
@@ -247,8 +254,10 @@ $stagedIndexEntries = if ($Mode -eq 'Staged') { Get-StagedIndexEntries } else { 
 foreach ($relativePath in $relativeFiles) {
     $normalized = $relativePath -replace '\\', '/'
     $segments = @($normalized -split '/')
+    $isAllowedCredentialSource = $allowedCredentialSourceFiles -ccontains $normalized
     foreach ($segment in $segments) {
-        if ($forbiddenDirectories -contains $segment) {
+        if ($forbiddenDirectories -contains $segment -and
+            -not ($segment -eq 'credentials' -and $isAllowedCredentialSource)) {
             $violations.Add("Forbidden directory in path: $normalized")
             break
         }
