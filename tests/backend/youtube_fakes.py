@@ -5,6 +5,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.youtube.client import (
+    ChannelUploads,
+    YouTubePage,
+)
 
 
 FIXED_NOW = datetime(2026, 8, 18, 2, 3, 4, tzinfo=timezone.utc)
@@ -76,6 +80,114 @@ class FakeYouTubeTransport:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+class FakeYouTubeClient:
+    def __init__(
+        self,
+        *,
+        channel_responses: tuple[object, ...] = (),
+        playlist_responses: tuple[object, ...] = (),
+        search_responses: tuple[object, ...] = (),
+        video_responses: tuple[object, ...] = (),
+    ) -> None:
+        self._channel_responses = list(channel_responses)
+        self._playlist_responses = list(playlist_responses)
+        self._search_responses = list(search_responses)
+        self._video_responses = list(video_responses)
+        self.channel_calls: list[tuple[str, ...]] = []
+        self.playlist_calls: list[tuple[str, str | None]] = []
+        self.search_calls: list[tuple[str, str, str, str | None]] = []
+        self.video_calls: list[tuple[str, ...]] = []
+
+    def channels_uploads(
+        self, channel_ids: tuple[str, ...]
+    ) -> tuple[ChannelUploads, ...]:
+        self.channel_calls.append(channel_ids)
+        return self._next(self._channel_responses, "channels_uploads")  # type: ignore[return-value]
+
+    def playlist_items(
+        self, playlist_id: str, page_token: str | None
+    ) -> YouTubePage:
+        self.playlist_calls.append((playlist_id, page_token))
+        return self._next(self._playlist_responses, "playlist_items")  # type: ignore[return-value]
+
+    def search_videos(
+        self,
+        query: str,
+        published_after: str,
+        published_before: str,
+        page_token: str | None,
+    ) -> YouTubePage:
+        self.search_calls.append(
+            (query, published_after, published_before, page_token)
+        )
+        return self._next(self._search_responses, "search_videos")  # type: ignore[return-value]
+
+    def videos(
+        self, video_ids: tuple[str, ...]
+    ) -> tuple[Mapping[str, object], ...]:
+        self.video_calls.append(video_ids)
+        return self._next(self._video_responses, "videos")  # type: ignore[return-value]
+
+    @staticmethod
+    def _next(responses: list[object], method: str) -> object:
+        if not responses:
+            raise AssertionError(f"fake client received unexpected {method} call")
+        response = responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def synthetic_video_item(
+    *,
+    video_id: str = "video000001",
+    channel_id: str = "UCabcdefghijklmnopqrstuv",
+    channel_title: str = "Synthetic Channel",
+    title: str = "Synthetic market discussion",
+    description: str = "Synthetic description.\nSecond line.",
+    snippet_published_at: str = "2026-08-10T01:00:00Z",
+    actual_start_time: str | None = None,
+    duration: str = "PT10M",
+    live_broadcast_content: str = "none",
+    privacy_status: str = "public",
+    upload_status: str = "processed",
+) -> dict[str, object]:
+    live_details: dict[str, object] = {
+        "scheduledStartTime": "2026-08-10T02:00:00Z",
+    }
+    if actual_start_time is not None:
+        live_details["actualStartTime"] = actual_start_time
+    return {
+        "etag": "provider-only-etag",
+        "id": video_id,
+        "kind": "youtube#video",
+        "snippet": {
+            "publishedAt": snippet_published_at,
+            "channelId": channel_id,
+            "channelTitle": channel_title,
+            "title": title,
+            "description": description,
+            "liveBroadcastContent": live_broadcast_content,
+            "tags": ["synthetic", "market"],
+            "thumbnails": {"default": {"url": "https://provider.invalid/image"}},
+        },
+        "contentDetails": {
+            "duration": duration,
+            "definition": "hd",
+            "licensedContent": True,
+        },
+        "liveStreamingDetails": live_details,
+        "status": {
+            "privacyStatus": privacy_status,
+            "uploadStatus": upload_status,
+            "embeddable": True,
+            "publicStatsViewable": True,
+        },
+        "statistics": {"viewCount": "123"},
+        "topicDetails": {"topicCategories": ["synthetic"]},
+    }
 
 
 class RecordingReservation:
