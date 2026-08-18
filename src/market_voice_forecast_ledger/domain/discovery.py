@@ -5,6 +5,7 @@ from enum import StrEnum
 
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text, utc_iso
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.domain.enums import JobStage
 
 
 _YOUTUBE_CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
@@ -34,6 +35,11 @@ class LiveState(StrEnum):
     NOT_LIVE = "not_live"
     LIVE = "live"
     UPCOMING = "upcoming"
+
+
+class YouTubeSyncKind(StrEnum):
+    FULL_DISCOVERY = "full_discovery"
+    MANUAL = "manual"
 
 
 def canonical_profile_hash(
@@ -282,6 +288,297 @@ class SearchWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class YouTubeSyncManifestProfile:
+    ordinal: int
+    profile_id: int
+    profile_version_id: int
+    config_hash: str
+    discoverer_set_hash: str
+
+
+YOUTUBE_SEED_EXECUTION_CONTRACT = "youtube-seed-discovery-contract-v1"
+YOUTUBE_SEARCH_EXECUTION_CONTRACT = "youtube-search-discovery-contract-v1"
+YOUTUBE_MANUAL_EXECUTION_CONTRACT = "youtube-manual-discovery-contract-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class YouTubeSyncUnitSpec:
+    unit_key: str
+    stage: JobStage
+    ordinal: int
+    profile_id: int
+    profile_version_id: int
+    config_hash: str
+    source_kind: DiscoverySourceKind
+    source_key: str
+    declared_input_hash: str
+    execution_contract_hash: str
+
+
+def build_youtube_sync_shape(
+    *,
+    sync_kind: YouTubeSyncKind,
+    profiles: tuple[DiscoveryProfileVersion, ...],
+    upper_bound: datetime,
+    backfill_floor: datetime,
+    quota_contract_version: str,
+    manual_request_id: int | None,
+    manual_video_id: str | None,
+) -> tuple[
+    tuple[YouTubeSyncManifestProfile, ...],
+    tuple[YouTubeSyncUnitSpec, ...],
+]:
+    if (
+        type(sync_kind) is not YouTubeSyncKind
+        or type(profiles) is not tuple
+        or not profiles
+        or any(type(profile) is not DiscoveryProfileVersion for profile in profiles)
+        or len({profile.profile_id for profile in profiles}) != len(profiles)
+        or not _is_exact_utc(upper_bound)
+        or not _is_exact_utc(backfill_floor)
+        or backfill_floor > upper_bound
+        or type(quota_contract_version) is not str
+        or not quota_contract_version
+    ):
+        _raise_sync_manifest_invalid()
+    for profile in profiles:
+        if (
+            profile.id <= 0
+            or profile.profile_id <= 0
+            or profile.config_hash
+            != canonical_profile_hash(
+                profile.seed_channel_ids, profile.search_terms
+            )
+        ):
+            _raise_sync_manifest_invalid()
+    if sync_kind is YouTubeSyncKind.FULL_DISCOVERY:
+        if manual_request_id is not None or manual_video_id is not None:
+            _raise_sync_manifest_invalid()
+    elif (
+        len(profiles) != 1
+        or type(manual_request_id) is not int
+        or manual_request_id <= 0
+        or type(manual_video_id) is not str
+        or backfill_floor != upper_bound
+    ):
+        _raise_sync_manifest_invalid()
+
+    unit_specs: list[YouTubeSyncUnitSpec] = []
+    manifest_profiles: list[YouTubeSyncManifestProfile] = []
+    manual_hash = (
+        None
+        if manual_video_id is None
+        else youtube_manual_video_hash(manual_video_id)
+    )
+    ordinal = 1
+    for profile_ordinal, profile in enumerate(profiles, start=1):
+        sources: tuple[
+            tuple[str, JobStage, DiscoverySourceKind, str, str], ...
+        ]
+        if sync_kind is YouTubeSyncKind.FULL_DISCOVERY:
+            seed_sources = tuple(
+                (
+                    f"youtube:profile:{profile.profile_id}:seed:{channel_id}",
+                    JobStage.YOUTUBE_SEED_DISCOVERY,
+                    DiscoverySourceKind.SEED_UPLOADS,
+                    channel_id,
+                    YOUTUBE_SEED_EXECUTION_CONTRACT,
+                )
+                for channel_id in profile.seed_channel_ids
+            )
+            sources = seed_sources + (
+                (
+                    f"youtube:profile:{profile.profile_id}:search",
+                    JobStage.YOUTUBE_SEARCH_DISCOVERY,
+                    DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+                    youtube_search_source_key(profile.search_terms),
+                    YOUTUBE_SEARCH_EXECUTION_CONTRACT,
+                ),
+            )
+        else:
+            sources = (
+                (
+                    f"youtube:manual-request:{manual_request_id}",
+                    JobStage.YOUTUBE_MANUAL_DISCOVERY,
+                    DiscoverySourceKind.MANUAL_URL,
+                    f"manual-request:{manual_request_id}",
+                    YOUTUBE_MANUAL_EXECUTION_CONTRACT,
+                ),
+            )
+        profile_keys = tuple(source[0] for source in sources)
+        manifest_profiles.append(
+            YouTubeSyncManifestProfile(
+                ordinal=profile_ordinal,
+                profile_id=profile.profile_id,
+                profile_version_id=profile.id,
+                config_hash=profile.config_hash,
+                discoverer_set_hash=youtube_discoverer_set_hash(profile_keys),
+            )
+        )
+        for unit_key, stage, source_kind, source_key, contract in sources:
+            unit_specs.append(
+                YouTubeSyncUnitSpec(
+                    unit_key=unit_key,
+                    stage=stage,
+                    ordinal=ordinal,
+                    profile_id=profile.profile_id,
+                    profile_version_id=profile.id,
+                    config_hash=profile.config_hash,
+                    source_kind=source_kind,
+                    source_key=source_key,
+                    declared_input_hash=youtube_sync_unit_input_hash(
+                        sync_kind=sync_kind,
+                        upper_bound=upper_bound,
+                        backfill_floor=backfill_floor,
+                        quota_contract_version=quota_contract_version,
+                        profile_id=profile.profile_id,
+                        profile_version_id=profile.id,
+                        config_hash=profile.config_hash,
+                        source_kind=source_kind,
+                        source_key=source_key,
+                        manual_request_id=manual_request_id,
+                        manual_video_id_hash=manual_hash,
+                    ),
+                    execution_contract_hash=contract,
+                )
+            )
+            ordinal += 1
+    return tuple(manifest_profiles), tuple(unit_specs)
+
+
+def _raise_sync_manifest_invalid() -> None:
+    raise DomainError(
+        "YOUTUBE_SYNC_MANIFEST_INVALID",
+        "YouTube sync manifest is invalid",
+    )
+
+
+def youtube_search_source_key(search_terms: tuple[str, ...]) -> str:
+    validate_profile_configuration((), search_terms)
+    return sha256_text(canonical_json({
+        "ordered_terms": list(search_terms),
+        "schema": "youtube-search-source.v1",
+    }))
+
+
+def youtube_discoverer_set_hash(unit_keys: tuple[str, ...]) -> str:
+    return sha256_text(canonical_json({
+        "schema": "youtube-sync-discoverer-set.v1",
+        "unit_keys": list(unit_keys),
+    }))
+
+
+def youtube_profile_set_hash(
+    profiles: tuple[YouTubeSyncManifestProfile, ...],
+) -> str:
+    return sha256_text(canonical_json({
+        "profiles": [
+            {
+                "config_hash": profile.config_hash,
+                "discoverer_set_hash": profile.discoverer_set_hash,
+                "ordinal": profile.ordinal,
+                "profile_id": profile.profile_id,
+                "profile_version_id": profile.profile_version_id,
+            }
+            for profile in profiles
+        ],
+        "schema": "youtube-sync-profile-set.v1",
+    }))
+
+
+def youtube_manual_video_hash(youtube_video_id: str) -> str:
+    if type(youtube_video_id) is not str or _YOUTUBE_VIDEO_ID.fullmatch(
+        youtube_video_id
+    ) is None:
+        raise DomainError(
+            "YOUTUBE_SYNC_MANIFEST_INVALID",
+            "manual YouTube video identity is invalid",
+        )
+    return sha256_text(canonical_json({
+        "schema": "youtube-manual-video.v1",
+        "youtube_video_id": youtube_video_id,
+    }))
+
+
+def youtube_sync_unit_input_hash(
+    *,
+    sync_kind: YouTubeSyncKind,
+    upper_bound: datetime,
+    backfill_floor: datetime,
+    quota_contract_version: str,
+    profile_id: int,
+    profile_version_id: int,
+    config_hash: str,
+    source_kind: DiscoverySourceKind,
+    source_key: str,
+    manual_request_id: int | None,
+    manual_video_id_hash: str | None,
+) -> str:
+    return sha256_text(canonical_json({
+        "backfill_floor": utc_iso(backfill_floor),
+        "config_hash": config_hash,
+        "manual_request_id": manual_request_id,
+        "manual_video_id_hash": manual_video_id_hash,
+        "profile_id": profile_id,
+        "profile_version_id": profile_version_id,
+        "quota_contract_version": quota_contract_version,
+        "schema": "youtube-sync-unit-input.v1",
+        "source_key": source_key,
+        "source_kind": source_kind.value,
+        "sync_kind": sync_kind.value,
+        "upper_bound": utc_iso(upper_bound),
+    }))
+
+
+@dataclass(frozen=True, slots=True)
+class YouTubeSyncCheckpoint:
+    job_id: int
+    unit_key: str
+    source_kind: DiscoverySourceKind
+    source_key: str
+    effective_lower_bound: datetime
+    upper_bound: datetime
+    uploads_playlist_id: str | None
+    next_page_token: str | None
+    page_count: int
+    batch_ordinal: int
+    completed_at: datetime | None
+    checkpoint_hash: str
+
+
+def canonical_youtube_sync_checkpoint_hash(
+    *,
+    job_id: int,
+    unit_key: str,
+    source_kind: DiscoverySourceKind,
+    source_key: str,
+    effective_lower_bound: datetime,
+    upper_bound: datetime,
+    uploads_playlist_id: str | None,
+    next_page_token: str | None,
+    page_count: int,
+    batch_ordinal: int,
+    completed_at: datetime | None,
+) -> str:
+    return sha256_text(canonical_json({
+        "batch_ordinal": batch_ordinal,
+        "completed_at": (
+            None if completed_at is None else utc_iso(completed_at)
+        ),
+        "effective_lower_bound": utc_iso(effective_lower_bound),
+        "job_id": job_id,
+        "next_page_token": next_page_token,
+        "page_count": page_count,
+        "schema": "youtube-sync-checkpoint.v1",
+        "source_key": source_key,
+        "source_kind": source_kind.value,
+        "unit_key": unit_key,
+        "uploads_playlist_id": uploads_playlist_id,
+        "upper_bound": utc_iso(upper_bound),
+    }))
+
+
+@dataclass(frozen=True, slots=True)
 class YouTubeSyncManifest:
     job_id: int
     sync_kind: str
@@ -293,3 +590,4 @@ class YouTubeSyncManifest:
     resume_not_before_utc: datetime | None
     manifest_hash: str
     created_at: datetime
+    profiles: tuple[YouTubeSyncManifestProfile, ...]

@@ -35,6 +35,13 @@ ANALYSIS_SCOPE_STAGES = frozenset(
         JobStage.HEATMAP_UPDATE,
     }
 )
+YOUTUBE_SYNC_STAGES = frozenset(
+    {
+        JobStage.YOUTUBE_SEED_DISCOVERY,
+        JobStage.YOUTUBE_SEARCH_DISCOVERY,
+        JobStage.YOUTUBE_MANUAL_DISCOVERY,
+    }
+)
 
 STAGE_ORDER = (
     JobStage.VIDEO_METADATA,
@@ -45,6 +52,9 @@ STAGE_ORDER = (
     JobStage.CODEX_ANALYSIS,
     JobStage.ASSET_MAPPING,
     JobStage.HEATMAP_UPDATE,
+    JobStage.YOUTUBE_SEED_DISCOVERY,
+    JobStage.YOUTUBE_SEARCH_DISCOVERY,
+    JobStage.YOUTUBE_MANUAL_DISCOVERY,
 )
 
 LEGAL_TRANSITIONS = {
@@ -167,12 +177,18 @@ class JobManifest:
                 "INVALID_VIDEO_MANIFEST",
                 "video manifest cannot contain analysis-reserved units",
             )
+        if kind is JobKind.YOUTUBE_SYNC and (input_count or final_count):
+            raise DomainError(
+                "INVALID_YOUTUBE_MANIFEST",
+                "YouTube manifest cannot contain analysis-reserved units",
+            )
 
-        allowed = (
-            ANALYSIS_SCOPE_STAGES
-            if kind is JobKind.ANALYSIS_SCOPE
-            else VIDEO_PIPELINE_STAGES
-        )
+        if kind is JobKind.ANALYSIS_SCOPE:
+            allowed = ANALYSIS_SCOPE_STAGES
+        elif kind is JobKind.VIDEO_PIPELINE:
+            allowed = VIDEO_PIPELINE_STAGES
+        else:
+            allowed = YOUTUBE_SYNC_STAGES
         if any(item.stage not in allowed for item in ordered):
             raise DomainError(
                 "INVALID_JOB_STAGE", "unit stage does not belong to job kind"

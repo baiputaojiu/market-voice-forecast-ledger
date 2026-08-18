@@ -27,6 +27,9 @@ class JobStage(StrEnum):
     CODEX_ANALYSIS = "codex_analysis"
     ASSET_MAPPING = "asset_mapping"
     HEATMAP_UPDATE = "heatmap_update"
+    YOUTUBE_SEED_DISCOVERY = "youtube_seed_discovery"
+    YOUTUBE_SEARCH_DISCOVERY = "youtube_search_discovery"
+    YOUTUBE_MANUAL_DISCOVERY = "youtube_manual_discovery"
 
 
 class JobStatus(StrEnum):

@@ -141,6 +141,31 @@ class JobRepository:
             status=JobStatus(row["status"]),
         )
 
+    def list_youtube_sync_job_ids(
+        self,
+        statuses: tuple[JobStatus, ...],
+        *,
+        newest_first: bool,
+    ) -> tuple[int, ...]:
+        if (
+            type(statuses) is not tuple
+            or not statuses
+            or any(type(status) is not JobStatus for status in statuses)
+            or len(set(statuses)) != len(statuses)
+        ):
+            raise DomainError(
+                "YOUTUBE_SYNC_QUEUE_INVALID",
+                "YouTube sync queue status filter is invalid",
+            )
+        placeholders = ",".join("?" for _ in statuses)
+        direction = "DESC" if newest_first else "ASC"
+        rows = self._conn.execute(
+            f"SELECT id FROM jobs WHERE job_kind=? "
+            f"AND status IN ({placeholders}) ORDER BY id {direction}",
+            (JobKind.YOUTUBE_SYNC.value, *(status.value for status in statuses)),
+        )
+        return tuple(row["id"] for row in rows)
+
     def create_sealed_video_pipeline_bindings(
         self, job_id: int, candidate_ids: tuple[int, ...]
     ) -> None:

@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -17,14 +18,24 @@ from market_voice_forecast_ledger.domain.discovery import (
     PresenceOrigin,
     PresenceState,
     SubjectVideoCandidate,
+    YouTubeSyncCheckpoint,
+    YouTubeSyncKind,
+    YouTubeSyncManifest,
+    YouTubeSyncManifestProfile,
+    build_youtube_sync_shape,
+    canonical_youtube_sync_checkpoint_hash,
     canonical_presence_decision_hash,
     canonical_profile_hash,
     validate_canonical_video_metadata,
+    youtube_profile_set_hash,
 )
+from market_voice_forecast_ledger.domain.enums import JobKind, JobStage, UnitStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
 
 
 _UTC_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+_CANONICAL_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _YOUTUBE_ENDPOINT_CLASSES = frozenset({
     "search_list",
@@ -500,6 +511,565 @@ class DiscoveryRepository:
             search_terms=terms,
             created_at=created_at,
         )
+
+    def create_youtube_sync_manifest(
+        self,
+        *,
+        job_id: int,
+        sync_kind: str,
+        upper_bound: datetime,
+        backfill_floor: datetime,
+        quota_contract_version: str,
+        profiles: tuple[DiscoveryProfileVersion, ...],
+        manual_request_id: int | None,
+        created_at: datetime,
+    ) -> YouTubeSyncManifest:
+        self._require_transaction()
+        try:
+            kind = YouTubeSyncKind(sync_kind)
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "YOUTUBE_SYNC_MANIFEST_INVALID",
+                "YouTube sync manifest is invalid",
+            ) from cause
+        if not _is_exact_utc(created_at):
+            raise DomainError(
+                "YOUTUBE_SYNC_MANIFEST_INVALID",
+                "YouTube sync manifest is invalid",
+            )
+        manual_video_id: str | None = None
+        if kind is YouTubeSyncKind.FULL_DISCOVERY:
+            current = self.list_active_profile_versions()
+            if profiles != current:
+                raise DomainError(
+                    "YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "full sync must bind every current active profile version",
+                )
+        else:
+            request = self._manual_request(manual_request_id)
+            current = self.get_current_profile_version(request["subject_id"])
+            if profiles != (current,) or request["profile_id"] != current.profile_id:
+                raise DomainError(
+                    "YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "manual sync profile binding is invalid",
+                )
+            manual_video_id = request["youtube_video_id"]
+
+        manifest_profiles, unit_specs = build_youtube_sync_shape(
+            sync_kind=kind,
+            profiles=profiles,
+            upper_bound=upper_bound,
+            backfill_floor=backfill_floor,
+            quota_contract_version=quota_contract_version,
+            manual_request_id=manual_request_id,
+            manual_video_id=manual_video_id,
+        )
+        generic = self._stored_youtube_job_manifest(job_id)
+        self._require_expected_youtube_units(generic, unit_specs)
+        profile_set_hash = youtube_profile_set_hash(manifest_profiles)
+        self._conn.execute(
+            "INSERT INTO youtube_sync_manifests("
+            "job_id, sync_kind, upper_bound, backfill_floor, "
+            "quota_contract_version, profile_set_hash, manual_request_id, "
+            "resume_not_before_utc, manifest_hash, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (
+                job_id,
+                kind.value,
+                utc_iso(upper_bound),
+                utc_iso(backfill_floor),
+                quota_contract_version,
+                profile_set_hash,
+                manual_request_id,
+                generic.manifest_hash,
+                utc_iso(created_at),
+            ),
+        )
+        self._conn.executemany(
+            "INSERT INTO youtube_sync_manifest_profiles("
+            "job_id, ordinal, profile_id, profile_version_id, config_hash, "
+            "discoverer_set_hash) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    job_id,
+                    item.ordinal,
+                    item.profile_id,
+                    item.profile_version_id,
+                    item.config_hash,
+                    item.discoverer_set_hash,
+                )
+                for item in manifest_profiles
+            ),
+        )
+        for spec in unit_specs:
+            checkpoint_hash = canonical_youtube_sync_checkpoint_hash(
+                job_id=job_id,
+                unit_key=spec.unit_key,
+                source_kind=spec.source_kind,
+                source_key=spec.source_key,
+                effective_lower_bound=backfill_floor,
+                upper_bound=upper_bound,
+                uploads_playlist_id=None,
+                next_page_token=None,
+                page_count=0,
+                batch_ordinal=0,
+                completed_at=None,
+            )
+            self._conn.execute(
+                "INSERT INTO youtube_sync_checkpoints("
+                "job_id, unit_key, source_kind, source_key, "
+                "effective_lower_bound, upper_bound, uploads_playlist_id, "
+                "next_page_token, page_count, batch_ordinal, completed_at, "
+                "checkpoint_hash) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, NULL, ?)",
+                (
+                    job_id,
+                    spec.unit_key,
+                    spec.source_kind.value,
+                    spec.source_key,
+                    utc_iso(backfill_floor),
+                    utc_iso(upper_bound),
+                    checkpoint_hash,
+                ),
+            )
+        return self.get_youtube_sync_manifest(job_id)
+
+    def get_youtube_sync_manifest(self, job_id: int) -> YouTubeSyncManifest:
+        generic = self._stored_youtube_job_manifest(job_id)
+        row = self._conn.execute(
+            "SELECT manifest.*, job.created_at AS job_created_at "
+            "FROM youtube_sync_manifests AS manifest "
+            "JOIN jobs AS job ON job.id=manifest.job_id WHERE manifest.job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            )
+        try:
+            kind = YouTubeSyncKind(row["sync_kind"])
+            upper_bound = _parse_canonical_utc(row["upper_bound"])
+            backfill_floor = _parse_canonical_utc(row["backfill_floor"])
+            created_at = _parse_canonical_utc(row["created_at"])
+            job_created_at = _parse_canonical_utc(row["job_created_at"])
+            resume_not_before = (
+                None
+                if row["resume_not_before_utc"] is None
+                else _parse_canonical_utc(row["resume_not_before_utc"])
+            )
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            ) from cause
+        if (
+            row["job_id"] != job_id
+            or row["manifest_hash"] != generic.manifest_hash
+            or created_at != job_created_at
+            or created_at != upper_bound
+            or backfill_floor > upper_bound
+            or type(row["quota_contract_version"]) is not str
+            or not row["quota_contract_version"]
+            or type(row["profile_set_hash"]) is not str
+            or _CANONICAL_HASH.fullmatch(row["profile_set_hash"]) is None
+            or (resume_not_before is not None and resume_not_before < created_at)
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            )
+        profile_rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM youtube_sync_manifest_profiles "
+                "WHERE job_id=? ORDER BY ordinal",
+                (job_id,),
+            )
+        )
+        if not profile_rows or tuple(
+            profile["ordinal"] for profile in profile_rows
+        ) != tuple(range(1, len(profile_rows) + 1)):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            )
+        versions: list[DiscoveryProfileVersion] = []
+        stored_profiles: list[YouTubeSyncManifestProfile] = []
+        for profile_row in profile_rows:
+            try:
+                version = self.get_profile_version(profile_row["profile_version_id"])
+            except (LookupError, DomainError) as cause:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "stored YouTube sync profile binding is invalid",
+                ) from cause
+            stored_profile = YouTubeSyncManifestProfile(
+                ordinal=profile_row["ordinal"],
+                profile_id=profile_row["profile_id"],
+                profile_version_id=profile_row["profile_version_id"],
+                config_hash=profile_row["config_hash"],
+                discoverer_set_hash=profile_row["discoverer_set_hash"],
+            )
+            if (
+                version.profile_id != stored_profile.profile_id
+                or version.id != stored_profile.profile_version_id
+                or version.config_hash != stored_profile.config_hash
+                or _CANONICAL_HASH.fullmatch(
+                    stored_profile.discoverer_set_hash
+                ) is None
+            ):
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "stored YouTube sync profile binding is invalid",
+                )
+            versions.append(version)
+            stored_profiles.append(stored_profile)
+
+        manual_video_id: str | None = None
+        if kind is YouTubeSyncKind.MANUAL:
+            request = self._manual_request(row["manual_request_id"])
+            if request["profile_id"] != stored_profiles[0].profile_id:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "stored manual sync request binding is invalid",
+                )
+            manual_video_id = request["youtube_video_id"]
+        elif row["manual_request_id"] is not None:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored full sync request binding is invalid",
+            )
+        try:
+            expected_profiles, unit_specs = build_youtube_sync_shape(
+                sync_kind=kind,
+                profiles=tuple(versions),
+                upper_bound=upper_bound,
+                backfill_floor=backfill_floor,
+                quota_contract_version=row["quota_contract_version"],
+                manual_request_id=row["manual_request_id"],
+                manual_video_id=manual_video_id,
+            )
+        except DomainError as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            ) from cause
+        if (
+            tuple(stored_profiles) != expected_profiles
+            or row["profile_set_hash"]
+            != youtube_profile_set_hash(expected_profiles)
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync profile set is invalid",
+            )
+        self._require_expected_youtube_units(generic, unit_specs)
+        self._validated_youtube_checkpoints(
+            job_id=job_id,
+            unit_specs=unit_specs,
+            manifest_backfill_floor=backfill_floor,
+            manifest_upper_bound=upper_bound,
+            manual=(kind is YouTubeSyncKind.MANUAL),
+        )
+        return YouTubeSyncManifest(
+            job_id=job_id,
+            sync_kind=kind.value,
+            upper_bound=upper_bound,
+            backfill_floor=backfill_floor,
+            quota_contract_version=row["quota_contract_version"],
+            profile_set_hash=row["profile_set_hash"],
+            manual_request_id=row["manual_request_id"],
+            resume_not_before_utc=resume_not_before,
+            manifest_hash=row["manifest_hash"],
+            created_at=created_at,
+            profiles=tuple(stored_profiles),
+        )
+
+    def verified_youtube_artifact_hashes(
+        self, job_id: int
+    ) -> dict[str, str]:
+        self.get_youtube_sync_manifest(job_id)
+        rows = self._conn.execute(
+            "SELECT unit_key, output_hash FROM job_units "
+            "WHERE job_id=? AND status=? ORDER BY ordinal",
+            (job_id, UnitStatus.SUCCESS.value),
+        )
+        return {row["unit_key"]: row["output_hash"] for row in rows}
+
+    def set_youtube_resume_not_before(
+        self, job_id: int, value: datetime | None
+    ) -> None:
+        self._require_transaction()
+        manifest = self.get_youtube_sync_manifest(job_id)
+        if value is not None and (
+            not _is_exact_utc(value) or value < manifest.created_at
+        ):
+            raise DomainError(
+                "YOUTUBE_SYNC_DEFER_INVALID",
+                "YouTube sync defer time is invalid",
+            )
+        cursor = self._conn.execute(
+            "UPDATE youtube_sync_manifests SET resume_not_before_utc=? "
+            "WHERE job_id=?",
+            (None if value is None else utc_iso(value), job_id),
+        )
+        if cursor.rowcount != 1:
+            raise DomainError(
+                "YOUTUBE_SYNC_MANIFEST_NOT_FOUND",
+                "YouTube sync manifest does not exist",
+            )
+        self.get_youtube_sync_manifest(job_id)
+
+    def find_manual_sync_job_id(self, manual_request_id: int) -> int | None:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT job_id FROM youtube_sync_manifests "
+                "WHERE sync_kind='manual' AND manual_request_id=? ORDER BY job_id",
+                (manual_request_id,),
+            )
+        )
+        if len(rows) > 1:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "manual request is linked to multiple sync jobs",
+            )
+        return None if not rows else rows[0]["job_id"]
+
+    def manual_sync_request_binding(
+        self, manual_request_id: int
+    ) -> tuple[DiscoveryProfileVersion, str]:
+        request = self._manual_request(manual_request_id)
+        version = self.get_current_profile_version(request["subject_id"])
+        if version.profile_id != request["profile_id"]:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored manual sync request binding is invalid",
+            )
+        return version, request["youtube_video_id"]
+
+    def _manual_request(self, manual_request_id: object) -> sqlite3.Row:
+        if type(manual_request_id) is not int or manual_request_id <= 0:
+            raise DomainError(
+                "YOUTUBE_SYNC_MANIFEST_INVALID",
+                "manual sync request identity is invalid",
+            )
+        row = self._conn.execute(
+            "SELECT request.*, profile.subject_id "
+            "FROM manual_discovery_requests AS request "
+            "JOIN discovery_profiles AS profile ON profile.id=request.profile_id "
+            "WHERE request.id=?",
+            (manual_request_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "YOUTUBE_SYNC_MANIFEST_INVALID",
+                "manual sync request does not exist",
+            )
+        try:
+            _parse_canonical_utc(row["requested_at"])
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored manual sync request is invalid",
+            ) from cause
+        if (
+            type(row["profile_id"]) is not int
+            or row["profile_id"] <= 0
+            or type(row["subject_id"]) is not int
+            or row["subject_id"] <= 0
+            or type(row["youtube_video_id"]) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{11}", row["youtube_video_id"])
+            is None
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored manual sync request is invalid",
+            )
+        return row
+
+    def _stored_youtube_job_manifest(self, job_id: int) -> JobManifest:
+        row = self._conn.execute(
+            "SELECT job_kind, manifest_hash, total_units FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None or row["job_kind"] != JobKind.YOUTUBE_SYNC.value:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync job is invalid",
+            )
+        unit_rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM job_units WHERE job_id=? ORDER BY ordinal",
+                (job_id,),
+            )
+        )
+        try:
+            manifest = JobManifest.build(
+                JobKind.YOUTUBE_SYNC,
+                tuple(
+                    ManifestUnit(
+                        unit["unit_key"],
+                        JobStage(unit["stage"]),
+                        unit["ordinal"],
+                        unit["declared_input_hash"],
+                        tuple(json.loads(unit["dependency_keys_json"])),
+                        unit["execution_contract_hash"],
+                    )
+                    for unit in unit_rows
+                ),
+            )
+        except (DomainError, TypeError, ValueError, json.JSONDecodeError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync job manifest is invalid",
+            ) from cause
+        if (
+            row["manifest_hash"] != manifest.manifest_hash
+            or row["total_units"] != len(unit_rows)
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync job manifest is invalid",
+            )
+        return manifest
+
+    @staticmethod
+    def _require_expected_youtube_units(generic, unit_specs) -> None:
+        expected = tuple(
+            ManifestUnit(
+                spec.unit_key,
+                spec.stage,
+                spec.ordinal,
+                spec.declared_input_hash,
+                (),
+                spec.execution_contract_hash,
+            )
+            for spec in unit_specs
+        )
+        if generic.units != expected:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync units do not match the sealed manifest",
+            )
+
+    def _validated_youtube_checkpoints(
+        self,
+        *,
+        job_id: int,
+        unit_specs,
+        manifest_backfill_floor: datetime,
+        manifest_upper_bound: datetime,
+        manual: bool,
+    ) -> tuple[YouTubeSyncCheckpoint, ...]:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT checkpoint.* FROM youtube_sync_checkpoints AS checkpoint "
+                "JOIN job_units AS unit ON unit.job_id=checkpoint.job_id "
+                "AND unit.unit_key=checkpoint.unit_key "
+                "WHERE checkpoint.job_id=? ORDER BY unit.ordinal",
+                (job_id,),
+            )
+        )
+        if len(rows) != len(unit_specs):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                "stored YouTube sync checkpoint set is invalid",
+            )
+        stored_units = {
+            row["unit_key"]: row
+            for row in self._conn.execute(
+                "SELECT unit_key, status, output_hash FROM job_units WHERE job_id=?",
+                (job_id,),
+            )
+        }
+        values: list[YouTubeSyncCheckpoint] = []
+        for row, spec in zip(rows, unit_specs, strict=True):
+            try:
+                source_kind = DiscoverySourceKind(row["source_kind"])
+                effective_lower = _parse_canonical_utc(
+                    row["effective_lower_bound"]
+                )
+                upper_bound = _parse_canonical_utc(row["upper_bound"])
+                completed_at = (
+                    None
+                    if row["completed_at"] is None
+                    else _parse_canonical_utc(row["completed_at"])
+                )
+            except (TypeError, ValueError) as cause:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                    "stored YouTube sync checkpoint is invalid",
+                ) from cause
+            unit = stored_units.get(spec.unit_key)
+            if (
+                row["job_id"] != job_id
+                or row["unit_key"] != spec.unit_key
+                or source_kind is not spec.source_kind
+                or row["source_key"] != spec.source_key
+                or effective_lower < manifest_backfill_floor
+                or effective_lower > upper_bound
+                or upper_bound != manifest_upper_bound
+                or (manual and effective_lower != upper_bound)
+                or type(row["page_count"]) is not int
+                or row["page_count"] < 0
+                or type(row["batch_ordinal"]) is not int
+                or row["batch_ordinal"] < 0
+                or row["uploads_playlist_id"] is not None
+                and type(row["uploads_playlist_id"]) is not str
+                or row["next_page_token"] is not None
+                and type(row["next_page_token"]) is not str
+                or type(row["checkpoint_hash"]) is not str
+                or _CANONICAL_HASH.fullmatch(row["checkpoint_hash"]) is None
+                or unit is None
+            ):
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                    "stored YouTube sync checkpoint is invalid",
+                )
+            if unit["status"] == UnitStatus.SUCCESS.value:
+                if (
+                    completed_at is None
+                    or unit["output_hash"] != row["checkpoint_hash"]
+                ):
+                    raise DomainError(
+                        "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                        "stored YouTube sync artifact is invalid",
+                    )
+            else:
+                expected_hash = canonical_youtube_sync_checkpoint_hash(
+                    job_id=job_id,
+                    unit_key=spec.unit_key,
+                    source_kind=source_kind,
+                    source_key=row["source_key"],
+                    effective_lower_bound=effective_lower,
+                    upper_bound=upper_bound,
+                    uploads_playlist_id=row["uploads_playlist_id"],
+                    next_page_token=row["next_page_token"],
+                    page_count=row["page_count"],
+                    batch_ordinal=row["batch_ordinal"],
+                    completed_at=completed_at,
+                )
+                if completed_at is not None or row["checkpoint_hash"] != expected_hash:
+                    raise DomainError(
+                        "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
+                        "stored YouTube sync checkpoint hash is invalid",
+                    )
+            values.append(
+                YouTubeSyncCheckpoint(
+                    job_id=job_id,
+                    unit_key=spec.unit_key,
+                    source_kind=source_kind,
+                    source_key=row["source_key"],
+                    effective_lower_bound=effective_lower,
+                    upper_bound=upper_bound,
+                    uploads_playlist_id=row["uploads_playlist_id"],
+                    next_page_token=row["next_page_token"],
+                    page_count=row["page_count"],
+                    batch_ordinal=row["batch_ordinal"],
+                    completed_at=completed_at,
+                    checkpoint_hash=row["checkpoint_hash"],
+                )
+            )
+        return tuple(values)
 
     def persist_metadata_batch(
         self,
