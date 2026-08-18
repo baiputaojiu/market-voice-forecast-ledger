@@ -724,8 +724,7 @@ class DiscoveryRepository:
             or row["source_kind"] != source_kind.value
             or row["source_key"] != source_key
             or row["cursor_hash"] != expected_hash
-            or completed_upper_bound < backfill_floor
-            or completed_upper_bound > upper_bound
+            or completed_upper_bound >= upper_bound
             or updated_at < completed_upper_bound
         ):
             raise DomainError(
@@ -873,7 +872,6 @@ class DiscoveryRepository:
         self._validated_youtube_checkpoints(
             job_id=job_id,
             unit_specs=unit_specs,
-            manifest_backfill_floor=backfill_floor,
             manifest_upper_bound=upper_bound,
             manual=(kind is YouTubeSyncKind.MANUAL),
         )
@@ -1825,7 +1823,6 @@ class DiscoveryRepository:
         *,
         job_id: int,
         unit_specs,
-        manifest_backfill_floor: datetime,
         manifest_upper_bound: datetime,
         manual: bool,
     ) -> tuple[YouTubeSyncCheckpoint, ...]:
@@ -1877,10 +1874,10 @@ class DiscoveryRepository:
                 or row["unit_key"] != spec.unit_key
                 or source_kind is not spec.source_kind
                 or row["source_key"] != spec.source_key
-                or effective_lower < manifest_backfill_floor
                 or effective_lower > upper_bound
                 or upper_bound != manifest_upper_bound
                 or (manual and effective_lower != upper_bound)
+                or (not manual and effective_lower >= upper_bound)
                 or type(row["page_count"]) is not int
                 or row["page_count"] < 0
                 or type(row["batch_ordinal"]) is not int
@@ -2130,6 +2127,12 @@ class DiscoveryRepository:
                     or newer.upper_bound != window.upper_bound
                     or older.lower_bound != window.lower_bound
                     or newer.lower_bound.time() != datetime.min.time()
+                    or (
+                        newer.upper_bound - newer.lower_bound
+                    ).total_seconds() < 86_400
+                    or (
+                        older.upper_bound - older.lower_bound
+                    ).total_seconds() < 86_400
                 ):
                     self._raise_stored_search_window_invalid()
             elif (

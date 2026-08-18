@@ -10,7 +10,7 @@ from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain import discovery as discovery_domain
 from market_voice_forecast_ledger.domain.common import utc_iso
 from market_voice_forecast_ledger.domain.discovery import DiscoverySourceKind
-from market_voice_forecast_ledger.domain.enums import JobStage, UnitStatus
+from market_voice_forecast_ledger.domain.enums import JobStage, JobStatus, UnitStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
 from market_voice_forecast_ledger.services.discovery_profiles import (
@@ -118,6 +118,25 @@ def _search_item_page(video_ids: tuple[str, ...], token=None) -> YouTubePage:
     )
 
 
+def _checkpoint_ten_search_pages(db, job_id: int, unit_key: str):
+    repository = DiscoveryRepository(db)
+    window = repository.next_search_window(job_id, unit_key)
+    assert window is not None
+    for page_number in range(1, 11):
+        with transaction(db):
+            _, window = repository.advance_search_window_page(
+                job_id=job_id,
+                unit_key=unit_key,
+                window_id=window.id,
+                next_page_token=f"durable_token_{page_number}",
+                encountered_video_ids=(),
+                unavailable_video_ids=(),
+            )
+    assert window.page_count == 10
+    assert window.next_page_token == "durable_token_10"
+    return window
+
+
 def test_source_key_and_three_calendar_year_floor_are_exact_and_leap_safe():
     terms = ("千竈鉄平", "千竃鉄平")
     expected_key = _canonical_hash({
@@ -194,6 +213,143 @@ def test_source_cursor_identity_survives_version_change_but_new_sources_backfill
     assert new_checkpoint.effective_lower_bound == datetime(
         2023, 1, 11, 1, tzinfo=timezone.utc
     )
+
+
+def test_long_idle_existing_cursor_precedes_initial_floor_across_profile_versions(db):
+    repository = DiscoveryRepository(db)
+    original = _search_profile(db)
+    long_idle_cursor = datetime(2022, 1, 1, tzinfo=timezone.utc)
+    upper = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    source_key = discovery_domain.youtube_search_source_key(
+        original.search_terms
+    )
+    _insert_cursor(
+        db,
+        profile_id=original.profile_id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key=source_key,
+        completed_upper_bound=long_idle_cursor,
+    )
+    unchanged = DiscoveryProfileService(
+        db, clock=lambda: upper - timedelta(days=1)
+    ).replace_version(
+        ReplaceDiscoveryProfileVersion(
+            subject_id=original.subject_id,
+            seed_channel_ids=("UC0123456789abcdefghijkl",),
+            search_terms=original.search_terms,
+            reason="retain the long-idle synthetic search source",
+        )
+    )
+
+    job_id = YouTubeSyncService(db).request_full_sync(upper).job_id
+
+    checkpoint = repository.get_youtube_sync_checkpoint(
+        job_id, _unit_key(unchanged.profile_id)
+    )
+    root = repository.next_search_window(
+        job_id, _unit_key(unchanged.profile_id)
+    )
+    assert unchanged.id != original.id
+    assert checkpoint.effective_lower_bound == long_idle_cursor
+    assert root is not None
+    assert (root.lower_bound, root.upper_bound) == (long_idle_cursor, upper)
+
+    changed_terms = unchanged.search_terms + ("Long Idle New Term",)
+    changed = DiscoveryProfileService(
+        db, clock=lambda: upper - timedelta(hours=12)
+    ).replace_version(
+        ReplaceDiscoveryProfileVersion(
+            subject_id=unchanged.subject_id,
+            seed_channel_ids=unchanged.seed_channel_ids,
+            search_terms=changed_terms,
+            reason="create a new synthetic search source",
+        )
+    )
+    changed_upper = upper + timedelta(hours=1)
+    changed_job_id = YouTubeSyncService(db).request_full_sync(
+        changed_upper
+    ).job_id
+    changed_checkpoint = repository.get_youtube_sync_checkpoint(
+        changed_job_id, _unit_key(changed.profile_id)
+    )
+    assert changed_checkpoint.source_key != source_key
+    assert changed_checkpoint.effective_lower_bound == datetime(
+        2023, 1, 1, 1, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("at_upper_bound", "malformed_bound", "hash", "owner_hash"),
+)
+def test_existing_cursor_still_fails_closed_on_invalid_bound_hash_or_owner(
+    db, corruption
+):
+    profile = _search_profile(db)
+    upper = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
+    cursor_bound = (
+        upper
+        if corruption == "at_upper_bound"
+        else datetime(2022, 1, 1, tzinfo=timezone.utc)
+    )
+    _insert_cursor(
+        db,
+        profile_id=profile.profile_id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key=source_key,
+        completed_upper_bound=cursor_bound,
+    )
+    if corruption == "malformed_bound":
+        db.execute(
+            "UPDATE youtube_source_cursors SET completed_upper_bound=? "
+            "WHERE profile_id=? AND source_kind=? AND source_key=?",
+            (
+                "2022-01-01T00:00:00Z",
+                profile.profile_id,
+                DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+                source_key,
+            ),
+        )
+    elif corruption == "hash":
+        db.execute(
+            "UPDATE youtube_source_cursors SET cursor_hash=? "
+            "WHERE profile_id=? AND source_kind=? AND source_key=?",
+            (
+                "f" * 64,
+                profile.profile_id,
+                DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+                source_key,
+            ),
+        )
+    elif corruption == "owner_hash":
+        foreign_profile = next(
+            item
+            for item in DiscoveryRepository(db).list_active_profile_versions()
+            if item.profile_id != profile.profile_id
+        )
+        owner_hash = _canonical_hash({
+            "completed_upper_bound": utc_iso(cursor_bound),
+            "profile_id": foreign_profile.profile_id,
+            "schema": "youtube-source-cursor.v1",
+            "source_key": source_key,
+            "source_kind": DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+        })
+        db.execute(
+            "UPDATE youtube_source_cursors SET cursor_hash=? "
+            "WHERE profile_id=? AND source_kind=? AND source_key=?",
+            (
+                owner_hash,
+                profile.profile_id,
+                DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+                source_key,
+            ),
+        )
+
+    with pytest.raises(DomainError) as caught:
+        YouTubeSyncService(db).request_full_sync(upper)
+
+    assert caught.value.code == "STORED_YOUTUBE_SOURCE_CURSOR_INVALID"
 
 
 def test_manual_manifest_never_reads_or_writes_source_cursors(db):
@@ -367,6 +523,104 @@ def test_ten_page_window_splits_at_day_boundary_newer_first_without_new_job_unit
     ).fetchone()[0] == 12
 
 
+@pytest.mark.parametrize(
+    ("lower", "upper", "expected"),
+    (
+        (
+            datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 4, tzinfo=timezone.utc),
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 3, 23, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 5, 12, tzinfo=timezone.utc),
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 3, 1, tzinfo=timezone.utc),
+            None,
+        ),
+    ),
+)
+def test_split_boundary_checks_midnight_before_then_after_midpoint(
+    lower, upper, expected
+):
+    window = discovery_domain.SearchWindow(
+        id=1,
+        job_id=1,
+        unit_key="youtube:profile:1:search",
+        ordinal=1,
+        lower_bound=lower,
+        upper_bound=upper,
+        next_page_token="saturated_token",
+        page_count=10,
+        split_parent_id=None,
+        completed_at=None,
+        window_hash="a" * 64,
+    )
+
+    assert YouTubeSyncService._search_split_boundary(window) == expected
+
+
+def test_asymmetric_window_uses_adjacent_midnight_and_preserves_full_cover(db):
+    profile = _search_profile(db)
+    lower = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+    upper = datetime(2026, 1, 4, tzinfo=timezone.utc)
+    boundary = datetime(2026, 1, 3, tzinfo=timezone.utc)
+    source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
+    _insert_cursor(
+        db,
+        profile_id=profile.profile_id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key=source_key,
+        completed_upper_bound=lower,
+    )
+    root_pages = tuple(
+        YouTubePage((), f"asymmetric_token_{index}") for index in range(10)
+    )
+    client = FakeYouTubeClient(
+        search_responses=root_pages + (
+            YouTubePage((), None),
+            YouTubePage((), None),
+        )
+    )
+    service = YouTubeSyncService(db, clock=lambda: upper, youtube_client=client)
+    job_id, unit_key = _start_search_unit(db, service, profile, upper)
+    unit_count = db.execute(
+        "SELECT COUNT(*) FROM job_units WHERE job_id=?", (job_id,)
+    ).fetchone()[0]
+
+    result = service.execute_search_unit(job_id, unit_key)
+
+    windows = tuple(
+        dict(row)
+        for row in db.execute(
+            "SELECT * FROM youtube_search_windows WHERE job_id=? "
+            "AND unit_key=? ORDER BY ordinal",
+            (job_id, unit_key),
+        )
+    )
+    assert len(windows) == 3
+    parent, newer, older = windows
+    assert parent["page_count"] == 10
+    assert newer["split_parent_id"] == older["split_parent_id"] == parent["id"]
+    assert older["lower_bound"] == utc_iso(lower)
+    assert newer["lower_bound"] == older["upper_bound"] == utc_iso(boundary)
+    assert newer["upper_bound"] == utc_iso(upper)
+    assert client.search_calls[10][1] == "2026-01-02T23:59:59.000000Z"
+    assert client.search_calls[11][1] == "2026-01-01T00:59:59.000000Z"
+    assert result.discovered_count == result.persisted_count == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM job_units WHERE job_id=?", (job_id,)
+    ).fetchone()[0] == unit_count
+
+
 def test_invalid_token_restarts_only_current_window_and_replay_is_idempotent(db):
     profile = _search_profile(db)
     first_id, second_id = _video_id(200), _video_id(201)
@@ -423,6 +677,144 @@ def test_invalid_token_restarts_only_current_window_and_replay_is_idempotent(db)
         "SELECT COUNT(*) FROM discovery_observations WHERE job_id=?",
         (job_id,),
     ).fetchone()[0] == 2
+
+
+def test_saturated_page_ten_retry_fails_before_provider_without_state_drift(db):
+    profile = _search_profile(db)
+    lower = RUN_UPPER - timedelta(days=1)
+    source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
+    _insert_cursor(
+        db,
+        profile_id=profile.profile_id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key=source_key,
+        completed_upper_bound=lower,
+    )
+    client = FakeYouTubeClient()
+    service = YouTubeSyncService(
+        db, clock=lambda: RUN_UPPER, youtube_client=client
+    )
+    job_id, unit_key = _start_search_unit(db, service, profile)
+    _checkpoint_ten_search_pages(db, job_id, unit_key)
+    JobStateService(db, clock=lambda: RUN_UPPER).fail_unit(
+        job_id, unit_key, "YOUTUBE_SEARCH_WINDOW_SATURATED"
+    )
+    with transaction(db):
+        JobStateService(
+            db, clock=lambda: RUN_UPPER
+        ).retry_failed_in_transaction(job_id, {})
+    JobStateService(db, clock=lambda: RUN_UPPER).begin_unit(job_id, unit_key)
+    assert JobStateService(db).unit(job_id, unit_key).status is UnitStatus.RUNNING
+    private_before = (
+        tuple(
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM youtube_sync_checkpoints WHERE job_id=? "
+                "AND unit_key=?",
+                (job_id, unit_key),
+            )
+        ),
+        tuple(
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM youtube_search_windows WHERE job_id=? "
+                "AND unit_key=? ORDER BY ordinal",
+                (job_id, unit_key),
+            )
+        ),
+        tuple(
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=?",
+                (job_id,),
+            )
+        ),
+        tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        service.execute_search_unit(job_id, unit_key)
+
+    private_after = (
+        tuple(
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM youtube_sync_checkpoints WHERE job_id=? "
+                "AND unit_key=?",
+                (job_id, unit_key),
+            )
+        ),
+        tuple(
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM youtube_search_windows WHERE job_id=? "
+                "AND unit_key=? ORDER BY ordinal",
+                (job_id, unit_key),
+            )
+        ),
+        tuple(
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=?",
+                (job_id,),
+            )
+        ),
+        tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")),
+    )
+    assert caught.value.code == "YOUTUBE_SEARCH_WINDOW_SATURATED"
+    assert client.search_calls == []
+    assert private_after == private_before
+    assert JobStateService(db).status(job_id) is JobStatus.FAILED
+    failed_unit = db.execute(
+        "SELECT status, error_code FROM job_units WHERE job_id=? AND unit_key=?",
+        (job_id, unit_key),
+    ).fetchone()
+    assert (failed_unit["status"], failed_unit["error_code"]) == (
+        UnitStatus.FAILED.value,
+        "YOUTUBE_SEARCH_WINDOW_SATURATED",
+    )
+
+
+def test_preexisting_splittable_page_ten_splits_before_provider_call(db):
+    profile = _search_profile(db)
+    client = FakeYouTubeClient(
+        search_responses=(YouTubePage((), None), YouTubePage((), None))
+    )
+    service = YouTubeSyncService(
+        db, clock=lambda: RUN_UPPER, youtube_client=client
+    )
+    job_id, unit_key = _start_search_unit(db, service, profile)
+    _checkpoint_ten_search_pages(db, job_id, unit_key)
+
+    result = service.execute_search_unit(job_id, unit_key)
+
+    windows = tuple(
+        dict(row)
+        for row in db.execute(
+            "SELECT * FROM youtube_search_windows WHERE job_id=? "
+            "AND unit_key=? ORDER BY ordinal",
+            (job_id, unit_key),
+        )
+    )
+    assert len(windows) == 3
+    parent, newer, older = windows
+    assert parent["page_count"] == 10
+    assert newer["split_parent_id"] == older["split_parent_id"] == parent["id"]
+    assert client.search_calls == [
+        (
+            "|".join(profile.search_terms),
+            "2024-07-11T23:59:59.000000Z",
+            utc_iso(RUN_UPPER),
+            None,
+        ),
+        (
+            "|".join(profile.search_terms),
+            "2023-01-10T23:59:59.000000Z",
+            utc_iso(SPLIT_BOUNDARY),
+            None,
+        ),
+    ]
+    assert result.discovered_count == result.persisted_count == 0
 
 
 def test_one_day_saturation_fails_closed_without_proposal_or_cursor_movement(db):

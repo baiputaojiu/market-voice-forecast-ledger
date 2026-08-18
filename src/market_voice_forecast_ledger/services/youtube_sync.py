@@ -511,6 +511,27 @@ class YouTubeSyncService:
             window = self._discovery.next_search_window(job_id, unit_key)
             if window is None:
                 break
+            if window.page_count == 10 and window.next_page_token is not None:
+                boundary = self._search_split_boundary(window)
+                if boundary is None:
+                    self._job_state.fail_unit(
+                        job_id,
+                        unit_key,
+                        "YOUTUBE_SEARCH_WINDOW_SATURATED",
+                    )
+                    raise DomainError(
+                        "YOUTUBE_SEARCH_WINDOW_SATURATED",
+                        "YouTube search window cannot be split safely",
+                    )
+                with transaction(self._conn):
+                    self._discovery.split_search_window(
+                        job_id=job_id,
+                        unit_key=unit_key,
+                        window_id=window.id,
+                        boundary=boundary,
+                        completed_at=self._exact_clock_value(),
+                    )
+                continue
             provider_window = replace(
                 window,
                 lower_bound=window.lower_bound - timedelta(seconds=1),
@@ -855,13 +876,21 @@ class YouTubeSyncService:
         midpoint = window.lower_bound + (
             window.upper_bound - window.lower_bound
         ) / 2
-        boundary = midpoint.replace(hour=0, minute=0, second=0, microsecond=0)
-        if (
-            boundary - window.lower_bound < timedelta(days=1)
-            or window.upper_bound - boundary < timedelta(days=1)
+        midnight_before = midpoint.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        # Stable order prefers the midnight at-or-before the midpoint, then
+        # the immediately following midnight for an asymmetric lower edge.
+        for boundary in (
+            midnight_before,
+            midnight_before + timedelta(days=1),
         ):
-            return None
-        return boundary
+            if (
+                boundary - window.lower_bound >= timedelta(days=1)
+                and window.upper_bound - boundary >= timedelta(days=1)
+            ):
+                return boundary
+        return None
 
     def _exact_clock_value(self) -> datetime:
         value = self._clock()
