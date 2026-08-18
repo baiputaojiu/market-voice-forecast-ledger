@@ -6,16 +6,23 @@ import pytest
 from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.db.migrate import apply_migrations
-from market_voice_forecast_ledger.domain.discovery import DiscoverySourceKind
-from market_voice_forecast_ledger.domain.enums import UnitStatus
+from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text, utc_iso
+from market_voice_forecast_ledger.domain.discovery import (
+    DiscoverySourceKind,
+    youtube_search_source_key,
+)
+from market_voice_forecast_ledger.domain.enums import JobStage, JobStatus, UnitStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
+from market_voice_forecast_ledger.repositories.jobs import JobRepository
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
 from market_voice_forecast_ledger.youtube.client import ChannelUploads, YouTubePage
 from market_voice_forecast_ledger.youtube.metadata import normalize_video_item
 from tests.backend.youtube_fakes import (
+    CursorPromotionFailpoint,
     FakeYouTubeClient,
+    empty_full_sync_client,
     synthetic_playlist_item,
     synthetic_video_item,
 )
@@ -27,6 +34,10 @@ AT_UPPER_BOUND = "2026-08-19T03:04:05Z"
 
 
 class SyntheticSeedFault(RuntimeError):
+    pass
+
+
+class SyntheticCursorPromotionFault(RuntimeError):
     pass
 
 
@@ -695,3 +706,82 @@ def test_reexecution_after_success_recomputes_domain_artifact_without_network(db
     with pytest.raises(DomainError) as caught:
         DiscoveryRepository(db).verified_youtube_artifact_hashes(job_id)
     assert caught.value.code == "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID"
+
+
+def test_cursor_map_and_job_success_roll_back_together_after_reconnect(db, db_path):
+    profiles = DiscoveryRepository(db).list_active_profile_versions()
+    profile = profiles[0]
+    source_key = youtube_search_source_key(profile.search_terms)
+    old_upper = RUN_UPPER_BOUND.replace(day=18)
+    old_cursor_hash = sha256_text(canonical_json({
+        "completed_upper_bound": utc_iso(old_upper),
+        "profile_id": profile.profile_id,
+        "schema": "youtube-source-cursor.v1",
+        "source_key": source_key,
+        "source_kind": DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+    }))
+    with transaction(db):
+        db.execute(
+            "INSERT INTO youtube_source_cursors("
+            "profile_id, source_kind, source_key, completed_upper_bound, "
+            "cursor_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                profile.profile_id,
+                DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+                source_key,
+                utc_iso(old_upper),
+                old_cursor_hash,
+                utc_iso(old_upper),
+            ),
+        )
+    failpoint = CursorPromotionFailpoint(
+        SyntheticCursorPromotionFault("after durable cursor updates")
+    )
+    service = YouTubeSyncService(
+        db,
+        clock=lambda: RUN_UPPER_BOUND,
+        youtube_client=empty_full_sync_client(profiles),
+        failpoint=failpoint,
+    )
+    request = service.request_full_sync(RUN_UPPER_BOUND)
+    total_units = db.execute(
+        "SELECT total_units FROM jobs WHERE id=?", (request.job_id,)
+    ).fetchone()[0]
+    for _ in range(total_units):
+        claimed = service.claim_next_runnable(RUN_UPPER_BOUND)
+        assert claimed is not None and claimed.job_id == request.job_id
+        running = db.execute(
+            "SELECT unit_key, stage FROM job_units "
+            "WHERE job_id=? AND status='running'",
+            (request.job_id,),
+        ).fetchone()
+        if running["stage"] == JobStage.YOUTUBE_SEED_DISCOVERY.value:
+            service.execute_seed_unit(request.job_id, running["unit_key"])
+        else:
+            assert running["stage"] == JobStage.YOUTUBE_SEARCH_DISCOVERY.value
+            service.execute_search_unit(request.job_id, running["unit_key"])
+    before = tuple(
+        dict(row)
+        for row in db.execute(
+            "SELECT * FROM youtube_source_cursors "
+            "ORDER BY profile_id, source_kind, source_key"
+        )
+    )
+
+    with pytest.raises(SyntheticCursorPromotionFault, match="durable cursor"):
+        service.finalize_full_job(request.job_id)
+
+    assert failpoint.calls == 1
+    reopened = open_database(db_path)
+    try:
+        after = tuple(
+            dict(row)
+            for row in reopened.execute(
+                "SELECT * FROM youtube_source_cursors "
+                "ORDER BY profile_id, source_kind, source_key"
+            )
+        )
+        assert after == before
+        assert JobRepository(reopened).get(request.job_id).status is JobStatus.RUNNING
+    finally:
+        reopened.close()

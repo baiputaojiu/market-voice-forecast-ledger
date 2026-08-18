@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.domain.discovery import DiscoveryProfileVersion
 from market_voice_forecast_ledger.youtube.client import (
     ChannelUploads,
     YouTubePage,
@@ -138,6 +139,42 @@ class FakeYouTubeClient:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+def synthetic_search_item(video_id: str) -> dict[str, object]:
+    return {
+        "kind": "youtube#searchResult",
+        "id": {
+            "kind": "youtube#video",
+            "videoId": video_id,
+        },
+    }
+
+
+def empty_full_sync_client(
+    profiles: tuple[DiscoveryProfileVersion, ...],
+) -> FakeYouTubeClient:
+    channels = tuple(
+        (ChannelUploads(channel_id, "UU" + channel_id[2:]),)
+        for profile in profiles
+        for channel_id in profile.seed_channel_ids
+    )
+    seed_count = sum(len(profile.seed_channel_ids) for profile in profiles)
+    return FakeYouTubeClient(
+        channel_responses=channels,
+        playlist_responses=(YouTubePage((), None),) * seed_count,
+        search_responses=(YouTubePage((), None),) * len(profiles),
+    )
+
+
+class CursorPromotionFailpoint:
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+        self.calls = 0
+
+    def after_cursor_update(self) -> None:
+        self.calls += 1
+        raise self.failure
 
 
 def synthetic_video_item(

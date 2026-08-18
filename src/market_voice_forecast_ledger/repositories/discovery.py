@@ -17,12 +17,15 @@ from market_voice_forecast_ledger.domain.discovery import (
     PresenceDecision,
     PresenceOrigin,
     PresenceState,
+    SearchWindow,
     SubjectVideoCandidate,
     YouTubeSyncCheckpoint,
     YouTubeSyncKind,
     YouTubeSyncManifest,
     YouTubeSyncManifestProfile,
     build_youtube_sync_shape,
+    canonical_search_window_hash,
+    canonical_source_cursor_hash,
     canonical_youtube_sync_checkpoint_hash,
     canonical_presence_decision_hash,
     canonical_profile_hash,
@@ -610,12 +613,21 @@ class DiscoveryRepository:
             ),
         )
         for spec in unit_specs:
+            effective_lower_bound = backfill_floor
+            if kind is YouTubeSyncKind.FULL_DISCOVERY:
+                effective_lower_bound = self._source_cursor_lower_bound(
+                    profile_id=spec.profile_id,
+                    source_kind=spec.source_kind,
+                    source_key=spec.source_key,
+                    backfill_floor=backfill_floor,
+                    upper_bound=upper_bound,
+                )
             checkpoint_hash = canonical_youtube_sync_checkpoint_hash(
                 job_id=job_id,
                 unit_key=spec.unit_key,
                 source_kind=spec.source_kind,
                 source_key=spec.source_key,
-                effective_lower_bound=backfill_floor,
+                effective_lower_bound=effective_lower_bound,
                 upper_bound=upper_bound,
                 uploads_playlist_id=None,
                 next_page_token=None,
@@ -638,12 +650,89 @@ class DiscoveryRepository:
                     spec.unit_key,
                     spec.source_kind.value,
                     spec.source_key,
-                    utc_iso(backfill_floor),
+                    utc_iso(effective_lower_bound),
                     utc_iso(upper_bound),
                     checkpoint_hash,
                 ),
             )
+            if spec.source_kind is DiscoverySourceKind.CROSS_CHANNEL_SEARCH:
+                completed_at = (
+                    created_at if effective_lower_bound == upper_bound else None
+                )
+                window_hash = canonical_search_window_hash(
+                    job_id=job_id,
+                    unit_key=spec.unit_key,
+                    ordinal=1,
+                    lower_bound=effective_lower_bound,
+                    upper_bound=upper_bound,
+                    next_page_token=None,
+                    page_count=0,
+                    split_parent_id=None,
+                    completed_at=completed_at,
+                )
+                self._conn.execute(
+                    "INSERT INTO youtube_search_windows("
+                    "job_id, unit_key, ordinal, lower_bound, upper_bound, "
+                    "next_page_token, page_count, split_parent_id, "
+                    "completed_at, window_hash) VALUES "
+                    "(?, ?, 1, ?, ?, NULL, 0, NULL, ?, ?)",
+                    (
+                        job_id,
+                        spec.unit_key,
+                        utc_iso(effective_lower_bound),
+                        utc_iso(upper_bound),
+                        None if completed_at is None else utc_iso(completed_at),
+                        window_hash,
+                    ),
+                )
         return self.get_youtube_sync_manifest(job_id)
+
+    def _source_cursor_lower_bound(
+        self,
+        *,
+        profile_id: int,
+        source_kind: DiscoverySourceKind,
+        source_key: str,
+        backfill_floor: datetime,
+        upper_bound: datetime,
+    ) -> datetime:
+        row = self._conn.execute(
+            "SELECT * FROM youtube_source_cursors WHERE profile_id=? "
+            "AND source_kind=? AND source_key=?",
+            (profile_id, source_kind.value, source_key),
+        ).fetchone()
+        if row is None:
+            return backfill_floor
+        try:
+            completed_upper_bound = _parse_canonical_utc(
+                row["completed_upper_bound"]
+            )
+            updated_at = _parse_canonical_utc(row["updated_at"])
+            expected_hash = canonical_source_cursor_hash(
+                profile_id=profile_id,
+                source_kind=source_kind,
+                source_key=source_key,
+                completed_upper_bound=completed_upper_bound,
+            )
+        except (DomainError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SOURCE_CURSOR_INVALID",
+                "stored YouTube source cursor is invalid",
+            ) from cause
+        if (
+            row["profile_id"] != profile_id
+            or row["source_kind"] != source_kind.value
+            or row["source_key"] != source_key
+            or row["cursor_hash"] != expected_hash
+            or completed_upper_bound < backfill_floor
+            or completed_upper_bound > upper_bound
+            or updated_at < completed_upper_bound
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SOURCE_CURSOR_INVALID",
+                "stored YouTube source cursor is invalid",
+            )
+        return completed_upper_bound
 
     def get_youtube_sync_manifest(self, job_id: int) -> YouTubeSyncManifest:
         generic = self._stored_youtube_job_manifest(job_id)
@@ -829,6 +918,255 @@ class DiscoveryRepository:
             )
         return self._checkpoint_value(row)
 
+    def next_search_window(
+        self, job_id: int, unit_key: str
+    ) -> SearchWindow | None:
+        self.get_youtube_sync_manifest(job_id)
+        row = self._conn.execute(
+            "SELECT * FROM youtube_sync_checkpoints "
+            "WHERE job_id=? AND unit_key=?",
+            (job_id, unit_key),
+        ).fetchone()
+        if row is None:
+            self._raise_search_checkpoint_invalid()
+        checkpoint = self._checkpoint_value(row)
+        if checkpoint.source_kind is not DiscoverySourceKind.CROSS_CHANNEL_SEARCH:
+            self._raise_search_checkpoint_invalid()
+        windows = self._validated_search_windows(checkpoint)
+        parent_ids = {
+            window.split_parent_id
+            for window in windows
+            if window.split_parent_id is not None
+        }
+        return next(
+            (
+                window
+                for window in windows
+                if window.completed_at is None and window.id not in parent_ids
+            ),
+            None,
+        )
+
+    def advance_search_window_page(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        window_id: int,
+        next_page_token: str | None,
+        encountered_video_ids: tuple[str, ...],
+        unavailable_video_ids: tuple[str, ...],
+    ) -> tuple[YouTubeSyncCheckpoint, SearchWindow]:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        window = self.next_search_window(job_id, unit_key)
+        if (
+            checkpoint.source_kind
+            is not DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+            or window is None
+            or window.id != window_id
+            or window.page_count >= 10
+            or (
+                next_page_token is not None
+                and (
+                    type(next_page_token) is not str
+                    or _YOUTUBE_PAGE_TOKEN.fullmatch(next_page_token) is None
+                )
+            )
+        ):
+            self._raise_search_checkpoint_invalid()
+        try:
+            self._validate_seed_progress_values(
+                encountered_video_ids, unavailable_video_ids
+            )
+        except (TypeError, ValueError):
+            self._raise_search_checkpoint_invalid()
+        if (
+            not set(checkpoint.encountered_video_ids).issubset(
+                encountered_video_ids
+            )
+            or not set(checkpoint.unavailable_video_ids).issubset(
+                unavailable_video_ids
+            )
+        ):
+            self._raise_search_checkpoint_invalid()
+        checkpoint = self._replace_youtube_checkpoint(
+            checkpoint,
+            uploads_playlist_id=None,
+            next_page_token=None,
+            encountered_video_ids=encountered_video_ids,
+            unavailable_video_ids=unavailable_video_ids,
+            page_count=checkpoint.page_count + 1,
+            batch_ordinal=checkpoint.batch_ordinal + 1,
+            completed_at=None,
+        )
+        window = self._replace_search_window(
+            window,
+            next_page_token=next_page_token,
+            page_count=window.page_count + 1,
+            completed_at=None,
+        )
+        return checkpoint, window
+
+    def restart_search_window(
+        self, *, job_id: int, unit_key: str, window_id: int
+    ) -> SearchWindow:
+        self._require_transaction()
+        window = self.next_search_window(job_id, unit_key)
+        if (
+            window is None
+            or window.id != window_id
+            or window.next_page_token is None
+            or window.page_count <= 0
+        ):
+            self._raise_search_checkpoint_invalid()
+        return self._replace_search_window(
+            window,
+            next_page_token=None,
+            page_count=0,
+            completed_at=None,
+        )
+
+    def complete_search_window(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        window_id: int,
+        completed_at: datetime,
+    ) -> SearchWindow:
+        self._require_transaction()
+        window = self.next_search_window(job_id, unit_key)
+        if (
+            window is None
+            or window.id != window_id
+            or window.next_page_token is not None
+            or window.page_count <= 0
+            or not _is_exact_utc(completed_at)
+        ):
+            self._raise_search_checkpoint_invalid()
+        return self._replace_search_window(
+            window,
+            next_page_token=None,
+            page_count=window.page_count,
+            completed_at=completed_at,
+        )
+
+    def split_search_window(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        window_id: int,
+        boundary: datetime,
+        completed_at: datetime,
+    ) -> tuple[SearchWindow, SearchWindow]:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        window = self.next_search_window(job_id, unit_key)
+        one_day_seconds = 86_400
+        if (
+            window is None
+            or window.id != window_id
+            or window.page_count != 10
+            or window.next_page_token is None
+            or not _is_exact_utc(boundary)
+            or not _is_exact_utc(completed_at)
+            or boundary.time() != datetime.min.time()
+            or (boundary - window.lower_bound).total_seconds()
+            < one_day_seconds
+            or (window.upper_bound - boundary).total_seconds()
+            < one_day_seconds
+        ):
+            self._raise_search_checkpoint_invalid()
+        self._replace_search_window(
+            window,
+            next_page_token=None,
+            page_count=10,
+            completed_at=completed_at,
+        )
+        next_ordinal = self._conn.execute(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM youtube_search_windows "
+            "WHERE job_id=? AND unit_key=?",
+            (job_id, unit_key),
+        ).fetchone()[0]
+        values: list[SearchWindow] = []
+        for ordinal, lower_bound, upper_bound in (
+            (next_ordinal, boundary, window.upper_bound),
+            (next_ordinal + 1, window.lower_bound, boundary),
+        ):
+            window_hash = canonical_search_window_hash(
+                job_id=job_id,
+                unit_key=unit_key,
+                ordinal=ordinal,
+                lower_bound=lower_bound,
+                upper_bound=upper_bound,
+                next_page_token=None,
+                page_count=0,
+                split_parent_id=window.id,
+                completed_at=None,
+            )
+            cursor = self._conn.execute(
+                "INSERT INTO youtube_search_windows("
+                "job_id, unit_key, ordinal, lower_bound, upper_bound, "
+                "next_page_token, page_count, split_parent_id, completed_at, "
+                "window_hash) VALUES (?, ?, ?, ?, ?, NULL, 0, ?, NULL, ?)",
+                (
+                    job_id,
+                    unit_key,
+                    ordinal,
+                    utc_iso(lower_bound),
+                    utc_iso(upper_bound),
+                    window.id,
+                    window_hash,
+                ),
+            )
+            values.append(self._search_window_value(
+                self._conn.execute(
+                    "SELECT * FROM youtube_search_windows WHERE id=?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+            ))
+        self._validated_search_windows(checkpoint)
+        return values[0], values[1]
+
+    def complete_search_checkpoint(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        completed_at: datetime,
+    ) -> YouTubeSyncCheckpoint:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        windows = self._validated_search_windows(checkpoint)
+        parent_ids = {
+            window.split_parent_id
+            for window in windows
+            if window.split_parent_id is not None
+        }
+        leaves = tuple(window for window in windows if window.id not in parent_ids)
+        if (
+            checkpoint.source_kind
+            is not DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+            or checkpoint.completed_at is not None
+            or checkpoint.uploads_playlist_id is not None
+            or checkpoint.next_page_token is not None
+            or any(window.completed_at is None for window in leaves)
+            or not _is_exact_utc(completed_at)
+        ):
+            self._raise_search_checkpoint_invalid()
+        return self._replace_youtube_checkpoint(
+            checkpoint,
+            uploads_playlist_id=None,
+            next_page_token=None,
+            encountered_video_ids=checkpoint.encountered_video_ids,
+            unavailable_video_ids=checkpoint.unavailable_video_ids,
+            page_count=checkpoint.page_count,
+            batch_ordinal=checkpoint.batch_ordinal,
+            completed_at=completed_at,
+        )
+
     def bind_seed_uploads_playlist(
         self,
         *,
@@ -996,6 +1334,61 @@ class DiscoveryRepository:
             )
         )
 
+    def search_unit_artifact(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        profile_version_id: int,
+        profile_id: int,
+        source_key: str,
+    ) -> tuple[str, tuple[int, ...]]:
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        try:
+            profile_version = self.get_profile_version(profile_version_id)
+        except (LookupError, DomainError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        if (
+            checkpoint.source_kind
+            is not DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+            or checkpoint.source_key != source_key
+            or profile_version.profile_id != profile_id
+        ):
+            self._raise_seed_artifact_invalid()
+        return self._canonical_search_artifact(profile_version, checkpoint)
+
+    def search_unit_seen_video_ids(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        profile_version_id: int,
+        profile_id: int,
+        source_key: str,
+    ) -> tuple[str, ...]:
+        self.search_unit_artifact(
+            job_id=job_id,
+            unit_key=unit_key,
+            profile_version_id=profile_version_id,
+            profile_id=profile_id,
+            source_key=source_key,
+        )
+        return tuple(
+            row["youtube_video_id"]
+            for row in self._conn.execute(
+                "SELECT video.youtube_video_id "
+                "FROM discovery_observations AS observation "
+                "JOIN videos AS video ON video.id=observation.video_id "
+                "WHERE observation.job_id=? AND observation.profile_id=? "
+                "AND observation.source_kind='cross_channel_search' "
+                "AND observation.source_key=? ORDER BY observation.id",
+                (job_id, profile_id, source_key),
+            )
+        )
+
     def record_seed_proposed_cursor(
         self,
         *,
@@ -1004,33 +1397,59 @@ class DiscoveryRepository:
         source_key: str,
         completed_upper_bound: datetime,
     ) -> str:
+        return self.record_source_proposed_cursor(
+            job_id=job_id,
+            profile_id=profile_id,
+            source_kind=DiscoverySourceKind.SEED_UPLOADS,
+            source_key=source_key,
+            completed_upper_bound=completed_upper_bound,
+        )
+
+    def record_source_proposed_cursor(
+        self,
+        *,
+        job_id: int,
+        profile_id: int,
+        source_kind: DiscoverySourceKind,
+        source_key: str,
+        completed_upper_bound: datetime,
+    ) -> str:
         self._require_transaction()
         manifest = self.get_youtube_sync_manifest(job_id)
+        profiles, unit_specs = self._bound_full_unit_specs(manifest)
+        matches = tuple(
+            spec
+            for spec in unit_specs
+            if spec.profile_id == profile_id
+            and spec.source_kind is source_kind
+            and spec.source_key == source_key
+        )
         if (
-            manifest.sync_kind != YouTubeSyncKind.FULL_DISCOVERY.value
+            type(source_kind) is not DiscoverySourceKind
+            or source_kind is DiscoverySourceKind.MANUAL_URL
             or type(profile_id) is not int
             or profile_id <= 0
             or type(source_key) is not str
             or _SAFE_SOURCE_KEY.fullmatch(source_key) is None
             or not _is_exact_utc(completed_upper_bound)
             or completed_upper_bound != manifest.upper_bound
-            or not any(item.profile_id == profile_id for item in manifest.profiles)
+            or len(matches) != 1
+            or not any(profile.profile_id == profile_id for profile in profiles)
         ):
             self._raise_seed_artifact_invalid()
-        cursor_hash = sha256_text(canonical_json({
-            "completed_upper_bound": utc_iso(completed_upper_bound),
-            "profile_id": profile_id,
-            "schema": "youtube-source-cursor.v1",
-            "source_key": source_key,
-            "source_kind": DiscoverySourceKind.SEED_UPLOADS.value,
-        }))
+        cursor_hash = canonical_source_cursor_hash(
+            profile_id=profile_id,
+            source_kind=source_kind,
+            source_key=source_key,
+            completed_upper_bound=completed_upper_bound,
+        )
         existing = self._conn.execute(
             "SELECT * FROM youtube_sync_proposed_cursors "
             "WHERE job_id=? AND profile_id=? AND source_kind=? AND source_key=?",
             (
                 job_id,
                 profile_id,
-                DiscoverySourceKind.SEED_UPLOADS.value,
+                source_kind.value,
                 source_key,
             ),
         ).fetchone()
@@ -1042,7 +1461,7 @@ class DiscoveryRepository:
                 (
                     job_id,
                     profile_id,
-                    DiscoverySourceKind.SEED_UPLOADS.value,
+                    source_kind.value,
                     source_key,
                     utc_iso(completed_upper_bound),
                     cursor_hash,
@@ -1054,6 +1473,160 @@ class DiscoveryRepository:
         ):
             self._raise_seed_artifact_invalid()
         return cursor_hash
+
+    def promote_full_job_cursors(
+        self, *, job_id: int, updated_at: datetime
+    ) -> int:
+        self._require_transaction()
+        manifest = self.get_youtube_sync_manifest(job_id)
+        profiles, unit_specs = self._bound_full_unit_specs(manifest)
+        if not _is_exact_utc(updated_at):
+            self._raise_cursor_promotion_invalid()
+        profile_by_version = {profile.id: profile for profile in profiles}
+        unit_rows = {
+            row["unit_key"]: row
+            for row in self._conn.execute(
+                "SELECT unit_key, status, output_hash FROM job_units "
+                "WHERE job_id=?",
+                (job_id,),
+            )
+        }
+        for spec in unit_specs:
+            unit = unit_rows.get(spec.unit_key)
+            checkpoint_row = self._conn.execute(
+                "SELECT * FROM youtube_sync_checkpoints WHERE job_id=? "
+                "AND unit_key=?",
+                (job_id, spec.unit_key),
+            ).fetchone()
+            profile = profile_by_version.get(spec.profile_version_id)
+            if (
+                unit is None
+                or unit["status"] != UnitStatus.SUCCESS.value
+                or checkpoint_row is None
+                or profile is None
+            ):
+                self._raise_cursor_promotion_invalid()
+            checkpoint = self._checkpoint_value(checkpoint_row)
+            if spec.source_kind is DiscoverySourceKind.SEED_UPLOADS:
+                artifact_hash, _ = self._canonical_seed_artifact(
+                    profile, checkpoint
+                )
+            elif (
+                spec.source_kind
+                is DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+            ):
+                artifact_hash, _ = self._canonical_search_artifact(
+                    profile, checkpoint
+                )
+            else:
+                self._raise_cursor_promotion_invalid()
+            if unit["output_hash"] != artifact_hash:
+                self._raise_seed_artifact_invalid()
+        expected = {
+            (spec.profile_id, spec.source_kind.value, spec.source_key): spec
+            for spec in unit_specs
+        }
+        rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=? "
+                "ORDER BY profile_id, source_kind, source_key",
+                (job_id,),
+            )
+        )
+        if len(rows) != len(expected):
+            self._raise_cursor_promotion_invalid()
+        seen: set[tuple[int, str, str]] = set()
+        for row in rows:
+            identity = (
+                row["profile_id"],
+                row["source_kind"],
+                row["source_key"],
+            )
+            spec = expected.get(identity)
+            try:
+                source_kind = DiscoverySourceKind(row["source_kind"])
+                completed_upper_bound = _parse_canonical_utc(
+                    row["completed_upper_bound"]
+                )
+                expected_hash = canonical_source_cursor_hash(
+                    profile_id=row["profile_id"],
+                    source_kind=source_kind,
+                    source_key=row["source_key"],
+                    completed_upper_bound=completed_upper_bound,
+                )
+            except (DomainError, TypeError, ValueError) as cause:
+                raise DomainError(
+                    "YOUTUBE_CURSOR_PROMOTION_INVALID",
+                    "YouTube cursor promotion evidence is invalid",
+                ) from cause
+            if (
+                spec is None
+                or identity in seen
+                or source_kind is DiscoverySourceKind.MANUAL_URL
+                or completed_upper_bound != manifest.upper_bound
+                or row["cursor_hash"] != expected_hash
+            ):
+                self._raise_cursor_promotion_invalid()
+            seen.add(identity)
+        if seen != set(expected):
+            self._raise_cursor_promotion_invalid()
+
+        for row in rows:
+            existing = self._conn.execute(
+                "SELECT * FROM youtube_source_cursors WHERE profile_id=? "
+                "AND source_kind=? AND source_key=?",
+                (
+                    row["profile_id"],
+                    row["source_kind"],
+                    row["source_key"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    old_bound = _parse_canonical_utc(
+                        existing["completed_upper_bound"]
+                    )
+                    old_updated_at = _parse_canonical_utc(
+                        existing["updated_at"]
+                    )
+                    old_kind = DiscoverySourceKind(existing["source_kind"])
+                    old_hash = canonical_source_cursor_hash(
+                        profile_id=existing["profile_id"],
+                        source_kind=old_kind,
+                        source_key=existing["source_key"],
+                        completed_upper_bound=old_bound,
+                    )
+                except (DomainError, TypeError, ValueError) as cause:
+                    raise DomainError(
+                        "STORED_YOUTUBE_SOURCE_CURSOR_INVALID",
+                        "stored YouTube source cursor is invalid",
+                    ) from cause
+                if (
+                    old_hash != existing["cursor_hash"]
+                    or old_updated_at < old_bound
+                    or old_bound > manifest.upper_bound
+                ):
+                    raise DomainError(
+                        "STORED_YOUTUBE_SOURCE_CURSOR_INVALID",
+                        "stored YouTube source cursor is invalid",
+                    )
+            self._conn.execute(
+                "INSERT INTO youtube_source_cursors("
+                "profile_id, source_kind, source_key, completed_upper_bound, "
+                "cursor_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(profile_id, source_kind, source_key) DO UPDATE SET "
+                "completed_upper_bound=excluded.completed_upper_bound, "
+                "cursor_hash=excluded.cursor_hash, updated_at=excluded.updated_at",
+                (
+                    row["profile_id"],
+                    row["source_kind"],
+                    row["source_key"],
+                    row["completed_upper_bound"],
+                    row["cursor_hash"],
+                    utc_iso(updated_at),
+                ),
+            )
+        return len(rows)
 
     def set_youtube_resume_not_before(
         self, job_id: int, value: datetime | None
@@ -1223,6 +1796,30 @@ class DiscoveryRepository:
                 "stored YouTube sync units do not match the sealed manifest",
             )
 
+    def _bound_full_unit_specs(self, manifest):
+        if manifest.sync_kind != YouTubeSyncKind.FULL_DISCOVERY.value:
+            self._raise_cursor_promotion_invalid()
+        try:
+            profiles = tuple(
+                self.get_profile_version(item.profile_version_id)
+                for item in manifest.profiles
+            )
+            _, unit_specs = build_youtube_sync_shape(
+                sync_kind=YouTubeSyncKind.FULL_DISCOVERY,
+                profiles=profiles,
+                upper_bound=manifest.upper_bound,
+                backfill_floor=manifest.backfill_floor,
+                quota_contract_version=manifest.quota_contract_version,
+                manual_request_id=None,
+                manual_video_id=None,
+            )
+        except (LookupError, DomainError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            ) from cause
+        return profiles, unit_specs
+
     def _validated_youtube_checkpoints(
         self,
         *,
@@ -1336,6 +1933,8 @@ class DiscoveryRepository:
                 completed_at=completed_at,
                 checkpoint_hash=row["checkpoint_hash"],
             )
+            if source_kind is DiscoverySourceKind.CROSS_CHANNEL_SEARCH:
+                self._validated_search_windows(checkpoint)
             if unit["status"] == UnitStatus.SUCCESS.value:
                 if (
                     completed_at is None
@@ -1347,17 +1946,25 @@ class DiscoveryRepository:
                         "stored YouTube sync artifact is invalid",
                     )
                 if unit["output_hash"] != expected_hash:
-                    if source_kind is not DiscoverySourceKind.SEED_UPLOADS:
+                    profile_version = self.get_profile_version(
+                        spec.profile_version_id
+                    )
+                    if source_kind is DiscoverySourceKind.SEED_UPLOADS:
+                        artifact_hash, _ = self._canonical_seed_artifact(
+                            profile_version, checkpoint
+                        )
+                    elif (
+                        source_kind
+                        is DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+                    ):
+                        artifact_hash, _ = self._canonical_search_artifact(
+                            profile_version, checkpoint
+                        )
+                    else:
                         raise DomainError(
                             "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                             "stored YouTube sync artifact is invalid",
                         )
-                    profile_version = self.get_profile_version(
-                        spec.profile_version_id
-                    )
-                    artifact_hash, _ = self._canonical_seed_artifact(
-                        profile_version, checkpoint
-                    )
                     if unit["output_hash"] != artifact_hash:
                         self._raise_seed_artifact_invalid()
             else:
@@ -1463,6 +2070,202 @@ class DiscoveryRepository:
             ).fetchone()
         )
 
+    def _validated_search_windows(
+        self, checkpoint: YouTubeSyncCheckpoint
+    ) -> tuple[SearchWindow, ...]:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM youtube_search_windows WHERE job_id=? "
+                "AND unit_key=? ORDER BY ordinal",
+                (checkpoint.job_id, checkpoint.unit_key),
+            )
+        )
+        if (
+            checkpoint.source_kind
+            is not DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+            or not rows
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SEARCH_WINDOW_INVALID",
+                "stored YouTube search window is invalid",
+            )
+        windows = tuple(self._search_window_value(row) for row in rows)
+        if tuple(window.ordinal for window in windows) != tuple(
+            range(1, len(windows) + 1)
+        ):
+            self._raise_stored_search_window_invalid()
+        root = windows[0]
+        if (
+            root.split_parent_id is not None
+            or root.lower_bound != checkpoint.effective_lower_bound
+            or root.upper_bound != checkpoint.upper_bound
+            or any(
+                window.job_id != checkpoint.job_id
+                or window.unit_key != checkpoint.unit_key
+                for window in windows
+            )
+        ):
+            self._raise_stored_search_window_invalid()
+        by_id = {window.id: window for window in windows}
+        children: dict[int, list[SearchWindow]] = {}
+        for window in windows[1:]:
+            parent = by_id.get(window.split_parent_id)
+            if parent is None or parent.ordinal >= window.ordinal:
+                self._raise_stored_search_window_invalid()
+            children.setdefault(parent.id, []).append(window)
+        for window in windows:
+            child_pair = children.get(window.id, [])
+            if child_pair:
+                if (
+                    len(child_pair) != 2
+                    or window.completed_at is None
+                    or window.next_page_token is not None
+                    or window.page_count != 10
+                ):
+                    self._raise_stored_search_window_invalid()
+                newer, older = sorted(child_pair, key=lambda item: item.ordinal)
+                if (
+                    newer.ordinal + 1 != older.ordinal
+                    or newer.lower_bound != older.upper_bound
+                    or newer.upper_bound != window.upper_bound
+                    or older.lower_bound != window.lower_bound
+                    or newer.lower_bound.time() != datetime.min.time()
+                ):
+                    self._raise_stored_search_window_invalid()
+            elif (
+                window.completed_at is not None
+                and window.next_page_token is not None
+            ):
+                self._raise_stored_search_window_invalid()
+            elif (
+                window.completed_at is not None
+                and window.page_count == 0
+                and checkpoint.effective_lower_bound
+                != checkpoint.upper_bound
+                or window.completed_at is None
+                and window.page_count == 0
+                and window.next_page_token is not None
+            ):
+                self._raise_stored_search_window_invalid()
+        if checkpoint.effective_lower_bound == checkpoint.upper_bound:
+            if (
+                len(windows) != 1
+                or root.completed_at is None
+                or root.page_count != 0
+                or root.next_page_token is not None
+            ):
+                self._raise_stored_search_window_invalid()
+        elif root.lower_bound >= root.upper_bound:
+            self._raise_stored_search_window_invalid()
+        return windows
+
+    def _search_window_value(self, row: sqlite3.Row) -> SearchWindow:
+        try:
+            lower_bound = _parse_canonical_utc(row["lower_bound"])
+            upper_bound = _parse_canonical_utc(row["upper_bound"])
+            completed_at = (
+                None
+                if row["completed_at"] is None
+                else _parse_canonical_utc(row["completed_at"])
+            )
+            expected_hash = canonical_search_window_hash(
+                job_id=row["job_id"],
+                unit_key=row["unit_key"],
+                ordinal=row["ordinal"],
+                lower_bound=lower_bound,
+                upper_bound=upper_bound,
+                next_page_token=row["next_page_token"],
+                page_count=row["page_count"],
+                split_parent_id=row["split_parent_id"],
+                completed_at=completed_at,
+            )
+        except (DomainError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SEARCH_WINDOW_INVALID",
+                "stored YouTube search window is invalid",
+            ) from cause
+        if (
+            type(row["id"]) is not int
+            or row["id"] <= 0
+            or type(row["job_id"]) is not int
+            or row["job_id"] <= 0
+            or type(row["unit_key"]) is not str
+            or not row["unit_key"]
+            or type(row["ordinal"]) is not int
+            or row["ordinal"] <= 0
+            or lower_bound > upper_bound
+            or row["next_page_token"] is not None
+            and (
+                type(row["next_page_token"]) is not str
+                or _YOUTUBE_PAGE_TOKEN.fullmatch(row["next_page_token"])
+                is None
+            )
+            or type(row["page_count"]) is not int
+            or row["page_count"] < 0
+            or row["page_count"] > 10
+            or row["split_parent_id"] is not None
+            and (
+                type(row["split_parent_id"]) is not int
+                or row["split_parent_id"] <= 0
+            )
+            or row["window_hash"] != expected_hash
+        ):
+            self._raise_stored_search_window_invalid()
+        return SearchWindow(
+            id=row["id"],
+            job_id=row["job_id"],
+            unit_key=row["unit_key"],
+            ordinal=row["ordinal"],
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            next_page_token=row["next_page_token"],
+            page_count=row["page_count"],
+            split_parent_id=row["split_parent_id"],
+            completed_at=completed_at,
+            window_hash=row["window_hash"],
+        )
+
+    def _replace_search_window(
+        self,
+        window: SearchWindow,
+        *,
+        next_page_token: str | None,
+        page_count: int,
+        completed_at: datetime | None,
+    ) -> SearchWindow:
+        window_hash = canonical_search_window_hash(
+            job_id=window.job_id,
+            unit_key=window.unit_key,
+            ordinal=window.ordinal,
+            lower_bound=window.lower_bound,
+            upper_bound=window.upper_bound,
+            next_page_token=next_page_token,
+            page_count=page_count,
+            split_parent_id=window.split_parent_id,
+            completed_at=completed_at,
+        )
+        cursor = self._conn.execute(
+            "UPDATE youtube_search_windows SET next_page_token=?, "
+            "page_count=?, completed_at=?, window_hash=? WHERE id=? "
+            "AND window_hash=?",
+            (
+                next_page_token,
+                page_count,
+                None if completed_at is None else utc_iso(completed_at),
+                window_hash,
+                window.id,
+                window.window_hash,
+            ),
+        )
+        if cursor.rowcount != 1:
+            self._raise_search_checkpoint_invalid()
+        return self._search_window_value(
+            self._conn.execute(
+                "SELECT * FROM youtube_search_windows WHERE id=?",
+                (window.id,),
+            ).fetchone()
+        )
+
     def _canonical_seed_artifact(
         self,
         profile_version: DiscoveryProfileVersion,
@@ -1533,6 +2336,76 @@ class DiscoveryRepository:
             observation_ids,
         )
 
+    def _canonical_search_artifact(
+        self,
+        profile_version: DiscoveryProfileVersion,
+        checkpoint: YouTubeSyncCheckpoint,
+    ) -> tuple[str, tuple[int, ...]]:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT observation.*, video.youtube_video_id "
+                "FROM discovery_observations AS observation "
+                "JOIN videos AS video ON video.id=observation.video_id "
+                "WHERE observation.job_id=? AND observation.profile_id=? "
+                "AND observation.source_kind='cross_channel_search' "
+                "AND observation.source_key=? ORDER BY observation.id",
+                (
+                    checkpoint.job_id,
+                    profile_version.profile_id,
+                    checkpoint.source_key,
+                ),
+            )
+        )
+        for row in rows:
+            self._validate_stored_observation(row)
+            if (
+                row["youtube_video_id"]
+                not in checkpoint.encountered_video_ids
+                or row["youtube_video_id"]
+                in checkpoint.unavailable_video_ids
+            ):
+                self._raise_seed_artifact_invalid()
+            snapshot = self._conn.execute(
+                "SELECT published_at FROM video_metadata_snapshots WHERE id=?",
+                (row["metadata_snapshot_id"],),
+            ).fetchone()
+            try:
+                published_at = _parse_canonical_utc(snapshot["published_at"])
+            except (TypeError, ValueError) as cause:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                    "stored YouTube sync artifact is invalid",
+                ) from cause
+            if not (
+                checkpoint.effective_lower_bound
+                <= published_at
+                < checkpoint.upper_bound
+            ):
+                self._raise_seed_artifact_invalid()
+            candidate = self._conn.execute(
+                "SELECT * FROM subject_video_candidates "
+                "WHERE profile_id=? AND video_id=?",
+                (profile_version.profile_id, row["video_id"]),
+            ).fetchone()
+            if candidate is None:
+                self._raise_seed_artifact_invalid()
+            self._validate_candidate_row(
+                candidate,
+                profile_id=profile_version.profile_id,
+                video_id=row["video_id"],
+            )
+        observation_ids = tuple(row["id"] for row in rows)
+        return (
+            sha256_text(canonical_json({
+                "completed_upper_bound": utc_iso(checkpoint.upper_bound),
+                "persisted_observation_ids": list(observation_ids),
+                "profile_version_id": profile_version.id,
+                "schema": "youtube-search-unit-output.v1",
+                "source_key": checkpoint.source_key,
+            })),
+            observation_ids,
+        )
+
     @classmethod
     def _stored_seed_progress(
         cls,
@@ -1551,7 +2424,10 @@ class DiscoveryRepository:
             != canonical_json(list(encountered))
             or row["unavailable_video_ids_json"]
             != canonical_json(list(unavailable))
-            or source_kind is not DiscoverySourceKind.SEED_UPLOADS
+            or source_kind not in {
+                DiscoverySourceKind.SEED_UPLOADS,
+                DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+            }
             and (encountered or unavailable)
         ):
             raise ValueError("checkpoint progress is not canonical")
@@ -1590,6 +2466,27 @@ class DiscoveryRepository:
         raise DomainError(
             "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
             "stored YouTube sync artifact is invalid",
+        )
+
+    @staticmethod
+    def _raise_search_checkpoint_invalid() -> None:
+        raise DomainError(
+            "YOUTUBE_SEARCH_CHECKPOINT_INVALID",
+            "YouTube search checkpoint is invalid",
+        )
+
+    @staticmethod
+    def _raise_stored_search_window_invalid() -> None:
+        raise DomainError(
+            "STORED_YOUTUBE_SEARCH_WINDOW_INVALID",
+            "stored YouTube search window is invalid",
+        )
+
+    @staticmethod
+    def _raise_cursor_promotion_invalid() -> None:
+        raise DomainError(
+            "YOUTUBE_CURSOR_PROMOTION_INVALID",
+            "YouTube cursor promotion evidence is invalid",
         )
 
     def persist_metadata_batch(

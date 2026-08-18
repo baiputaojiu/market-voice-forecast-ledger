@@ -454,10 +454,68 @@ def _raise_sync_manifest_invalid() -> None:
 
 
 def youtube_search_source_key(search_terms: tuple[str, ...]) -> str:
+    return source_key_for_search_terms(search_terms)
+
+
+def source_key_for_search_terms(search_terms: tuple[str, ...]) -> str:
     validate_profile_configuration((), search_terms)
     return sha256_text(canonical_json({
         "ordered_terms": list(search_terms),
         "schema": "youtube-search-source.v1",
+    }))
+
+
+def initial_backfill_floor(upper_bound: datetime) -> datetime:
+    if not _is_exact_utc(upper_bound):
+        raise DomainError(
+            "YOUTUBE_SYNC_REQUEST_INVALID",
+            "YouTube sync request requires an exact UTC datetime",
+        )
+    try:
+        return upper_bound.replace(year=upper_bound.year - 3)
+    except ValueError:
+        return upper_bound.replace(year=upper_bound.year - 3, day=28)
+
+
+def canonical_source_cursor_hash(
+    *,
+    profile_id: int,
+    source_kind: DiscoverySourceKind,
+    source_key: str,
+    completed_upper_bound: datetime,
+) -> str:
+    return sha256_text(canonical_json({
+        "completed_upper_bound": utc_iso(completed_upper_bound),
+        "profile_id": profile_id,
+        "schema": "youtube-source-cursor.v1",
+        "source_key": source_key,
+        "source_kind": source_kind.value,
+    }))
+
+
+def canonical_search_window_hash(
+    *,
+    job_id: int,
+    unit_key: str,
+    ordinal: int,
+    lower_bound: datetime,
+    upper_bound: datetime,
+    next_page_token: str | None,
+    page_count: int,
+    split_parent_id: int | None,
+    completed_at: datetime | None,
+) -> str:
+    return sha256_text(canonical_json({
+        "completed_at": None if completed_at is None else utc_iso(completed_at),
+        "job_id": job_id,
+        "lower_bound": utc_iso(lower_bound),
+        "next_page_token": next_page_token,
+        "ordinal": ordinal,
+        "page_count": page_count,
+        "schema": "youtube-search-window.v1",
+        "split_parent_id": split_parent_id,
+        "unit_key": unit_key,
+        "upper_bound": utc_iso(upper_bound),
     }))
 
 
