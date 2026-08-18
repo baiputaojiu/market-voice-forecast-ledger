@@ -4,6 +4,7 @@ import copy
 import hashlib
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 
 import pytest
 
@@ -320,6 +321,41 @@ def test_nested_provider_containers_require_exact_objects(
 ):
     item = synthetic_video_item()
     item[container] = value
+    _assert_metadata_invalid(item)
+
+
+def test_omitted_live_streaming_details_is_an_allowed_optional_field():
+    item = synthetic_video_item()
+    del item["liveStreamingDetails"]
+
+    value = normalize_video_item(item, fetched_at=FIXED_NOW)
+
+    assert value.actual_start_time is None
+    assert value.published_at == datetime(
+        2026, 8, 10, 1, 0, tzinfo=timezone.utc
+    )
+
+
+class _ProviderObjectSubclass(dict[str, object]):
+    pass
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        None,
+        "object",
+        [],
+        (),
+        True,
+        1,
+        MappingProxyType({}),
+        _ProviderObjectSubclass(),
+    ),
+)
+def test_present_live_streaming_details_requires_an_exact_object(value: object):
+    item = synthetic_video_item()
+    item["liveStreamingDetails"] = value
     _assert_metadata_invalid(item)
 
 

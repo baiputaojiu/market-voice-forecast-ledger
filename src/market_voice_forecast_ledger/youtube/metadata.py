@@ -52,14 +52,19 @@ def normalize_video_item(
         snippet = item["snippet"]
         content_details = item["contentDetails"]
         status = item["status"]
-        live_details = item.get("liveStreamingDetails")
+        live_details_value = item.get("liveStreamingDetails", _MISSING)
+        if live_details_value is _MISSING:
+            live_details = None
+        elif type(live_details_value) is dict:
+            live_details = live_details_value
+        else:
+            _raise_metadata_invalid()
         if (
             type(video_id) is not str
             or _YOUTUBE_VIDEO_ID.fullmatch(video_id) is None
             or type(snippet) is not dict
             or type(content_details) is not dict
             or type(status) is not dict
-            or (live_details is not None and type(live_details) is not dict)
         ):
             _raise_metadata_invalid()
 
