@@ -5,10 +5,24 @@ import re
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 
+from market_voice_forecast_ledger.api.models import (
+    JobResponse,
+    JobUnitResponse,
+    StageProgressResponse,
+    SubjectResponse,
+    YouTubeSyncStatusResponse,
+    YouTubeSyncUnitResponse,
+)
 from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
+from market_voice_forecast_ledger.domain.common import utc_iso
+from market_voice_forecast_ledger.domain.discovery import (
+    DiscoverySourceKind,
+    YouTubeSyncKind,
+    build_youtube_sync_shape,
+)
 from market_voice_forecast_ledger.domain.enums import (
     JobKind,
     JobStage,
@@ -22,12 +36,12 @@ from market_voice_forecast_ledger.domain.jobs import (
     ManifestUnit,
 )
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
+from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
 from market_voice_forecast_ledger.repositories.jobs import JobRepository
-from market_voice_forecast_ledger.api.models import (
-    JobResponse,
-    JobUnitResponse,
-    StageProgressResponse,
-    SubjectResponse,
+from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
+from market_voice_forecast_ledger.windows.task_scheduler import (
+    TaskSchedulerAdapter,
+    TaskWakeAdapter,
 )
 
 
@@ -83,6 +97,25 @@ def settings_dependency(settings: Settings) -> Callable[[], Settings]:
         return settings
 
     return request_settings
+
+
+def get_task_wake_adapter() -> TaskWakeAdapter:
+    return TaskSchedulerAdapter()
+
+
+def task_wake_dependency(
+    adapter: TaskWakeAdapter,
+) -> Callable[[], TaskWakeAdapter]:
+    if not callable(getattr(adapter, "request_start", None)):
+        raise DomainError(
+            "YOUTUBE_SYNC_DEPENDENCY_INVALID",
+            "YouTube sync wake dependency is invalid",
+        )
+
+    def request_adapter() -> TaskWakeAdapter:
+        return adapter
+
+    return request_adapter
 
 
 class PublicReadAdapter:
@@ -248,6 +281,153 @@ class PublicReadAdapter:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as cause:
             raise DomainError(
                 "JOB_STORED_INVALID", "stored job progress is invalid"
+            ) from cause
+
+    def read_youtube_sync_status(self, job_id: int) -> YouTubeSyncStatusResponse:
+        if type(job_id) is not int or job_id <= 0:
+            raise DomainError("JOB_ID_INVALID", "job id is invalid")
+        try:
+            job = self.read_job(job_id)
+            if job.kind != JobKind.YOUTUBE_SYNC.value:
+                raise DomainError(
+                    "YOUTUBE_SYNC_NOT_FOUND", "YouTube sync job does not exist"
+                )
+            repository = DiscoveryRepository(self._conn)
+            manifest = YouTubeSyncService(self._conn).get_sync_manifest(job_id)
+            sync_kind = YouTubeSyncKind(manifest.sync_kind)
+            profiles = tuple(
+                repository.get_profile_version(profile.profile_version_id)
+                for profile in manifest.profiles
+            )
+            manual_video_id = None
+            if sync_kind is YouTubeSyncKind.MANUAL:
+                if manifest.manual_request_id is None or len(profiles) != 1:
+                    raise ValueError("invalid manual manifest")
+                profile_id, manual_video_id = repository.manual_request_binding(
+                    manifest.manual_request_id
+                )
+                if profiles[0].profile_id != profile_id:
+                    raise ValueError("invalid manual profile binding")
+            _, unit_specs = build_youtube_sync_shape(
+                sync_kind=sync_kind,
+                profiles=profiles,
+                upper_bound=manifest.upper_bound,
+                backfill_floor=manifest.backfill_floor,
+                quota_contract_version=manifest.quota_contract_version,
+                manual_request_id=manifest.manual_request_id,
+                manual_video_id=manual_video_id,
+            )
+            if len(unit_specs) != job.total or len(job.units) != job.total:
+                raise ValueError("invalid YouTube unit set")
+
+            verified_artifacts = repository.verified_youtube_artifact_hashes(
+                job_id
+            )
+            checkpoints = tuple(
+                repository.get_youtube_sync_checkpoint(job_id, spec.unit_key)
+                for spec in unit_specs
+            )
+            for spec, checkpoint, unit in zip(
+                unit_specs, checkpoints, job.units, strict=True
+            ):
+                if (
+                    checkpoint.job_id != job_id
+                    or checkpoint.unit_key != spec.unit_key
+                    or checkpoint.source_kind is not spec.source_kind
+                    or checkpoint.source_key != spec.source_key
+                    or unit.stage != spec.stage.value
+                    or (unit.status == UnitStatus.SUCCESS.value)
+                    != (checkpoint.completed_at is not None)
+                    or (unit.status == UnitStatus.SUCCESS.value)
+                    != (spec.unit_key in verified_artifacts)
+                    or not set(checkpoint.unavailable_video_ids).issubset(
+                        checkpoint.encountered_video_ids
+                    )
+                ):
+                    raise ValueError("invalid YouTube checkpoint provenance")
+                if spec.source_kind is DiscoverySourceKind.CROSS_CHANNEL_SEARCH:
+                    repository.next_search_window(job_id, spec.unit_key)
+
+            observed: dict[tuple[int, str, str], list[str]] = {}
+            for row in self._conn.execute(
+                "SELECT observation.profile_id, observation.source_kind, "
+                "observation.source_key, video.youtube_video_id "
+                "FROM discovery_observations AS observation "
+                "JOIN videos AS video ON video.id=observation.video_id "
+                "WHERE observation.job_id=? ORDER BY observation.id",
+                (job_id,),
+            ):
+                key = (row["profile_id"], row["source_kind"], row["source_key"])
+                youtube_video_id = row["youtube_video_id"]
+                if (
+                    type(key[0]) is not int
+                    or type(key[1]) is not str
+                    or type(key[2]) is not str
+                    or type(youtube_video_id) is not str
+                ):
+                    raise ValueError("invalid YouTube observation provenance")
+                observed.setdefault(key, []).append(youtube_video_id)
+
+            expected_keys = {
+                (spec.profile_id, spec.source_kind.value, spec.source_key)
+                for spec in unit_specs
+            }
+            if any(key not in expected_keys for key in observed):
+                raise ValueError("invalid YouTube observation source")
+
+            units: list[YouTubeSyncUnitResponse] = []
+            for spec, checkpoint, unit in zip(
+                unit_specs, checkpoints, job.units, strict=True
+            ):
+                observed_ids = observed.get(
+                    (spec.profile_id, spec.source_kind.value, spec.source_key), []
+                )
+                if any(
+                    video_id not in checkpoint.encountered_video_ids
+                    for video_id in observed_ids
+                ):
+                    raise ValueError("invalid YouTube observation binding")
+                units.append(
+                    YouTubeSyncUnitResponse(
+                        stage=unit.stage,
+                        status=unit.status,
+                        discovered_count=len(checkpoint.encountered_video_ids),
+                        persisted_count=len(observed_ids),
+                        unavailable_count=len(checkpoint.unavailable_video_ids),
+                        error_code=unit.error_code,
+                    )
+                )
+            response_units = tuple(units)
+            return YouTubeSyncStatusResponse(
+                job_id=job.job_id,
+                status=job.status,
+                completed_units=job.completed,
+                total_units=job.total,
+                resume_not_before_utc=(
+                    None
+                    if manifest.resume_not_before_utc is None
+                    else utc_iso(manifest.resume_not_before_utc)
+                ),
+                discovered_total=sum(
+                    unit.discovered_count for unit in response_units
+                ),
+                persisted_total=sum(unit.persisted_count for unit in response_units),
+                unavailable_total=sum(
+                    unit.unavailable_count for unit in response_units
+                ),
+                units=response_units,
+            )
+        except DomainError as cause:
+            if cause.code in {"JOB_NOT_FOUND", "YOUTUBE_SYNC_NOT_FOUND"}:
+                raise
+            raise DomainError(
+                "YOUTUBE_SYNC_STORED_INVALID",
+                "stored YouTube sync progress is invalid",
+            ) from cause
+        except (KeyError, LookupError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "YOUTUBE_SYNC_STORED_INVALID",
+                "stored YouTube sync progress is invalid",
             ) from cause
 
     def stale_scope_count_for_segment(

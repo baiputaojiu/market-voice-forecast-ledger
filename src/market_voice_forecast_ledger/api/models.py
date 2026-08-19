@@ -187,6 +187,9 @@ class StageProgressResponse(StrictApiModel):
         "codex_analysis",
         "asset_mapping",
         "heatmap_update",
+        "youtube_seed_discovery",
+        "youtube_search_discovery",
+        "youtube_manual_discovery",
     ]
     completed: int = Field(ge=0)
     total: int = Field(ge=0)
@@ -202,6 +205,9 @@ class JobUnitResponse(StrictApiModel):
         "codex_analysis",
         "asset_mapping",
         "heatmap_update",
+        "youtube_seed_discovery",
+        "youtube_search_discovery",
+        "youtube_manual_discovery",
     ]
     status: Literal["pending", "running", "success", "failed"]
     ordinal: int = Field(gt=0)
@@ -210,7 +216,7 @@ class JobUnitResponse(StrictApiModel):
 
 class JobResponse(StrictApiModel):
     job_id: int = Field(gt=0)
-    kind: Literal["video_pipeline", "analysis_scope"]
+    kind: Literal["video_pipeline", "analysis_scope", "youtube_sync"]
     status: Literal[
         "queued",
         "running",
@@ -226,6 +232,89 @@ class JobResponse(StrictApiModel):
     total: int = Field(gt=0)
     stages: tuple[StageProgressResponse, ...]
     units: tuple[JobUnitResponse, ...]
+
+
+YouTubeJobStatus = Literal[
+    "queued", "running", "retrying", "failed", "succeeded"
+]
+
+
+class YouTubeSyncRequestResponse(StrictApiModel):
+    job_id: int = Field(gt=0)
+    status: YouTubeJobStatus
+    reused: bool
+
+
+class YouTubeManualCandidateRequest(StrictApiModel):
+    subject_id: int = Field(gt=0)
+    url: str = Field(min_length=1, max_length=2048)
+
+
+class YouTubeManualCandidateResponse(StrictApiModel):
+    request_id: int = Field(gt=0)
+    job_id: int = Field(gt=0)
+    status: YouTubeJobStatus
+    reused: bool
+
+
+class YouTubeSyncUnitResponse(StrictApiModel):
+    stage: Literal[
+        "youtube_seed_discovery",
+        "youtube_search_discovery",
+        "youtube_manual_discovery",
+    ]
+    status: Literal["pending", "running", "success", "failed"]
+    discovered_count: int = Field(ge=0)
+    persisted_count: int = Field(ge=0)
+    unavailable_count: int = Field(ge=0)
+    error_code: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_counts_and_error(self):
+        if (
+            self.persisted_count > self.discovered_count
+            or self.unavailable_count > self.discovered_count
+            or (self.status == "failed") != (self.error_code is not None)
+        ):
+            raise ValueError("YouTube sync unit summary is invalid")
+        return self
+
+
+class YouTubeSyncStatusResponse(StrictApiModel):
+    job_id: int = Field(gt=0)
+    status: YouTubeJobStatus
+    completed_units: int = Field(ge=0)
+    total_units: int = Field(gt=0)
+    resume_not_before_utc: str | None = Field(
+        default=None, min_length=27, max_length=27
+    )
+    discovered_total: int = Field(ge=0)
+    persisted_total: int = Field(ge=0)
+    unavailable_total: int = Field(ge=0)
+    units: tuple[YouTubeSyncUnitResponse, ...]
+
+    @field_validator("resume_not_before_utc")
+    @classmethod
+    def validate_resume_not_before(cls, value: str | None) -> str | None:
+        if value is not None:
+            parse_canonical_utc(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_totals(self):
+        if (
+            len(self.units) != self.total_units
+            or self.completed_units
+            != sum(unit.status == "success" for unit in self.units)
+            or self.discovered_total
+            != sum(unit.discovered_count for unit in self.units)
+            or self.persisted_total
+            != sum(unit.persisted_count for unit in self.units)
+            or self.unavailable_total
+            != sum(unit.unavailable_count for unit in self.units)
+        ):
+            raise ValueError("YouTube sync summary totals are invalid")
+        return self
 
 
 class CurrentSummaryResponse(StrictApiModel):

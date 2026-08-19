@@ -537,6 +537,42 @@ def test_retention_requires_exact_preview_token_and_preserves_public_results(
                 "unknown": {"nested": "value"},
             },
         ),
+        (
+            "/api/youtube-syncs",
+            {"unknown": "private sync field"},
+        ),
+        (
+            "/api/youtube-syncs?unknown=private",
+            {},
+        ),
+        (
+            "/api/youtube-manual-candidates",
+            {"subject_id": True, "url": "https://youtu.be/abcdefghijk"},
+        ),
+        (
+            "/api/youtube-manual-candidates",
+            {"subject_id": "1", "url": "https://youtu.be/abcdefghijk"},
+        ),
+        (
+            "/api/youtube-manual-candidates",
+            {"subject_id": 1.0, "url": "https://youtu.be/abcdefghijk"},
+        ),
+        (
+            "/api/youtube-manual-candidates",
+            {"subject_id": 1, "url": 7},
+        ),
+        (
+            "/api/youtube-manual-candidates",
+            {
+                "subject_id": 1,
+                "url": "https://youtu.be/abcdefghijk",
+                "unknown": "private manual field",
+            },
+        ),
+        (
+            "/api/youtube-manual-candidates?unknown=private",
+            {"subject_id": 1, "url": "https://youtu.be/abcdefghijk"},
+        ),
     ),
 )
 def test_write_models_are_strict_shape_checked_and_actor_is_server_fixed(

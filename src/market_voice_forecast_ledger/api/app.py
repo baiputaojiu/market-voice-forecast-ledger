@@ -18,6 +18,7 @@ from market_voice_forecast_ledger.api.routes import (
     retention,
     reviews,
     subjects,
+    youtube,
 )
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -40,6 +41,8 @@ _SAFE_LOCATIONS = {
     "assignment_kind",
     "assigned_subject_id",
     "preview_token",
+    "subject_id",
+    "url",
 }
 _CONFLICT_CODES = {
     "REVIEW_APPLICATION_REQUIRED",
@@ -87,6 +90,7 @@ def create_app(settings: Settings) -> FastAPI:
         reviews.router,
         corrections.router,
         retention.router,
+        youtube.router,
     ):
         app.include_router(router, prefix="/api")
 
@@ -171,6 +175,8 @@ def _safe_location(value: object) -> str:
 
 
 def _domain_status(code: str) -> int:
+    if code == "YOUTUBE_SYNC_UNAVAILABLE":
+        return 503
     if code.endswith("_NOT_FOUND"):
         return 404
     if (
