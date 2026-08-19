@@ -26,12 +26,17 @@ from tests.backend.youtube_fakes import FakeYouTubeClient, synthetic_video_item
 
 
 VIDEO_ID = "abcdefghijk"
+FOREIGN_VIDEO_ID = "lmnopqrstuv"
 WATCH_URL = f"https://youtube.com/watch?v={VIDEO_ID}"
 SHORT_URL = f"https://youtu.be/{VIDEO_ID}"
 PRIVATE_QUERY = "private_query_sentinel"
 PRIVATE_PAGE_TOKEN = "private_page_token_sentinel"
 PRIVATE_TITLE = "private title sentinel"
 PRIVATE_DESCRIPTION = "private description sentinel"
+PRIVATE_CURRENT_TITLE = "private current title sentinel"
+PRIVATE_CURRENT_DESCRIPTION = "private current description sentinel"
+PRIVATE_FOREIGN_TITLE = "private foreign title sentinel"
+PRIVATE_FOREIGN_DESCRIPTION = "private foreign description sentinel"
 PRIVATE_WAKE_DETAILS = (
     "private retry detail sentinel synthetic-youtube-key-000001 "
     "C:/private/ledger.sqlite3 provider body sentinel"
@@ -135,8 +140,16 @@ def _drop_table_triggers(conn, *table_names: str) -> None:
         conn.execute(f'DROP TRIGGER "{name}"')
 
 
-def _partial_seed_observation(settings: Settings, *, failed: bool):
-    requested_at = datetime(2026, 8, 19, 3, 4, 5, tzinfo=timezone.utc)
+def _partial_seed_observation(
+    settings: Settings,
+    *,
+    failed: bool,
+    requested_at: datetime | None = None,
+    title: str = PRIVATE_TITLE,
+    description: str = PRIVATE_DESCRIPTION,
+):
+    if requested_at is None:
+        requested_at = datetime(2026, 8, 19, 3, 4, 5, tzinfo=timezone.utc)
     conn = open_database(settings.database_path)
     try:
         service = YouTubeSyncService(conn, clock=lambda: requested_at)
@@ -164,8 +177,8 @@ def _partial_seed_observation(settings: Settings, *, failed: bool):
         metadata = normalize_video_item(
             synthetic_video_item(
                 video_id=VIDEO_ID,
-                title=PRIVATE_TITLE,
-                description=PRIVATE_DESCRIPTION,
+                title=title,
+                description=description,
                 snippet_published_at="2026-08-18T01:02:03Z",
             ),
             fetched_at=requested_at,
@@ -210,7 +223,94 @@ def _partial_seed_observation(settings: Settings, *, failed: bool):
             (unit_key, result.job_id),
         ).fetchone()
         assert row is not None
-        return result.job_id, dict(row)
+        identity = dict(row)
+        identity["profile_version_id"] = profile.id
+        identity["unit_key"] = unit_key
+        return result.job_id, identity
+    finally:
+        conn.close()
+
+
+def _historical_and_current_seed_observations(settings: Settings):
+    historical_job_id, historical = _partial_seed_observation(
+        settings,
+        failed=False,
+        title=PRIVATE_TITLE,
+        description=PRIVATE_DESCRIPTION,
+    )
+    conn = open_database(settings.database_path)
+    try:
+        state = JobStateService(
+            conn,
+            clock=lambda: datetime(
+                2026, 8, 19, 3, 4, 6, tzinfo=timezone.utc
+            ),
+        )
+        assert state.request_stop(historical_job_id).value == "cancel_requested"
+        state.fail_unit(
+            historical_job_id,
+            historical["unit_key"],
+            "YOUTUBE_PROVIDER_TRANSIENT",
+        )
+        assert state.status(historical_job_id).value == "stopped"
+    finally:
+        conn.close()
+
+    current_job_id, current = _partial_seed_observation(
+        settings,
+        failed=False,
+        requested_at=datetime(2026, 8, 20, 3, 4, 5, tzinfo=timezone.utc),
+        title=PRIVATE_CURRENT_TITLE,
+        description=PRIVATE_CURRENT_DESCRIPTION,
+    )
+    assert current_job_id != historical_job_id
+    assert current["metadata_snapshot_id"] != historical["metadata_snapshot_id"]
+    return historical_job_id, historical, current_job_id, current
+
+
+def _persist_foreign_seed_observation(
+    settings: Settings, job_id: int, identity: dict[str, object]
+) -> int:
+    observed_at = datetime(2026, 8, 20, 3, 4, 6, tzinfo=timezone.utc)
+    metadata = normalize_video_item(
+        synthetic_video_item(
+            video_id=FOREIGN_VIDEO_ID,
+            title=PRIVATE_FOREIGN_TITLE,
+            description=PRIVATE_FOREIGN_DESCRIPTION,
+            snippet_published_at="2026-08-18T01:02:04Z",
+        ),
+        fetched_at=observed_at,
+    )
+    conn = open_database(settings.database_path)
+    try:
+        repository = DiscoveryRepository(conn)
+        with transaction(conn):
+            repository.persist_metadata_batch(
+                job_id,
+                identity["profile_version_id"],
+                DiscoverySourceKind.SEED_UPLOADS,
+                identity["source_key"],
+                (metadata,),
+                observed_at,
+            )
+            repository.advance_seed_checkpoint(
+                job_id=job_id,
+                unit_key=identity["unit_key"],
+                next_page_token=PRIVATE_PAGE_TOKEN,
+                encountered_video_ids=tuple(
+                    sorted((VIDEO_ID, FOREIGN_VIDEO_ID))
+                ),
+                unavailable_video_ids=(),
+            )
+        row = conn.execute(
+            "SELECT observation.metadata_snapshot_id "
+            "FROM discovery_observations AS observation "
+            "JOIN videos AS video ON video.id=observation.video_id "
+            "WHERE observation.job_id=? AND video.youtube_video_id=?",
+            (job_id, FOREIGN_VIDEO_ID),
+        ).fetchone()
+        assert row is not None
+        return row["metadata_snapshot_id"]
     finally:
         conn.close()
 
@@ -952,6 +1052,134 @@ def test_partial_status_revalidates_every_persisted_discovery_binding(
             PRIVATE_PAGE_TOKEN,
             identity["source_key"],
             VIDEO_ID,
+        ),
+    )
+    assert after == before
+    assert wake.request_count == 0
+
+
+def test_status_keeps_historical_snapshot_readable_after_later_metadata(
+    settings: Settings,
+):
+    historical_job_id, historical, current_job_id, current = (
+        _historical_and_current_seed_observations(settings)
+    )
+    conn = open_database(settings.database_path)
+    try:
+        pointer = conn.execute(
+            "SELECT current_metadata_snapshot_id FROM videos WHERE id=?",
+            (historical["video_id"],),
+        ).fetchone()["current_metadata_snapshot_id"]
+    finally:
+        conn.close()
+    assert pointer == current["metadata_snapshot_id"]
+    assert pointer != historical["metadata_snapshot_id"]
+
+    before = _job_storage_snapshot(settings, historical_job_id)
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        historical_response = client.get(
+            f"/api/youtube-syncs/{historical_job_id}"
+        )
+        current_response = client.get(f"/api/youtube-syncs/{current_job_id}")
+    after = _job_storage_snapshot(settings, historical_job_id)
+
+    assert historical_response.status_code == 200
+    assert historical_response.json()["status"] == "stopped"
+    assert historical_response.json()["persisted_total"] == 1
+    assert current_response.status_code == 200
+    assert current_response.json()["status"] == "running"
+    assert current_response.json()["persisted_total"] == 1
+    for response in (historical_response, current_response):
+        _assert_private_absent(
+            response,
+            (
+                PRIVATE_TITLE,
+                PRIVATE_DESCRIPTION,
+                PRIVATE_CURRENT_TITLE,
+                PRIVATE_CURRENT_DESCRIPTION,
+                PRIVATE_PAGE_TOKEN,
+                historical["source_key"],
+                VIDEO_ID,
+            ),
+        )
+    assert after == before
+    assert wake.request_count == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "current_pointer_null",
+        "current_pointer_foreign",
+        "current_snapshot_owner",
+        "current_snapshot_hash",
+    ),
+)
+def test_historical_status_revalidates_the_independent_current_snapshot(
+    settings: Settings,
+    mutation: str,
+):
+    historical_job_id, historical, current_job_id, current = (
+        _historical_and_current_seed_observations(settings)
+    )
+    private_mutation = f"private_{mutation}_sentinel"
+    foreign_snapshot_id = None
+    if mutation == "current_pointer_foreign":
+        foreign_snapshot_id = _persist_foreign_seed_observation(
+            settings, current_job_id, current
+        )
+
+    conn = open_database(settings.database_path)
+    try:
+        _drop_table_triggers(conn, "videos", "video_metadata_snapshots")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        if mutation == "current_pointer_null":
+            conn.execute(
+                "UPDATE videos SET current_metadata_snapshot_id=NULL WHERE id=?",
+                (historical["video_id"],),
+            )
+        elif mutation == "current_pointer_foreign":
+            conn.execute(
+                "UPDATE videos SET current_metadata_snapshot_id=? WHERE id=?",
+                (foreign_snapshot_id, historical["video_id"]),
+            )
+        elif mutation == "current_snapshot_owner":
+            conn.execute(
+                "UPDATE video_metadata_snapshots SET video_id=999999 WHERE id=?",
+                (current["metadata_snapshot_id"],),
+            )
+        else:
+            conn.execute(
+                "UPDATE video_metadata_snapshots SET canonical_hash=? WHERE id=?",
+                (private_mutation, current["metadata_snapshot_id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    before = _job_storage_snapshot(settings, historical_job_id)
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        response = client.get(f"/api/youtube-syncs/{historical_job_id}")
+    after = _job_storage_snapshot(settings, historical_job_id)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "INTERNAL_ERROR"}
+    _assert_private_absent(
+        response,
+        (
+            private_mutation,
+            PRIVATE_TITLE,
+            PRIVATE_DESCRIPTION,
+            PRIVATE_CURRENT_TITLE,
+            PRIVATE_CURRENT_DESCRIPTION,
+            PRIVATE_FOREIGN_TITLE,
+            PRIVATE_FOREIGN_DESCRIPTION,
+            PRIVATE_PAGE_TOKEN,
+            historical["source_key"],
+            VIDEO_ID,
+            FOREIGN_VIDEO_ID,
         ),
     )
     assert after == before

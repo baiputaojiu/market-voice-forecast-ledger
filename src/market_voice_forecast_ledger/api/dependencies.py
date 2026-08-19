@@ -12,6 +12,7 @@ from market_voice_forecast_ledger.api.models import (
     SubjectResponse,
     YouTubeSyncStatusResponse,
     YouTubeSyncUnitResponse,
+    parse_canonical_utc,
 )
 from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.config import Settings
@@ -19,9 +20,12 @@ from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.common import utc_iso
 from market_voice_forecast_ledger.domain.discovery import (
+    CanonicalVideoMetadata,
     DiscoverySourceKind,
+    LiveState,
     YouTubeSyncKind,
     build_youtube_sync_shape,
+    validate_canonical_video_metadata,
 )
 from market_voice_forecast_ledger.domain.enums import (
     JobKind,
@@ -352,10 +356,33 @@ class PublicReadAdapter:
             for row in self._conn.execute(
                 "SELECT observation.id, observation.profile_id, "
                 "observation.source_kind, observation.source_key, "
-                "observation.metadata_snapshot_id, video.youtube_video_id, "
-                "video.current_metadata_snapshot_id "
+                "observation.metadata_snapshot_id, video.id AS video_id, "
+                "video.youtube_video_id, video.current_metadata_snapshot_id, "
+                "current_snapshot.id AS current_snapshot_id, "
+                "current_snapshot.video_id AS current_snapshot_video_id, "
+                "current_snapshot.youtube_video_id "
+                "AS current_snapshot_youtube_video_id, "
+                "current_snapshot.channel_id AS current_snapshot_channel_id, "
+                "current_snapshot.channel_title "
+                "AS current_snapshot_channel_title, "
+                "current_snapshot.title AS current_snapshot_title, "
+                "current_snapshot.description AS current_snapshot_description, "
+                "current_snapshot.published_at "
+                "AS current_snapshot_published_at, "
+                "current_snapshot.duration_seconds "
+                "AS current_snapshot_duration_seconds, "
+                "current_snapshot.live_state AS current_snapshot_live_state, "
+                "current_snapshot.actual_start_time "
+                "AS current_snapshot_actual_start_time, "
+                "current_snapshot.schema_version "
+                "AS current_snapshot_schema_version, "
+                "current_snapshot.canonical_hash "
+                "AS current_snapshot_canonical_hash, "
+                "current_snapshot.fetched_at AS current_snapshot_fetched_at "
                 "FROM discovery_observations AS observation "
                 "LEFT JOIN videos AS video ON video.id=observation.video_id "
+                "LEFT JOIN video_metadata_snapshots AS current_snapshot "
+                "ON current_snapshot.id=video.current_metadata_snapshot_id "
                 "WHERE observation.job_id=? ORDER BY observation.id",
                 (job_id,),
             ):
@@ -369,10 +396,9 @@ class PublicReadAdapter:
                     or type(observation_id) is not int
                     or type(youtube_video_id) is not str
                     or type(row["metadata_snapshot_id"]) is not int
-                    or row["current_metadata_snapshot_id"]
-                    != row["metadata_snapshot_id"]
                 ):
                     raise ValueError("invalid YouTube observation provenance")
+                _validate_current_youtube_snapshot(row)
                 observed.setdefault(key, []).append(
                     (observation_id, youtube_video_id)
                 )
@@ -487,6 +513,36 @@ class PublicReadAdapter:
             segment_id, assigned_subject_id
         )
         return len(scope_ids)
+
+
+def _validate_current_youtube_snapshot(row: sqlite3.Row) -> None:
+    if (
+        type(row["video_id"]) is not int
+        or type(row["current_metadata_snapshot_id"]) is not int
+        or row["current_snapshot_id"] != row["current_metadata_snapshot_id"]
+        or row["current_snapshot_video_id"] != row["video_id"]
+        or row["current_snapshot_youtube_video_id"] != row["youtube_video_id"]
+    ):
+        raise ValueError("invalid YouTube current metadata binding")
+    metadata = CanonicalVideoMetadata(
+        youtube_video_id=row["current_snapshot_youtube_video_id"],
+        channel_id=row["current_snapshot_channel_id"],
+        channel_title=row["current_snapshot_channel_title"],
+        title=row["current_snapshot_title"],
+        description=row["current_snapshot_description"],
+        published_at=parse_canonical_utc(row["current_snapshot_published_at"]),
+        duration_seconds=row["current_snapshot_duration_seconds"],
+        live_state=LiveState(row["current_snapshot_live_state"]),
+        actual_start_time=(
+            None
+            if row["current_snapshot_actual_start_time"] is None
+            else parse_canonical_utc(row["current_snapshot_actual_start_time"])
+        ),
+        schema_version=row["current_snapshot_schema_version"],
+        canonical_hash=row["current_snapshot_canonical_hash"],
+        fetched_at=parse_canonical_utc(row["current_snapshot_fetched_at"]),
+    )
+    validate_canonical_video_metadata(metadata)
 
 
 def _positive_int(value: object) -> int:
