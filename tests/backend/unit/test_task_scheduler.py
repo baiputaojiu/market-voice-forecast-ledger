@@ -268,6 +268,41 @@ def test_registration_builds_exact_utf16_interactive_task_xml(
     )
     assert settings[0].findtext("task:StartWhenAvailable", namespaces=ns) == "true"
     assert settings[0].findtext("task:ExecutionTimeLimit", namespaces=ns) == "PT0S"
+    assert tuple(child.tag.rsplit("}", 1)[-1] for child in settings[0]) == (
+        "AllowStartOnDemand",
+        "MultipleInstancesPolicy",
+        "DisallowStartIfOnBatteries",
+        "StopIfGoingOnBatteries",
+        "AllowHardTerminate",
+        "StartWhenAvailable",
+        "RunOnlyIfNetworkAvailable",
+        "WakeToRun",
+        "Enabled",
+        "Hidden",
+        "DeleteExpiredTaskAfter",
+        "IdleSettings",
+        "ExecutionTimeLimit",
+        "Priority",
+        "RunOnlyIfIdle",
+        "UseUnifiedSchedulingEngine",
+        "DisallowStartOnRemoteAppSession",
+    )
+    for setting_name, expected_value in EXPECTED_SCALAR_SETTINGS.items():
+        assert settings[0].findtext(
+            f"task:{setting_name}", namespaces=ns
+        ) == expected_value
+    idle_settings = settings[0].findall("task:IdleSettings", ns)
+    assert len(idle_settings) == 1
+    assert tuple(child.tag.rsplit("}", 1)[-1] for child in idle_settings[0]) == (
+        "Duration",
+        "WaitTimeout",
+        "StopOnIdleEnd",
+        "RestartOnIdle",
+    )
+    for setting_name, expected_value in EXPECTED_IDLE_SETTINGS.items():
+        assert idle_settings[0].findtext(
+            f"task:{setting_name}", namespaces=ns
+        ) == expected_value
 
     actions = root.findall("./task:Actions/task:Exec", ns)
     assert len(actions) == 1
@@ -822,3 +857,237 @@ def test_i2_managed_delete_nonzero_is_a_safe_error_not_absence():
         WHOAMI_ARGV,
         DELETE_ARGV,
     ]
+
+
+EXPECTED_SCALAR_SETTINGS = {
+    "AllowStartOnDemand": "true",
+    "MultipleInstancesPolicy": "Queue",
+    "DisallowStartIfOnBatteries": "true",
+    "StopIfGoingOnBatteries": "true",
+    "AllowHardTerminate": "true",
+    "StartWhenAvailable": "true",
+    "RunOnlyIfNetworkAvailable": "false",
+    "WakeToRun": "false",
+    "Enabled": "true",
+    "Hidden": "false",
+    "DeleteExpiredTaskAfter": "PT0S",
+    "ExecutionTimeLimit": "PT0S",
+    "Priority": "7",
+    "RunOnlyIfIdle": "false",
+    "UseUnifiedSchedulingEngine": "false",
+    "DisallowStartOnRemoteAppSession": "false",
+}
+EXPECTED_IDLE_SETTINGS = {
+    "Duration": "PT10M",
+    "WaitTimeout": "PT1H",
+    "StopOnIdleEnd": "true",
+    "RestartOnIdle": "false",
+}
+REQUIRED_SETTINGS = (
+    ("MultipleInstancesPolicy", "Queue"),
+    ("StartWhenAvailable", "true"),
+    ("ExecutionTimeLimit", "PT0S"),
+)
+
+
+def _task_xml_with_settings(*setting_entries):
+    root = ElementTree.fromstring(MANAGED_TASK_XML)
+    namespace = f"{{{TASK_NAMESPACE}}}"
+    settings = root.find(f"./{namespace}Settings")
+    assert settings is not None
+    settings.clear()
+    for setting_name, setting_value in setting_entries:
+        setting = ElementTree.SubElement(settings, f"{namespace}{setting_name}")
+        if type(setting_value) is tuple:
+            for child_name, child_value in setting_value:
+                ElementTree.SubElement(
+                    setting, f"{namespace}{child_name}"
+                ).text = child_value
+        else:
+            setting.text = setting_value
+    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _task_xml_with_added_settings(*setting_entries):
+    return _task_xml_with_settings(*REQUIRED_SETTINGS, *setting_entries)
+
+
+SETTINGS_MUTATIONS = (
+    _task_xml_with_added_settings(("Enabled", "false")),
+    _task_xml_with_added_settings(("RunOnlyIfNetworkAvailable", "true")),
+    _task_xml_with_added_settings(("DisallowStartIfOnBatteries", "false")),
+    _task_xml_with_added_settings(("StopIfGoingOnBatteries", "false")),
+    _task_xml_with_added_settings(("AllowHardTerminate", "false")),
+    _task_xml_with_added_settings(("AllowStartOnDemand", "false")),
+    _task_xml_with_added_settings(("Hidden", "true")),
+    _task_xml_with_added_settings(("Priority", "8")),
+    _task_xml_with_added_settings(("RunOnlyIfIdle", "true")),
+    _task_xml_with_added_settings(("UseUnifiedSchedulingEngine", "true")),
+    _task_xml_with_added_settings(
+        ("DisallowStartOnRemoteAppSession", "true")
+    ),
+    _task_xml_with_added_settings(("WakeToRun", "true")),
+    _task_xml_with_added_settings(("DeleteExpiredTaskAfter", "PT1H")),
+    _task_xml_with_added_settings(
+        (
+            "IdleSettings",
+            (
+                ("Duration", "PT5M"),
+                ("WaitTimeout", "PT1H"),
+                ("StopOnIdleEnd", "true"),
+                ("RestartOnIdle", "false"),
+            ),
+        )
+    ),
+    _task_xml_with_added_settings(
+        (
+            "IdleSettings",
+            (
+                ("Duration", "PT10M"),
+                ("WaitTimeout", "PT1H"),
+                ("StopOnIdleEnd", "true"),
+                ("RestartOnIdle", "false"),
+                ("UnknownIdleSetting", "true"),
+            ),
+        )
+    ),
+    _task_xml_with_added_settings(
+        ("RestartOnFailure", (("Interval", "PT1M"), ("Count", "1")))
+    ),
+    _task_xml_with_added_settings(("NetworkProfileName", "private-profile")),
+    _task_xml_with_added_settings(
+        ("NetworkSettings", (("Name", "private-network"),))
+    ),
+    _task_xml_with_added_settings(("UnknownSetting", "true")),
+    _task_xml_with_added_settings(("Enabled", "true"), ("Enabled", "true")),
+    _task_xml_with_added_settings(("Enabled", "True")),
+    _task_xml_with_added_settings(("Priority", "07")),
+)
+
+
+@pytest.mark.parametrize(
+    "mutated_xml",
+    SETTINGS_MUTATIONS,
+    ids=(
+        "disabled",
+        "network-required",
+        "battery-start",
+        "battery-stop",
+        "hard-terminate",
+        "on-demand",
+        "hidden",
+        "priority",
+        "idle-only",
+        "unified-engine",
+        "remote-app-session",
+        "wake-to-run",
+        "delete-expired",
+        "idle-duration",
+        "unknown-idle-setting",
+        "restart-on-failure",
+        "network-profile",
+        "network-settings",
+        "unknown-setting",
+        "duplicate-setting",
+        "noncanonical-boolean",
+        "noncanonical-priority",
+    ),
+)
+def test_i3_settings_mutations_fail_managed_attestation(mutated_xml):
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=mutated_xml)
+    )
+
+    with pytest.raises(DomainError) as caught:
+        TaskSchedulerAdapter(runner=runner).status()
+
+    assert caught.value.code == "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE"
+    assert "private" not in str(caught.value).lower()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_code"),
+    (
+        ("install", "YOUTUBE_SCHEDULE_OPERATION_FAILED"),
+        ("update", "YOUTUBE_SCHEDULE_OPERATION_FAILED"),
+        ("status", "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE"),
+        ("request_start", "YOUTUBE_SYNC_UNAVAILABLE"),
+        ("remove", "YOUTUBE_SCHEDULE_OPERATION_FAILED"),
+    ),
+)
+def test_i3_changed_settings_block_status_run_delete_and_create(
+    operation, expected_code
+):
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=SETTINGS_MUTATIONS[0])
+    )
+    adapter = TaskSchedulerAdapter(runner=runner, today=lambda: date(2026, 8, 19))
+    caught = None
+
+    try:
+        _invoke_review_operation(adapter, operation)
+    except DomainError as error:
+        caught = error
+
+    mutating_commands = [
+        call[0]
+        for call in runner.calls
+        if len(call[0]) >= 2 and call[0][1] in {"/Create", "/Run", "/Delete"}
+    ]
+    assert mutating_commands == []
+    assert caught is not None
+    assert caught.code == expected_code
+
+
+FULL_DEFAULT_SETTINGS_ARBITRARY_ORDER = (
+    ("Priority", "7"),
+    ("Enabled", "true"),
+    ("ExecutionTimeLimit", "PT0S"),
+    ("WakeToRun", "false"),
+    (
+        "IdleSettings",
+        (
+            ("RestartOnIdle", "false"),
+            ("StopOnIdleEnd", "true"),
+            ("WaitTimeout", "PT1H"),
+            ("Duration", "PT10M"),
+        ),
+    ),
+    ("MultipleInstancesPolicy", "Queue"),
+    ("RunOnlyIfIdle", "false"),
+    ("DisallowStartIfOnBatteries", "true"),
+    ("StartWhenAvailable", "true"),
+    ("AllowHardTerminate", "true"),
+    ("Hidden", "false"),
+    ("UseUnifiedSchedulingEngine", "false"),
+    ("AllowStartOnDemand", "true"),
+    ("StopIfGoingOnBatteries", "true"),
+    ("DeleteExpiredTaskAfter", "PT0S"),
+    ("DisallowStartOnRemoteAppSession", "false"),
+    ("RunOnlyIfNetworkAvailable", "false"),
+)
+
+
+@pytest.mark.parametrize(
+    "xml",
+    (
+        MANAGED_TASK_XML,
+        _task_xml_with_added_settings(
+            ("IdleSettings", (("Duration", "PT10M"),))
+        ),
+        _task_xml_with_settings(*FULL_DEFAULT_SETTINGS_ARBITRARY_ORDER),
+    ),
+    ids=(
+        "documented-defaults-omitted",
+        "idle-defaults-partly-omitted",
+        "documented-defaults-explicit",
+    ),
+)
+def test_i3_documented_settings_defaults_normalize_to_managed_task(xml):
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=xml)
+    )
+
+    status = TaskSchedulerAdapter(runner=runner).status()
+
+    assert status == ScheduledTaskStatus(True, "06:00", True, "Queue")

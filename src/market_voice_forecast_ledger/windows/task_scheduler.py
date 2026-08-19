@@ -36,6 +36,34 @@ _TASK_URI = f"\\{YOUTUBE_SYNC_TASK_NAME}"
 _TASK_DESCRIPTION = (
     "Managed by Market Voice Forecast Ledger for daily YouTube sync."
 )
+_TASK_SETTINGS = (
+    ("AllowStartOnDemand", "true"),
+    ("MultipleInstancesPolicy", "Queue"),
+    ("DisallowStartIfOnBatteries", "true"),
+    ("StopIfGoingOnBatteries", "true"),
+    ("AllowHardTerminate", "true"),
+    ("StartWhenAvailable", "true"),
+    ("RunOnlyIfNetworkAvailable", "false"),
+    ("WakeToRun", "false"),
+    ("Enabled", "true"),
+    ("Hidden", "false"),
+    ("DeleteExpiredTaskAfter", "PT0S"),
+    ("IdleSettings", None),
+    ("ExecutionTimeLimit", "PT0S"),
+    ("Priority", "7"),
+    ("RunOnlyIfIdle", "false"),
+    ("UseUnifiedSchedulingEngine", "false"),
+    ("DisallowStartOnRemoteAppSession", "false"),
+)
+_TASK_IDLE_SETTINGS = (
+    ("Duration", "PT10M"),
+    ("WaitTimeout", "PT1H"),
+    ("StopOnIdleEnd", "true"),
+    ("RestartOnIdle", "false"),
+)
+_REQUIRED_TASK_SETTINGS = frozenset(
+    {"MultipleInstancesPolicy", "StartWhenAvailable", "ExecutionTimeLimit"}
+)
 _MAX_WHOAMI_BYTES = 8_192
 _MAX_TASK_LIST_BYTES = 1_048_576
 
@@ -371,15 +399,18 @@ def _build_task_xml(day: date, local_time: time, sid: str) -> bytes:
     )
 
     settings = ElementTree.SubElement(task, f"{namespace}Settings")
-    ElementTree.SubElement(
-        settings, f"{namespace}MultipleInstancesPolicy"
-    ).text = "Queue"
-    ElementTree.SubElement(settings, f"{namespace}StartWhenAvailable").text = (
-        "true"
-    )
-    ElementTree.SubElement(settings, f"{namespace}ExecutionTimeLimit").text = (
-        "PT0S"
-    )
+    for setting_name, setting_value in _TASK_SETTINGS:
+        setting = ElementTree.SubElement(
+            settings, f"{namespace}{setting_name}"
+        )
+        if setting_name == "IdleSettings":
+            for idle_name, idle_value in _TASK_IDLE_SETTINGS:
+                ElementTree.SubElement(
+                    setting, f"{namespace}{idle_name}"
+                ).text = idle_value
+        else:
+            assert setting_value is not None
+            setting.text = setting_value
 
     actions = ElementTree.SubElement(
         task, f"{namespace}Actions", {"Context": "Author"}
@@ -489,21 +520,7 @@ def _parse_task_status(
     settings_containers = root.findall(f"./{namespace}Settings")
     if len(settings_containers) != 1:
         raise ValueError("task settings are invalid")
-    start_when_available = _one_text(
-        settings_containers[0], f"{namespace}StartWhenAvailable"
-    )
-    multiple_instances = _one_text(
-        settings_containers[0], f"{namespace}MultipleInstancesPolicy"
-    )
-    execution_time_limit = _one_text(
-        settings_containers[0], f"{namespace}ExecutionTimeLimit"
-    )
-    if (
-        start_when_available != "true"
-        or multiple_instances != "Queue"
-        or execution_time_limit != "PT0S"
-    ):
-        raise ValueError("task settings are invalid")
+    _validate_task_settings(settings_containers[0], namespace)
 
     action_containers = root.findall(f"./{namespace}Actions")
     if (
@@ -523,6 +540,63 @@ def _parse_task_status(
     ):
         raise ValueError("task action is invalid")
     return ScheduledTaskStatus(True, match.group(2), True, "Queue")
+
+
+def _validate_task_settings(
+    settings: ElementTree.Element,
+    namespace: str,
+) -> None:
+    if settings.attrib:
+        raise ValueError("task settings are invalid")
+    expected = {
+        f"{namespace}{setting_name}": (setting_name, setting_value)
+        for setting_name, setting_value in _TASK_SETTINGS
+    }
+    seen: set[str] = set()
+    for setting in settings:
+        definition = expected.get(setting.tag)
+        if definition is None:
+            raise ValueError("task settings are invalid")
+        setting_name, setting_value = definition
+        if setting_name in seen:
+            raise ValueError("task settings are invalid")
+        seen.add(setting_name)
+        if setting_name == "IdleSettings":
+            _validate_idle_settings(setting, namespace)
+        elif (
+            setting.attrib
+            or len(setting) != 0
+            or setting.text != setting_value
+        ):
+            raise ValueError("task settings are invalid")
+    if not _REQUIRED_TASK_SETTINGS.issubset(seen):
+        raise ValueError("task settings are invalid")
+
+
+def _validate_idle_settings(
+    idle_settings: ElementTree.Element,
+    namespace: str,
+) -> None:
+    if idle_settings.attrib:
+        raise ValueError("task settings are invalid")
+    expected = {
+        f"{namespace}{setting_name}": (setting_name, setting_value)
+        for setting_name, setting_value in _TASK_IDLE_SETTINGS
+    }
+    seen: set[str] = set()
+    for setting in idle_settings:
+        definition = expected.get(setting.tag)
+        if definition is None:
+            raise ValueError("task settings are invalid")
+        setting_name, setting_value = definition
+        if (
+            setting_name in seen
+            or setting.attrib
+            or len(setting) != 0
+            or setting.text != setting_value
+        ):
+            raise ValueError("task settings are invalid")
+        seen.add(setting_name)
 
 
 def _one_text(element: ElementTree.Element, path: str) -> str:
