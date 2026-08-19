@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -290,3 +291,102 @@ def missing_credential_error() -> DomainError:
         "YOUTUBE_CREDENTIAL_NOT_CONFIGURED",
         "YouTube credential is not configured",
     )
+
+
+class FakeScheduleReader:
+    def __init__(
+        self, status: object, *, error: BaseException | None = None
+    ) -> None:
+        self._status = status
+        self._error = error
+        self.calls = 0
+
+    def status(self) -> object:
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._status
+
+
+@dataclass(frozen=True, slots=True)
+class FakeCompletedProcess:
+    returncode: int = 0
+    stdout: bytes = b""
+    stderr: bytes = b""
+
+
+class FakeSubprocessRunner:
+    def __init__(self, *responses: object) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def __call__(self, argv: object, **kwargs: object) -> object:
+        if type(argv) is not list or any(type(item) is not str for item in argv):
+            raise AssertionError("scheduler argv must be a list of strings")
+        self.calls.append((tuple(argv), dict(kwargs)))
+        if not self._responses:
+            raise AssertionError(
+                "fake scheduler runner received an unexpected call"
+            )
+        response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+class EndpointYouTubeTransport:
+    """Endpoint-aware fake used by worker integration tests."""
+
+    def __init__(
+        self,
+        *,
+        responses: tuple[Mapping[str, object] | BaseException, ...] = (),
+        on_request: object | None = None,
+    ) -> None:
+        self._responses = list(responses)
+        self._on_request = on_request
+        self.safe_requests: list[dict[str, str]] = []
+
+    def get_json(
+        self,
+        endpoint: str,
+        params: Mapping[str, str],
+        api_key: str,
+    ) -> Mapping[str, object]:
+        request = {"endpoint": endpoint, **dict(params)}
+        self.safe_requests.append(request)
+        if callable(self._on_request):
+            self._on_request(endpoint, dict(params), len(self.safe_requests))
+        if self._responses:
+            response = self._responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+        if endpoint == "channels":
+            channel_ids = params["id"].split(",")
+            return {
+                "items": [
+                    {
+                        "id": channel_id,
+                        "contentDetails": {
+                            "relatedPlaylists": {
+                                "uploads": "UU" + channel_id[2:],
+                            }
+                        },
+                    }
+                    for channel_id in channel_ids
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint in {"playlistItems", "search"}:
+            return {"items": [], "nextPageToken": None}
+        if endpoint == "videos":
+            video_ids = params["id"].split(",")
+            return {
+                "items": [
+                    synthetic_video_item(video_id=video_id)
+                    for video_id in video_ids
+                ],
+                "nextPageToken": None,
+            }
+        raise AssertionError("unexpected fake YouTube endpoint")

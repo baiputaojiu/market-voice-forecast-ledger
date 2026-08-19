@@ -639,54 +639,10 @@ class JobStateService:
         for artifact_hash in artifact_hashes.values():
             self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
 
-        stopped = False
         with transaction(self._conn):
-            job = self._jobs.get(job_id)
-            self._stored_manifest(job)
-            units = self._jobs.list_units(job_id)
-
-            if job.status is JobStatus.CANCEL_REQUESTED:
-                plan = self._reset_and_plan(
-                    job_id,
-                    units,
-                    artifact_hashes,
-                    reset_running=True,
-                    reset_failed=True,
-                )
-                self._transition(job, JobStatus.STOPPED)
-                stopped = True
-            else:
-                self._require_video_pipeline_runnable(job)
-                if job.status is JobStatus.PAUSE_REQUESTED:
-                    plan = self._reset_and_plan(
-                        job_id,
-                        units,
-                        artifact_hashes,
-                        reset_running=True,
-                        reset_failed=True,
-                    )
-                    self._transition(job, JobStatus.PAUSED)
-                elif job.status is JobStatus.FAILED:
-                    plan = self._reset_and_plan(
-                        job_id,
-                        units,
-                        artifact_hashes,
-                        reset_running=True,
-                        reset_failed=True,
-                    )
-                elif job.status is JobStatus.RUNNING:
-                    plan = self._reset_and_plan(
-                        job_id,
-                        units,
-                        artifact_hashes,
-                        reset_running=True,
-                        reset_failed=True,
-                    )
-                else:
-                    raise DomainError(
-                        "JOB_NOT_RECOVERABLE",
-                        "job status has no interrupted worker to recover",
-                    )
+            plan, stopped = self._recover_interrupted_in_transaction(
+                job_id, artifact_hashes
+            )
 
         if stopped:
             raise DomainError(
@@ -694,6 +650,66 @@ class JobStateService:
                 "a stopped job can continue only through a successor",
             )
         return plan
+
+    def recover_interrupted_in_transaction(
+        self, job_id: int, artifact_hashes: Mapping[str, str]
+    ) -> ResumePlan:
+        self._require_transaction()
+        for artifact_hash in artifact_hashes.values():
+            self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
+        plan, stopped = self._recover_interrupted_in_transaction(
+            job_id, artifact_hashes
+        )
+        if stopped:
+            raise DomainError(
+                "STOPPED_JOB_REQUIRES_SUCCESSOR",
+                "a stopped job can continue only through a successor",
+            )
+        return plan
+
+    def _recover_interrupted_in_transaction(
+        self, job_id: int, artifact_hashes: Mapping[str, str]
+    ) -> tuple[ResumePlan, bool]:
+        self._require_transaction()
+        job = self._jobs.get(job_id)
+        self._stored_manifest(job)
+        units = self._jobs.list_units(job_id)
+
+        if job.status is JobStatus.CANCEL_REQUESTED:
+            plan = self._reset_and_plan(
+                job_id,
+                units,
+                artifact_hashes,
+                reset_running=True,
+                reset_failed=True,
+            )
+            self._transition(job, JobStatus.STOPPED)
+            return plan, True
+
+        self._require_video_pipeline_runnable(job)
+        if job.status is JobStatus.PAUSE_REQUESTED:
+            plan = self._reset_and_plan(
+                job_id,
+                units,
+                artifact_hashes,
+                reset_running=True,
+                reset_failed=True,
+            )
+            self._transition(job, JobStatus.PAUSED)
+        elif job.status in {JobStatus.FAILED, JobStatus.RUNNING}:
+            plan = self._reset_and_plan(
+                job_id,
+                units,
+                artifact_hashes,
+                reset_running=True,
+                reset_failed=True,
+            )
+        else:
+            raise DomainError(
+                "JOB_NOT_RECOVERABLE",
+                "job status has no interrupted worker to recover",
+            )
+        return plan, False
 
     def _reset_and_plan(
         self,

@@ -1,7 +1,7 @@
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from collections.abc import Callable
@@ -122,6 +122,76 @@ class DiscoveryRepository:
                         conn.close()
                     except sqlite3.Error:
                         pass
+
+        return reserve
+
+    def youtube_attempt_reservation_chain(
+        self, *, job_id: int, unit_key: str
+    ) -> Callable[[object, int, datetime], None]:
+        self._validate_quota_reservation_identity(
+            job_id=job_id,
+            unit_key=unit_key,
+            request_ordinal=1,
+        )
+        rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM youtube_quota_reservations "
+                "WHERE job_id=? AND unit_key=? "
+                "ORDER BY request_ordinal, attempt_no",
+                (job_id, unit_key),
+            )
+        )
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            request_ordinal = row["request_ordinal"]
+            if type(request_ordinal) is not int or request_ordinal <= 0:
+                raise DomainError(
+                    "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                    "stored YouTube quota reservation is invalid",
+                )
+            self._validate_stored_quota_reservation(
+                row,
+                job_id=job_id,
+                unit_key=unit_key,
+                request_ordinal=request_ordinal,
+            )
+            grouped.setdefault(request_ordinal, []).append(row)
+        if tuple(grouped) != tuple(range(1, len(grouped) + 1)):
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            )
+        for grouped_rows in grouped.values():
+            if (
+                tuple(row["attempt_no"] for row in grouped_rows)
+                != tuple(range(1, len(grouped_rows) + 1))
+                or len({row["endpoint_class"] for row in grouped_rows}) != 1
+            ):
+                raise DomainError(
+                    "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                    "stored YouTube quota reservation is invalid",
+                )
+
+        current_ordinal = len(grouped)
+
+        def reserve(
+            endpoint_class: object,
+            attempt_no: int,
+            attempted_at: datetime,
+        ) -> None:
+            nonlocal current_ordinal
+            if attempt_no == 1:
+                current_ordinal += 1
+            elif current_ordinal <= len(grouped):
+                raise DomainError(
+                    "YOUTUBE_QUOTA_RESERVATION_SEQUENCE_INVALID",
+                    "YouTube quota reservation attempt sequence is invalid",
+                )
+            self.youtube_attempt_reservation(
+                job_id=job_id,
+                unit_key=unit_key,
+                request_ordinal=current_ordinal,
+            )(endpoint_class, attempt_no, attempted_at)
 
         return reserve
 
@@ -933,13 +1003,212 @@ class DiscoveryRepository:
     def verified_youtube_artifact_hashes(
         self, job_id: int
     ) -> dict[str, str]:
-        self.get_youtube_sync_manifest(job_id)
-        rows = self._conn.execute(
+        try:
+            manifest = self.get_youtube_sync_manifest(job_id)
+            profiles = tuple(
+                self.get_profile_version(item.profile_version_id)
+                for item in manifest.profiles
+            )
+            manual_video_id = None
+            sync_kind = YouTubeSyncKind(manifest.sync_kind)
+            if sync_kind is YouTubeSyncKind.MANUAL:
+                if manifest.manual_request_id is None:
+                    self._raise_manual_artifact_invalid()
+                _, manual_video_id = self.manual_request_binding(
+                    manifest.manual_request_id
+                )
+            _, unit_specs = build_youtube_sync_shape(
+                sync_kind=sync_kind,
+                profiles=profiles,
+                upper_bound=manifest.upper_bound,
+                backfill_floor=manifest.backfill_floor,
+                quota_contract_version=manifest.quota_contract_version,
+                manual_request_id=manifest.manual_request_id,
+                manual_video_id=manual_video_id,
+            )
+        except DomainError as cause:
+            if not (
+                cause.code.startswith("STORED_DISCOVERY_")
+                or cause.code == "STORED_PRESENCE_DECISION_INVALID"
+            ):
+                raise
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        except (LookupError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        specs = {spec.unit_key: spec for spec in unit_specs}
+        rows = tuple(self._conn.execute(
             "SELECT unit_key, output_hash FROM job_units "
             "WHERE job_id=? AND status=? ORDER BY ordinal",
             (job_id, UnitStatus.SUCCESS.value),
+        ))
+        verified: dict[str, str] = {}
+        try:
+            for row in rows:
+                spec = specs.get(row["unit_key"])
+                if spec is None:
+                    self._raise_seed_artifact_invalid()
+                if self._is_legacy_checkpoint_artifact(
+                    job_id=job_id,
+                    spec=spec,
+                    output_hash=row["output_hash"],
+                ):
+                    verified[spec.unit_key] = row["output_hash"]
+                    continue
+                if spec.source_kind is DiscoverySourceKind.SEED_UPLOADS:
+                    output_hash, _ = self.seed_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                elif (
+                    spec.source_kind
+                    is DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+                ):
+                    output_hash, _ = self.search_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                elif spec.source_kind is DiscoverySourceKind.MANUAL_URL:
+                    if manifest.manual_request_id is None:
+                        self._raise_manual_artifact_invalid()
+                    output_hash, _ = self.manual_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        manual_request_id=manifest.manual_request_id,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                else:
+                    self._raise_seed_artifact_invalid()
+                if row["output_hash"] != output_hash:
+                    self._raise_seed_artifact_invalid()
+                verified[spec.unit_key] = output_hash
+        except DomainError as cause:
+            if cause.code == "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID":
+                raise
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        return verified
+
+    def _is_legacy_checkpoint_artifact(
+        self, *, job_id: int, spec: object, output_hash: object
+    ) -> bool:
+        source_kind = getattr(spec, "source_kind", None)
+        if source_kind not in {
+            DiscoverySourceKind.SEED_UPLOADS,
+            DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        }:
+            return False
+        checkpoint = self.get_youtube_sync_checkpoint(
+            job_id, getattr(spec, "unit_key", "")
         )
-        return {row["unit_key"]: row["output_hash"] for row in rows}
+        if output_hash != checkpoint.checkpoint_hash:
+            return False
+        observation_count = self._conn.execute(
+            "SELECT COUNT(*) FROM discovery_observations "
+            "WHERE job_id=? AND profile_id=? AND source_kind=? AND source_key=?",
+            (
+                job_id,
+                getattr(spec, "profile_id", None),
+                source_kind.value,
+                getattr(spec, "source_key", None),
+            ),
+        ).fetchone()[0]
+        proposed_cursor_count = self._conn.execute(
+            "SELECT COUNT(*) FROM youtube_sync_proposed_cursors "
+            "WHERE job_id=? AND profile_id=? AND source_kind=? AND source_key=?",
+            (
+                job_id,
+                getattr(spec, "profile_id", None),
+                source_kind.value,
+                getattr(spec, "source_key", None),
+            ),
+        ).fetchone()[0]
+        return observation_count == 0 and proposed_cursor_count == 0
+
+    def has_daily_youtube_sync_request(self, jst_day: date) -> bool:
+        day_text = self._validate_jst_day(jst_day)
+        row = self._conn.execute(
+            "SELECT job_id, requested_at FROM youtube_daily_sync_requests "
+            "WHERE jst_day=?",
+            (day_text,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            requested_at = _parse_canonical_utc(row["requested_at"])
+            manifest = self.get_youtube_sync_manifest(row["job_id"])
+        except (DomainError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_DAILY_REQUEST_INVALID",
+                "stored YouTube daily request is invalid",
+            ) from cause
+        if manifest.sync_kind != YouTubeSyncKind.FULL_DISCOVERY.value:
+            raise DomainError(
+                "STORED_YOUTUBE_DAILY_REQUEST_INVALID",
+                "stored YouTube daily request is invalid",
+            )
+        return True
+
+    def record_daily_youtube_sync_request(
+        self, *, jst_day: date, job_id: int, requested_at: datetime
+    ) -> None:
+        self._require_transaction()
+        day_text = self._validate_jst_day(jst_day)
+        if (
+            type(job_id) is not int
+            or job_id <= 0
+            or not _is_exact_utc(requested_at)
+        ):
+            raise DomainError(
+                "YOUTUBE_DAILY_REQUEST_INVALID",
+                "YouTube daily request is invalid",
+            )
+        manifest = self.get_youtube_sync_manifest(job_id)
+        if manifest.sync_kind != YouTubeSyncKind.FULL_DISCOVERY.value:
+            raise DomainError(
+                "YOUTUBE_DAILY_REQUEST_INVALID",
+                "YouTube daily request is invalid",
+            )
+        try:
+            self._conn.execute(
+                "INSERT INTO youtube_daily_sync_requests("
+                "jst_day, job_id, requested_at) VALUES (?, ?, ?)",
+                (day_text, job_id, utc_iso(requested_at)),
+            )
+        except sqlite3.IntegrityError:
+            raise DomainError(
+                "YOUTUBE_DAILY_REQUEST_CONFLICT",
+                "YouTube daily request already exists",
+            ) from None
+        if not self.has_daily_youtube_sync_request(jst_day):
+            raise DomainError(
+                "STORED_YOUTUBE_DAILY_REQUEST_INVALID",
+                "stored YouTube daily request is invalid",
+            )
+
+    @staticmethod
+    def _validate_jst_day(jst_day: object) -> str:
+        if type(jst_day) is not date:
+            raise DomainError(
+                "YOUTUBE_DAILY_REQUEST_INVALID",
+                "YouTube daily request is invalid",
+            )
+        return jst_day.isoformat()
 
     def get_youtube_sync_checkpoint(
         self, job_id: int, unit_key: str

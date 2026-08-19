@@ -1,7 +1,7 @@
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from market_voice_forecast_ledger.db.connection import transaction
@@ -21,7 +21,11 @@ from market_voice_forecast_ledger.domain.enums import (
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
-from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
+from market_voice_forecast_ledger.domain.jobs import (
+    JobManifest,
+    ManifestUnit,
+    ResumePlan,
+)
 from market_voice_forecast_ledger.repositories.discovery import (
     DiscoveryRepository,
 )
@@ -100,6 +104,9 @@ class YouTubeSyncService:
         *,
         clock: Callable[[], datetime] | None = None,
         youtube_client: YouTubeClient | None = None,
+        credential_store: object | None = None,
+        transport: object | None = None,
+        sleeper: Callable[[float], None] | None = None,
         failpoint: object | None = None,
     ) -> None:
         self._conn = conn
@@ -108,54 +115,117 @@ class YouTubeSyncService:
         self._discovery = DiscoveryRepository(conn)
         self._job_state = JobStateService(conn, clock=self._clock)
         self._youtube_client = youtube_client
+        self._credential_store = credential_store
+        self._transport = transport
+        self._sleeper = sleeper
         self._failpoint = failpoint
+
+    @classmethod
+    def from_dependencies(
+        cls, conn: sqlite3.Connection, dependencies: object
+    ) -> "YouTubeSyncService":
+        try:
+            credential_store = getattr(dependencies, "credential_store")
+            transport = getattr(dependencies, "transport")
+            clock = getattr(dependencies, "clock")
+            sleeper = getattr(dependencies, "sleeper")
+        except Exception:
+            raise DomainError(
+                "YOUTUBE_SYNC_DEPENDENCY_MISSING",
+                "YouTube sync dependency is not configured",
+            ) from None
+        if not callable(clock) or not callable(sleeper):
+            raise DomainError(
+                "YOUTUBE_SYNC_DEPENDENCY_MISSING",
+                "YouTube sync dependency is not configured",
+            )
+        return cls(
+            conn,
+            clock=clock,
+            credential_store=credential_store,
+            transport=transport,
+            sleeper=sleeper,
+        )
 
     def request_full_sync(self, requested_at: datetime) -> SyncRequestResult:
         self._require_exact_utc(requested_at)
         with transaction(self._conn):
-            profiles = self._discovery.list_active_profile_versions()
-            backfill_floor = initial_backfill_floor(requested_at)
-            candidate_manifest, candidate_profile_hash = self._full_shape(
-                profiles=profiles,
-                upper_bound=requested_at,
-                backfill_floor=backfill_floor,
-            )
-            for job_id in self._jobs.list_youtube_sync_job_ids(
-                _COALESCIBLE_STATUSES,
-                newest_first=True,
-            ):
-                stored = self.get_sync_manifest(job_id)
-                status = self._jobs.get(job_id).status
-                if not self._is_compatible_full(
-                    stored,
-                    profile_set_hash=candidate_profile_hash,
-                ):
-                    continue
-                if status is JobStatus.FAILED:
-                    artifacts = (
-                        self._discovery.verified_youtube_artifact_hashes(job_id)
-                    )
-                    self._job_state.retry_failed_in_transaction(
-                        job_id, artifacts
-                    )
-                    status = JobStatus.RETRYING
-                return SyncRequestResult(job_id, status, True)
+            return self._request_full_sync_in_transaction(requested_at)
 
-            job_id = self._job_state.create_in_transaction(
-                candidate_manifest,
-                created_at=requested_at,
-            )
-            self._discovery.create_youtube_sync_manifest(
-                job_id=job_id,
-                sync_kind=YouTubeSyncKind.FULL_DISCOVERY.value,
-                upper_bound=requested_at,
-                backfill_floor=backfill_floor,
-                quota_contract_version=QUOTA_CONTRACT_VERSION,
-                profiles=profiles,
-                manual_request_id=None,
-                created_at=requested_at,
-            )
-            return SyncRequestResult(job_id, JobStatus.QUEUED, False)
+    def _request_full_sync_in_transaction(
+        self, requested_at: datetime
+    ) -> SyncRequestResult:
+        profiles = self._discovery.list_active_profile_versions()
+        backfill_floor = initial_backfill_floor(requested_at)
+        candidate_manifest, candidate_profile_hash = self._full_shape(
+            profiles=profiles,
+            upper_bound=requested_at,
+            backfill_floor=backfill_floor,
+        )
+        for job_id in self._jobs.list_youtube_sync_job_ids(
+            _COALESCIBLE_STATUSES,
+            newest_first=True,
+        ):
+            stored = self.get_sync_manifest(job_id)
+            status = self._jobs.get(job_id).status
+            if not self._is_compatible_full(
+                stored,
+                profile_set_hash=candidate_profile_hash,
+            ):
+                continue
+            if status is JobStatus.FAILED:
+                artifacts = self._discovery.verified_youtube_artifact_hashes(
+                    job_id
+                )
+                self._job_state.retry_failed_in_transaction(job_id, artifacts)
+                status = JobStatus.RETRYING
+            return SyncRequestResult(job_id, status, True)
+
+        job_id = self._job_state.create_in_transaction(
+            candidate_manifest,
+            created_at=requested_at,
+        )
+        self._discovery.create_youtube_sync_manifest(
+            job_id=job_id,
+            sync_kind=YouTubeSyncKind.FULL_DISCOVERY.value,
+            upper_bound=requested_at,
+            backfill_floor=backfill_floor,
+            quota_contract_version=QUOTA_CONTRACT_VERSION,
+            profiles=profiles,
+            manual_request_id=None,
+            created_at=requested_at,
+        )
+        return SyncRequestResult(job_id, JobStatus.QUEUED, False)
+
+    def has_daily_request(self, jst_day: date) -> bool:
+        return self._discovery.has_daily_youtube_sync_request(jst_day)
+
+    def ensure_daily_full_request(self, jst_day: date) -> SyncRequestResult:
+        requested_at = self._exact_clock_value()
+        with transaction(self._conn):
+            if self._discovery.has_daily_youtube_sync_request(jst_day):
+                row = self._conn.execute(
+                    "SELECT job_id FROM youtube_daily_sync_requests "
+                    "WHERE jst_day=?",
+                    (jst_day.isoformat(),),
+                ).fetchone()
+                job_id = row["job_id"]
+                return SyncRequestResult(
+                    job_id, self._jobs.get(job_id).status, True
+                )
+            result = self._request_full_sync_in_transaction(requested_at)
+            linked = self._conn.execute(
+                "SELECT jst_day FROM youtube_daily_sync_requests "
+                "WHERE job_id=?",
+                (result.job_id,),
+            ).fetchone()
+            if linked is None:
+                self._discovery.record_daily_youtube_sync_request(
+                    jst_day=jst_day,
+                    job_id=result.job_id,
+                    requested_at=requested_at,
+                )
+            return result
 
     def request_manual_sync(
         self, manual_request_id: int, requested_at: datetime
@@ -320,11 +390,156 @@ class YouTubeSyncService:
                     and manifest.resume_not_before_utc is not None
                 ):
                     if manifest.resume_not_before_utc > now:
-                        continue
+                        return None
                     self._discovery.set_youtube_resume_not_before(job_id, None)
                     manifest = self.get_sync_manifest(job_id)
                 return self._claim_pending(job_id, manifest, now)
             return None
+
+    def recover_interrupted_job(self, job_id: int) -> ResumePlan:
+        with transaction(self._conn):
+            artifacts = self._discovery.verified_youtube_artifact_hashes(job_id)
+            return self._job_state.recover_interrupted_in_transaction(
+                job_id, artifacts
+            )
+
+    def defer_current_unit(
+        self,
+        job_id: int,
+        unit_key: str,
+        error_code: str,
+        resume_not_before_utc: datetime,
+    ) -> None:
+        self._require_exact_utc(resume_not_before_utc)
+        with transaction(self._conn):
+            self._job_state.fail_unit_in_transaction(
+                job_id, unit_key, error_code
+            )
+            artifacts = self._discovery.verified_youtube_artifact_hashes(job_id)
+            self._job_state.retry_failed_in_transaction(job_id, artifacts)
+            self._discovery.set_youtube_resume_not_before(
+                job_id, resume_not_before_utc
+            )
+
+    def resume_failed_jobs_for_wake(self) -> tuple[int, ...]:
+        resumed: list[int] = []
+        for job_id in self._jobs.list_youtube_sync_job_ids(
+            (JobStatus.FAILED,), newest_first=False
+        ):
+            with transaction(self._conn):
+                artifacts = self._discovery.verified_youtube_artifact_hashes(
+                    job_id
+                )
+                self._job_state.retry_failed_in_transaction(job_id, artifacts)
+            resumed.append(job_id)
+        return tuple(resumed)
+
+    def execute_claimed_job(self, claimed: ClaimedSyncJob) -> JobStatus:
+        if type(claimed) is not ClaimedSyncJob:
+            raise DomainError(
+                "YOUTUBE_SYNC_CLAIM_INVALID",
+                "YouTube sync claim is invalid",
+            )
+        running = tuple(
+            unit
+            for unit in self._jobs.list_units(claimed.job_id)
+            if unit.status is UnitStatus.RUNNING
+        )
+        if len(running) != 1:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_QUEUE_INVALID",
+                "claimed YouTube sync job must have one running unit",
+            )
+        unit = running[0]
+        if (
+            self._credential_store is None
+            or self._transport is None
+            or self._sleeper is None
+        ):
+            self._job_state.fail_unit(
+                claimed.job_id, unit.unit_key, "YOUTUBE_SYNC_DEPENDENCY_MISSING"
+            )
+            return JobStatus.FAILED
+        client = YouTubeClient(
+            transport=self._transport,
+            credential_store=self._credential_store,
+            reserve_attempt=self._discovery.youtube_attempt_reservation_chain(
+                job_id=claimed.job_id, unit_key=unit.unit_key
+            ),
+            sleeper=self._sleeper,
+            clock=self._clock,
+        )
+        executor = YouTubeSyncService(
+            self._conn,
+            clock=self._clock,
+            youtube_client=client,
+            credential_store=self._credential_store,
+            transport=self._transport,
+            sleeper=self._sleeper,
+        )
+        try:
+            if unit.stage is JobStage.YOUTUBE_SEED_DISCOVERY:
+                executor.execute_seed_unit(claimed.job_id, unit.unit_key)
+            elif unit.stage is JobStage.YOUTUBE_SEARCH_DISCOVERY:
+                executor.execute_search_unit(claimed.job_id, unit.unit_key)
+            elif unit.stage is JobStage.YOUTUBE_MANUAL_DISCOVERY:
+                executor.execute_manual_unit(claimed.job_id, unit.unit_key)
+            else:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_QUEUE_INVALID",
+                    "claimed YouTube sync unit stage is invalid",
+                )
+            if claimed.kind == "full" and all(
+                item.status is UnitStatus.SUCCESS
+                for item in self._jobs.list_units(claimed.job_id)
+            ):
+                executor.finalize_full_job(claimed.job_id)
+        except YouTubeProviderFailure as cause:
+            if cause.category in {"quota", "defer"}:
+                seconds = (
+                    86_400
+                    if cause.category == "quota"
+                    else cause.retry_after_seconds
+                )
+                if type(seconds) is not int or seconds <= 0:
+                    seconds = 86_400
+                self.defer_current_unit(
+                    claimed.job_id,
+                    unit.unit_key,
+                    cause.code,
+                    self._exact_clock_value() + timedelta(seconds=seconds),
+                )
+                return JobStatus.RETRYING
+            self._fail_unit_if_running(claimed.job_id, unit.unit_key, cause.code)
+            return self._job_state.status(claimed.job_id)
+        except DomainError as cause:
+            self._fail_unit_if_running(
+                claimed.job_id, unit.unit_key, self._safe_failure_code(cause.code)
+            )
+            return self._job_state.status(claimed.job_id)
+        except Exception:
+            self._fail_unit_if_running(
+                claimed.job_id, unit.unit_key, "YOUTUBE_SYNC_FAILED"
+            )
+            return self._job_state.status(claimed.job_id)
+        return self._job_state.status(claimed.job_id)
+
+    def _fail_unit_if_running(
+        self, job_id: int, unit_key: str, error_code: str
+    ) -> None:
+        if self._job_state.unit(job_id, unit_key).status is UnitStatus.RUNNING:
+            self._job_state.fail_unit(job_id, unit_key, error_code)
+
+    @staticmethod
+    def _safe_failure_code(code: object) -> str:
+        if (
+            type(code) is str
+            and 1 <= len(code) <= 64
+            and code[0].isalpha()
+            and all(character.isalnum() or character in "_.:-" for character in code)
+        ):
+            return code
+        return "YOUTUBE_SYNC_FAILED"
 
     def execute_seed_unit(
         self, job_id: int, unit_key: str

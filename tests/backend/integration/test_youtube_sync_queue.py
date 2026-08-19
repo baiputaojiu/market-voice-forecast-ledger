@@ -420,7 +420,7 @@ def test_oldest_runnable_job_is_claimed_fifo_and_only_one_pending_unit_starts(db
     assert _service(db).claim_next_runnable(FIXED_NOW) is None
 
 
-def test_deferred_retrying_head_is_skipped_and_next_fifo_job_is_claimed(db):
+def test_deferred_retrying_head_blocks_fifo_until_the_same_head_is_due(db):
     profiles = _bootstrap(db)
     first = _service(db).request_full_sync(FIXED_NOW)
     _claim_and_fail_first(db, first.job_id)
@@ -434,20 +434,30 @@ def test_deferred_retrying_head_is_skipped_and_next_fifo_job_is_claimed(db):
     request_id = _insert_manual_request(db, profiles[0].profile_id)
     second = _service(db, LATER).request_manual_sync(request_id, LATER)
 
-    claimed = _service(db).claim_next_runnable(FIXED_NOW)
+    assert _service(db).claim_next_runnable(FIXED_NOW) is None
 
-    assert claimed is not None and claimed.job_id == second.job_id
-    assert claimed.kind == "manual"
-    assert JobStateService(db).status(first.job_id) is JobStatus.RETRYING
+    claimed = _service(db).claim_next_runnable(TOMORROW)
+
+    assert claimed is not None and claimed.job_id == first.job_id
+    assert claimed.kind == "full"
+    assert JobStateService(db).status(first.job_id) is JobStatus.RUNNING
+    assert JobStateService(db).status(second.job_id) is JobStatus.QUEUED
     assert (
         DiscoveryRepository(db)
         .get_youtube_sync_manifest(first.job_id)
         .resume_not_before_utc
-        == TOMORROW
+        is None
     )
-    assert all(
-        row["status"] == "pending" for row in _unit_rows(db, first.job_id)
-    )
+    running_key = _running_unit_key(db, first.job_id)
+    state = JobStateService(db, clock=lambda: TOMORROW)
+    state.request_stop(first.job_id)
+    state.fail_unit(first.job_id, running_key, "SYNTHETIC_STOP")
+
+    later = _service(db).claim_next_runnable(TOMORROW)
+
+    assert JobStateService(db).status(first.job_id) is JobStatus.STOPPED
+    assert later is not None and later.job_id == second.job_id
+    assert later.kind == "manual"
 
 
 @pytest.mark.parametrize("prepared_status", ("queued", "running", "failed"))
