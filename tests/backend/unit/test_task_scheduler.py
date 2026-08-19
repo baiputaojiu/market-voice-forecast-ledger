@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import subprocess
-from datetime import date, datetime, timezone
+import sys
+import xml.etree.ElementTree as ElementTree
+from datetime import date, datetime, time, timezone
+from pathlib import Path
 
 import pytest
 
@@ -32,6 +35,10 @@ VALID_TASK_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
 </Task>
 """
 
+TASK_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+CURRENT_USER_SID = "S-1-5-21-111111111-222222222-333333333-1001"
+WHOAMI_CSV = f'"SYNTHETIC\\User","{CURRENT_USER_SID}"\r\n'.encode()
+
 
 def _assert_safe_native_call(call, expected_argv):
     argv, kwargs = call
@@ -58,7 +65,7 @@ def test_status_queries_the_fixed_task_and_strictly_reads_its_schedule():
     )
     _assert_safe_native_call(
         runner.calls[0],
-        ("schtasks", "/Query", "/TN", YOUTUBE_SYNC_TASK_NAME, "/XML"),
+        ("schtasks.exe", "/Query", "/TN", YOUTUBE_SYNC_TASK_NAME, "/XML"),
     )
 
 
@@ -71,7 +78,7 @@ def test_request_start_runs_only_the_fixed_task_with_native_output_suppressed():
 
     _assert_safe_native_call(
         runner.calls[0],
-        ("schtasks", "/Run", "/TN", YOUTUBE_SYNC_TASK_NAME),
+        ("schtasks.exe", "/Run", "/TN", YOUTUBE_SYNC_TASK_NAME),
     )
 
 
@@ -157,3 +164,241 @@ def test_schedule_time_helpers_reject_non_exact_utc_inputs(value):
         status.jst_day(value)  # type: ignore[arg-type]
 
     assert caught.value.code == "YOUTUBE_SCHEDULE_STATUS_INVALID"
+
+
+def _registration_runner(*, create_response: object = None, whoami: bytes = WHOAMI_CSV):
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    captured: dict[str, object] = {}
+    response = create_response or FakeCompletedProcess()
+
+    def runner(argv: object, **kwargs: object) -> object:
+        if type(argv) is not list or any(type(item) is not str for item in argv):
+            raise AssertionError("scheduler argv must be a list of strings")
+        call = (tuple(argv), dict(kwargs))
+        calls.append(call)
+        if tuple(argv) == ("whoami.exe", "/user", "/fo", "csv", "/nh"):
+            return FakeCompletedProcess(stdout=whoami)
+        if len(argv) == 7 and argv[:4] == [
+            "schtasks.exe",
+            "/Create",
+            "/TN",
+            YOUTUBE_SYNC_TASK_NAME,
+        ]:
+            assert argv[4] == "/XML"
+            assert argv[6] == "/F"
+            xml_path = Path(argv[5])
+            captured["xml_path"] = xml_path
+            captured["xml_existed_during_call"] = xml_path.is_file()
+            captured["xml_bytes"] = xml_path.read_bytes()
+            if isinstance(response, BaseException):
+                raise response
+            return response
+        raise AssertionError(f"unexpected fake scheduler command: {argv!r}")
+
+    return runner, calls, captured
+
+
+@pytest.mark.parametrize(
+    ("method_name", "local_time", "expected_clock"),
+    (
+        ("install", time(6, 0), "06:00"),
+        ("update", time(23, 59), "23:59"),
+    ),
+)
+def test_registration_builds_exact_utf16_interactive_task_xml(
+    method_name, local_time, expected_clock
+):
+    runner, calls, captured = _registration_runner()
+    adapter = TaskSchedulerAdapter(
+        runner=runner,
+        today=lambda: date(2026, 8, 19),
+    )
+
+    getattr(adapter, method_name)(local_time)
+
+    assert captured["xml_existed_during_call"] is True
+    xml_path = captured["xml_path"]
+    assert isinstance(xml_path, Path)
+    assert not xml_path.exists()
+    xml_bytes = captured["xml_bytes"]
+    assert isinstance(xml_bytes, bytes)
+    assert xml_bytes.startswith((b"\xff\xfe", b"\xfe\xff"))
+    assert "encoding='utf-16'" in xml_bytes.decode("utf-16").splitlines()[0]
+
+    root = ElementTree.fromstring(xml_bytes)
+    ns = {"task": TASK_NAMESPACE}
+    assert root.tag == f"{{{TASK_NAMESPACE}}}Task"
+    triggers = root.findall("./task:Triggers/task:CalendarTrigger", ns)
+    assert len(triggers) == 1
+    assert triggers[0].findtext("task:StartBoundary", namespaces=ns) == (
+        f"2026-08-19T{expected_clock}:00+09:00"
+    )
+    assert triggers[0].findtext("task:Enabled", namespaces=ns) == "true"
+    assert (
+        triggers[0].findtext(
+            "task:ScheduleByDay/task:DaysInterval", namespaces=ns
+        )
+        == "1"
+    )
+
+    principals = root.findall("./task:Principals/task:Principal", ns)
+    assert len(principals) == 1
+    assert principals[0].findtext("task:UserId", namespaces=ns) == CURRENT_USER_SID
+    assert principals[0].findtext("task:LogonType", namespaces=ns) == (
+        "InteractiveToken"
+    )
+    assert principals[0].findtext("task:RunLevel", namespaces=ns) == (
+        "LeastPrivilege"
+    )
+
+    settings = root.findall("./task:Settings", ns)
+    assert len(settings) == 1
+    assert settings[0].findtext("task:MultipleInstancesPolicy", namespaces=ns) == (
+        "Queue"
+    )
+    assert settings[0].findtext("task:StartWhenAvailable", namespaces=ns) == "true"
+    assert settings[0].findtext("task:ExecutionTimeLimit", namespaces=ns) == "PT0S"
+
+    actions = root.findall("./task:Actions/task:Exec", ns)
+    assert len(actions) == 1
+    assert actions[0].findtext("task:Command", namespaces=ns) == sys.executable
+    assert actions[0].findtext("task:Arguments", namespaces=ns) == (
+        "-m market_voice_forecast_ledger.cli youtube-sync worker --once"
+    )
+
+    exposed = xml_bytes.decode("utf-16").lower()
+    assert "password" not in exposed
+    assert "api_key" not in exposed
+    assert "api-key" not in exposed
+    assert "synthetic-key-token" not in exposed
+    assert "environment" not in exposed
+
+    assert len(calls) == 2
+    _assert_safe_native_call(
+        calls[0],
+        ("whoami.exe", "/user", "/fo", "csv", "/nh"),
+    )
+    _assert_safe_native_call(
+        calls[1],
+        (
+            "schtasks.exe",
+            "/Create",
+            "/TN",
+            YOUTUBE_SYNC_TASK_NAME,
+            "/XML",
+            str(xml_path),
+            "/F",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "whoami_output",
+    (
+        b"",
+        b'"SYNTHETIC\\User","not-a-sid"\r\n',
+        b'"SYNTHETIC\\User","S-1-5-21-1","extra"\r\n',
+        b'"SYNTHETIC\\User","S-1-5-21-1\r\n',
+        b'"SYNTHETIC\\User","S-1-5-21-1"\r\n"OTHER","S-1-5-21-2"\r\n',
+        b'"","S-1-5-21-1"\r\n',
+        b"\xff\xfe\x00",
+    ),
+)
+def test_registration_rejects_malformed_current_user_identity_without_create(
+    whoami_output,
+):
+    runner, calls, _captured = _registration_runner(whoami=whoami_output)
+    adapter = TaskSchedulerAdapter(
+        runner=runner,
+        today=lambda: date(2026, 8, 19),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        adapter.install(time(6, 0))
+
+    assert caught.value.code == "YOUTUBE_SCHEDULE_OPERATION_FAILED"
+    assert "synthetic" not in str(caught.value).lower()
+    assert len(calls) == 1
+    _assert_safe_native_call(
+        calls[0],
+        ("whoami.exe", "/user", "/fo", "csv", "/nh"),
+    )
+
+
+@pytest.mark.parametrize(
+    "create_response",
+    (
+        FakeCompletedProcess(
+            returncode=9,
+            stdout=b"native-private-output",
+            stderr=b"native-private-error",
+        ),
+        OSError("native-private-path"),
+    ),
+)
+def test_registration_failure_cleans_temp_xml_and_exposes_only_safe_code(
+    create_response,
+):
+    runner, _calls, captured = _registration_runner(
+        create_response=create_response
+    )
+    adapter = TaskSchedulerAdapter(
+        runner=runner,
+        today=lambda: date(2026, 8, 19),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        adapter.update(time(0, 0))
+
+    assert caught.value.code == "YOUTUBE_SCHEDULE_OPERATION_FAILED"
+    assert "native-private" not in str(caught.value)
+    xml_path = captured["xml_path"]
+    assert isinstance(xml_path, Path)
+    assert not xml_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    ((0, True), (1, False)),
+)
+def test_remove_is_idempotent_and_uses_only_the_fixed_task(returncode, expected):
+    runner = FakeSubprocessRunner(FakeCompletedProcess(returncode=returncode))
+
+    assert TaskSchedulerAdapter(runner=runner).remove() is expected
+
+    _assert_safe_native_call(
+        runner.calls[0],
+        ("schtasks.exe", "/Delete", "/TN", YOUTUBE_SYNC_TASK_NAME, "/F"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "response", "expected_code"),
+    (
+        (
+            "status",
+            FakeCompletedProcess(returncode=2, stderr=b"native-private-error"),
+            "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE",
+        ),
+        (
+            "request_start",
+            FakeCompletedProcess(returncode=2, stderr=b"native-private-error"),
+            "YOUTUBE_SYNC_UNAVAILABLE",
+        ),
+        (
+            "remove",
+            FakeCompletedProcess(returncode=2, stderr=b"native-private-error"),
+            "YOUTUBE_SCHEDULE_OPERATION_FAILED",
+        ),
+    ),
+)
+def test_nonzero_native_results_expose_only_safe_codes(
+    operation, response, expected_code
+):
+    adapter = TaskSchedulerAdapter(runner=FakeSubprocessRunner(response))
+
+    with pytest.raises(DomainError) as caught:
+        getattr(adapter, operation)()
+
+    assert caught.value.code == expected_code
+    assert "native-private" not in str(caught.value)

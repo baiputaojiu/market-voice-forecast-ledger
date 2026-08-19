@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
+from datetime import time
 
 import pytest
 
 import market_voice_forecast_ledger.cli as cli
+from market_voice_forecast_ledger.api import dependencies as api_dependencies
+from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.windows.task_scheduler import ScheduledTaskStatus
 
 
 SYNTHETIC_SECRET = "synthetic-key-token-000001"
@@ -42,6 +46,48 @@ class FakeCredentialStore:
         existed = self.secret is not None
         self.secret = None
         return existed
+
+
+class FakeTaskScheduler:
+    def __init__(
+        self,
+        *,
+        status: ScheduledTaskStatus | None = None,
+        remove_result: bool = True,
+        error: Exception | None = None,
+    ) -> None:
+        self.status_value = status or ScheduledTaskStatus.unavailable()
+        self.remove_result = remove_result
+        self.error = error
+        self.install_calls: list[time] = []
+        self.update_calls: list[time] = []
+        self.status_calls = 0
+        self.remove_calls = 0
+
+    def install(self, local_time: time) -> None:
+        self._raise_if_needed()
+        self.install_calls.append(local_time)
+
+    def update(self, local_time: time) -> None:
+        self._raise_if_needed()
+        self.update_calls.append(local_time)
+
+    def status(self) -> ScheduledTaskStatus:
+        self._raise_if_needed()
+        self.status_calls += 1
+        return self.status_value
+
+    def remove(self) -> bool:
+        self._raise_if_needed()
+        self.remove_calls += 1
+        return self.remove_result
+
+    def request_start(self) -> None:
+        raise AssertionError("schedule CLI must not request an on-demand start")
+
+    def _raise_if_needed(self) -> None:
+        if self.error is not None:
+            raise self.error
 
 
 def test_credential_cli_uses_hidden_confirmation_and_exact_safe_outputs(
@@ -244,3 +290,219 @@ def test_safe_public_runner_sanitizes_unexpected_dependency_failure(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "INTERNAL_ERROR\n"
+
+
+@pytest.mark.parametrize(
+    ("argv", "operation", "expected_time", "expected_output"),
+    (
+        (
+            ["youtube", "schedule", "install"],
+            "install",
+            time(6, 0),
+            "installed 06:00\n",
+        ),
+        (
+            ["youtube", "schedule", "install", "--time", "00:00"],
+            "install",
+            time(0, 0),
+            "installed 00:00\n",
+        ),
+        (
+            ["youtube", "schedule", "install", "--time", "23:59"],
+            "install",
+            time(23, 59),
+            "installed 23:59\n",
+        ),
+        (
+            ["youtube", "schedule", "update", "--time", "06:00"],
+            "update",
+            time(6, 0),
+            "updated 06:00\n",
+        ),
+    ),
+)
+def test_schedule_cli_accepts_only_canonical_times_and_defaults_install(
+    argv, operation, expected_time, expected_output, capsys
+):
+    scheduler = FakeTaskScheduler()
+    scheduler_factory_calls: list[None] = []
+
+    def scheduler_factory() -> FakeTaskScheduler:
+        scheduler_factory_calls.append(None)
+        return scheduler
+
+    def forbidden_dependency():
+        raise AssertionError("unrelated dependency constructed")
+
+    assert cli.main(
+        argv,
+        credential_store_factory=forbidden_dependency,
+        task_scheduler_factory=scheduler_factory,
+        worker_runner=forbidden_dependency,
+    ) == 0
+
+    assert scheduler_factory_calls == [None]
+    assert scheduler.install_calls == (
+        [expected_time] if operation == "install" else []
+    )
+    assert scheduler.update_calls == (
+        [expected_time] if operation == "update" else []
+    )
+    assert capsys.readouterr().out == expected_output
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["youtube", "schedule", "install", "--time", "6:00"],
+        ["youtube", "schedule", "install", "--time", "06:00:00"],
+        ["youtube", "schedule", "install", "--time", "06:00+09:00"],
+        ["youtube", "schedule", "install", "--time", "06:00&whoami"],
+        ["youtube", "schedule", "install", "extra"],
+        ["youtube", "schedule", "update"],
+        ["youtube", "schedule", "update", "--time", "00:00", "extra"],
+        ["youtube", "schedule", "status", "extra"],
+        ["youtube", "schedule", "remove", "--force"],
+        ["youtube-sync", "worker"],
+        ["youtube-sync", "worker", "--once", "extra"],
+    ),
+)
+def test_schedule_and_worker_parser_rejects_noncanonical_or_extra_arguments(
+    argv, capsys, monkeypatch
+):
+    scheduler_factory_calls: list[None] = []
+    worker_calls: list[object] = []
+
+    def scheduler_factory() -> FakeTaskScheduler:
+        scheduler_factory_calls.append(None)
+        return FakeTaskScheduler()
+
+    monkeypatch.setattr(
+        cli,
+        "default_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("settings accessed")),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(
+            argv,
+            credential_store_factory=lambda: (_ for _ in ()).throw(
+                AssertionError("credential accessed")
+            ),
+            task_scheduler_factory=scheduler_factory,
+            worker_runner=worker_calls.append,
+        )
+
+    assert error.value.code == 2
+    assert scheduler_factory_calls == []
+    assert worker_calls == []
+    captured = capsys.readouterr()
+    assert "invalid arguments" in captured.err
+    assert "whoami" not in captured.err.lower()
+    assert "06:00:00" not in captured.err
+    assert "06:00+09:00" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_output"),
+    (
+        (ScheduledTaskStatus(True, "06:00", True, "Queue"), "installed 06:00\n"),
+        (ScheduledTaskStatus.unavailable(), "not installed\n"),
+    ),
+)
+def test_schedule_status_prints_only_safe_canonical_state(
+    status, expected_output, capsys
+):
+    scheduler = FakeTaskScheduler(status=status)
+
+    assert cli.main(
+        ["youtube", "schedule", "status"],
+        task_scheduler_factory=lambda: scheduler,
+    ) == 0
+
+    assert scheduler.status_calls == 1
+    assert capsys.readouterr().out == expected_output
+
+
+@pytest.mark.parametrize(
+    ("removed", "expected_output"),
+    ((True, "removed\n"), (False, "not installed\n")),
+)
+def test_schedule_remove_is_idempotent(removed, expected_output, capsys):
+    scheduler = FakeTaskScheduler(remove_result=removed)
+
+    assert cli.main(
+        ["youtube", "schedule", "remove"],
+        task_scheduler_factory=lambda: scheduler,
+    ) == 0
+
+    assert scheduler.remove_calls == 1
+    assert capsys.readouterr().out == expected_output
+
+
+def test_worker_once_calls_only_injected_runner_with_default_settings(
+    monkeypatch, tmp_path, capsys
+):
+    settings = Settings.for_data_dir(tmp_path / "runtime")
+    settings_calls: list[None] = []
+    worker_calls: list[Settings] = []
+
+    def settings_factory() -> Settings:
+        settings_calls.append(None)
+        return settings
+
+    monkeypatch.setattr(cli, "default_settings", settings_factory)
+
+    def forbidden_dependency():
+        raise AssertionError("unrelated native dependency constructed")
+
+    assert cli.main(
+        ["youtube-sync", "worker", "--once"],
+        credential_store_factory=forbidden_dependency,
+        task_scheduler_factory=forbidden_dependency,
+        worker_runner=worker_calls.append,
+    ) == 0
+
+    assert settings_calls == [None]
+    assert worker_calls == [settings]
+    assert capsys.readouterr().out == ""
+
+
+def test_schedule_safe_runner_does_not_expose_native_failure(capsys):
+    scheduler = FakeTaskScheduler(
+        error=DomainError(
+            "YOUTUBE_SCHEDULE_OPERATION_FAILED",
+            "C:/private/native/path synthetic-key-token-000001",
+        )
+    )
+
+    assert cli.run_cli(
+        ["youtube", "schedule", "install"],
+        task_scheduler_factory=lambda: scheduler,
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "YOUTUBE_SCHEDULE_OPERATION_FAILED\n"
+
+
+def test_app_construction_does_not_construct_or_run_task_scheduler(
+    monkeypatch, tmp_path
+):
+    native_calls: list[object] = []
+
+    def forbidden_scheduler():
+        native_calls.append(None)
+        raise AssertionError("scheduler constructed during app creation")
+
+    monkeypatch.setattr(
+        api_dependencies,
+        "TaskSchedulerAdapter",
+        forbidden_scheduler,
+    )
+    settings = Settings.for_data_dir(tmp_path / "runtime")
+
+    app = cli.create_app(settings)
+
+    assert app is not None
+    assert native_calls == []

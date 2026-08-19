@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import csv
+import io
+import locale
 import re
 import subprocess
+import sys
+import tempfile
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Protocol
 
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -19,7 +25,14 @@ _LOCAL_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _START_BOUNDARY = re.compile(
     r"^(\d{4}-\d{2}-\d{2})T((?:[01]\d|2[0-3]):[0-5]\d):00\+09:00$"
 )
+_CURRENT_USER_SID = re.compile(
+    r"^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*)){1,15}$"
+)
 _JST = timezone(timedelta(hours=9))
+_TASK_ACTION_ARGUMENTS = (
+    "-m market_voice_forecast_ledger.cli youtube-sync worker --once"
+)
+_MAX_WHOAMI_BYTES = 8_192
 
 
 class TaskWakeAdapter(Protocol):
@@ -94,13 +107,27 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
         self,
         *,
         runner: Callable[..., object] | None = None,
+        today: Callable[[], date] | None = None,
     ) -> None:
         self._runner = runner or subprocess.run
+        self._today = today or _jst_today
+
+    def install(self, local_time: time) -> None:
+        self._register(local_time)
+
+    def update(self, local_time: time) -> None:
+        self._register(local_time)
 
     def status(self) -> ScheduledTaskStatus:
         try:
             completed = self._run(
-                ("schtasks", "/Query", "/TN", YOUTUBE_SYNC_TASK_NAME, "/XML")
+                (
+                    "schtasks.exe",
+                    "/Query",
+                    "/TN",
+                    YOUTUBE_SYNC_TASK_NAME,
+                    "/XML",
+                )
             )
             returncode = getattr(completed, "returncode", None)
         except Exception:
@@ -117,13 +144,65 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
     def request_start(self) -> None:
         try:
             completed = self._run(
-                ("schtasks", "/Run", "/TN", YOUTUBE_SYNC_TASK_NAME)
+                ("schtasks.exe", "/Run", "/TN", YOUTUBE_SYNC_TASK_NAME)
             )
             returncode = getattr(completed, "returncode", None)
         except Exception:
             self._raise_sync_unavailable()
         if returncode != 0:
             self._raise_sync_unavailable()
+
+    def remove(self) -> bool:
+        try:
+            completed = self._run(
+                (
+                    "schtasks.exe",
+                    "/Delete",
+                    "/TN",
+                    YOUTUBE_SYNC_TASK_NAME,
+                    "/F",
+                )
+            )
+            returncode = getattr(completed, "returncode", None)
+        except Exception:
+            self._raise_operation_failed()
+        if returncode == 0:
+            return True
+        if returncode == 1:
+            return False
+        self._raise_operation_failed()
+
+    def _register(self, local_time: time) -> None:
+        try:
+            canonical_time = _require_schedule_time(local_time)
+            day = self._today()
+            if type(day) is not date:
+                raise ValueError("task date is invalid")
+            identity = self._run(
+                ("whoami.exe", "/user", "/fo", "csv", "/nh")
+            )
+            if getattr(identity, "returncode", None) != 0:
+                raise ValueError("task identity is unavailable")
+            sid = _parse_current_user_sid(getattr(identity, "stdout", None))
+            xml_bytes = _build_task_xml(day, canonical_time, sid)
+            with tempfile.TemporaryDirectory(prefix="mvfl-youtube-sync-") as temp_dir:
+                xml_path = Path(temp_dir) / "youtube-sync-task.xml"
+                xml_path.write_bytes(xml_bytes)
+                completed = self._run(
+                    (
+                        "schtasks.exe",
+                        "/Create",
+                        "/TN",
+                        YOUTUBE_SYNC_TASK_NAME,
+                        "/XML",
+                        str(xml_path),
+                        "/F",
+                    )
+                )
+                if getattr(completed, "returncode", None) != 0:
+                    raise ValueError("task registration failed")
+        except Exception:
+            self._raise_operation_failed()
 
     def _run(self, argv: tuple[str, ...]):
         return self._runner(
@@ -150,6 +229,108 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
             "YOUTUBE_SYNC_UNAVAILABLE",
             "YouTube sync could not be started",
         ) from None
+
+    @staticmethod
+    def _raise_operation_failed() -> None:
+        raise DomainError(
+            "YOUTUBE_SCHEDULE_OPERATION_FAILED",
+            "YouTube schedule operation failed",
+        ) from None
+
+
+def _require_schedule_time(value: object) -> time:
+    if (
+        type(value) is not time
+        or value.tzinfo is not None
+        or value.second != 0
+        or value.microsecond != 0
+        or value.fold != 0
+    ):
+        raise ValueError("task time is invalid")
+    return value
+
+
+def _parse_current_user_sid(csv_bytes: object) -> str:
+    if (
+        type(csv_bytes) is not bytes
+        or not csv_bytes
+        or len(csv_bytes) > _MAX_WHOAMI_BYTES
+        or b"\x00" in csv_bytes
+    ):
+        raise ValueError("task identity is invalid")
+    text = csv_bytes.decode(locale.getpreferredencoding(False), errors="strict")
+    rows = list(csv.reader(io.StringIO(text, newline=""), strict=True))
+    if len(rows) != 1 or len(rows[0]) != 2:
+        raise ValueError("task identity is invalid")
+    user_name, sid = rows[0]
+    if (
+        not user_name
+        or user_name != user_name.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in user_name)
+        or _CURRENT_USER_SID.fullmatch(sid) is None
+    ):
+        raise ValueError("task identity is invalid")
+    return sid
+
+
+def _build_task_xml(day: date, local_time: time, sid: str) -> bytes:
+    namespace = f"{{{_TASK_NAMESPACE}}}"
+    ElementTree.register_namespace("", _TASK_NAMESPACE)
+    task = ElementTree.Element(f"{namespace}Task", {"version": "1.4"})
+
+    triggers = ElementTree.SubElement(task, f"{namespace}Triggers")
+    calendar = ElementTree.SubElement(triggers, f"{namespace}CalendarTrigger")
+    ElementTree.SubElement(calendar, f"{namespace}StartBoundary").text = (
+        f"{day.isoformat()}T{local_time.strftime('%H:%M')}:00+09:00"
+    )
+    ElementTree.SubElement(calendar, f"{namespace}Enabled").text = "true"
+    schedule_by_day = ElementTree.SubElement(
+        calendar, f"{namespace}ScheduleByDay"
+    )
+    ElementTree.SubElement(
+        schedule_by_day, f"{namespace}DaysInterval"
+    ).text = "1"
+
+    principals = ElementTree.SubElement(task, f"{namespace}Principals")
+    principal = ElementTree.SubElement(
+        principals, f"{namespace}Principal", {"id": "Author"}
+    )
+    ElementTree.SubElement(principal, f"{namespace}UserId").text = sid
+    ElementTree.SubElement(principal, f"{namespace}LogonType").text = (
+        "InteractiveToken"
+    )
+    ElementTree.SubElement(principal, f"{namespace}RunLevel").text = (
+        "LeastPrivilege"
+    )
+
+    settings = ElementTree.SubElement(task, f"{namespace}Settings")
+    ElementTree.SubElement(
+        settings, f"{namespace}MultipleInstancesPolicy"
+    ).text = "Queue"
+    ElementTree.SubElement(settings, f"{namespace}StartWhenAvailable").text = (
+        "true"
+    )
+    ElementTree.SubElement(settings, f"{namespace}ExecutionTimeLimit").text = (
+        "PT0S"
+    )
+
+    actions = ElementTree.SubElement(
+        task, f"{namespace}Actions", {"Context": "Author"}
+    )
+    execute = ElementTree.SubElement(actions, f"{namespace}Exec")
+    ElementTree.SubElement(execute, f"{namespace}Command").text = sys.executable
+    ElementTree.SubElement(execute, f"{namespace}Arguments").text = (
+        _TASK_ACTION_ARGUMENTS
+    )
+    return ElementTree.tostring(
+        task,
+        encoding="utf-16",
+        xml_declaration=True,
+    )
+
+
+def _jst_today() -> date:
+    return datetime.now(_JST).date()
 
 
 def _parse_task_status(xml_bytes: object) -> ScheduledTaskStatus:

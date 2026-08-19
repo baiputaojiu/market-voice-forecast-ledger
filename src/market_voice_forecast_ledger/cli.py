@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import re
 import sys
 from collections.abc import Callable, Sequence
+from datetime import time
 from pathlib import Path
 
 import uvicorn
@@ -16,6 +18,10 @@ from market_voice_forecast_ledger.credentials.windows import (
     WindowsCredentialManager,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.windows.task_scheduler import (
+    ScheduledTaskStatus,
+    TaskSchedulerAdapter,
+)
 
 
 _PUBLIC_CLI_ERROR_CODES = frozenset(
@@ -27,8 +33,11 @@ _PUBLIC_CLI_ERROR_CODES = frozenset(
         "YOUTUBE_CREDENTIAL_INVALID",
         "YOUTUBE_CREDENTIAL_NOT_CONFIGURED",
         "YOUTUBE_CREDENTIAL_STORAGE_FAILED",
+        "YOUTUBE_SCHEDULE_OPERATION_FAILED",
+        "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE",
     }
 )
+_SCHEDULE_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -63,6 +72,12 @@ def default_settings() -> Settings:
     )
 
 
+def _parse_schedule_time(value: str) -> time:
+    if type(value) is not str or _SCHEDULE_TIME.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("invalid schedule time")
+    return time(hour=int(value[:2]), minute=int(value[3:]))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(prog="market-voice-forecast-ledger")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -80,6 +95,33 @@ def build_parser() -> argparse.ArgumentParser:
     credential_commands.add_parser("set")
     credential_commands.add_parser("status")
     credential_commands.add_parser("delete")
+    schedule = youtube_commands.add_parser("schedule")
+    schedule_commands = schedule.add_subparsers(
+        dest="schedule_command", required=True
+    )
+    schedule_install = schedule_commands.add_parser("install")
+    schedule_install.add_argument(
+        "--time",
+        dest="schedule_time",
+        type=_parse_schedule_time,
+        default=time(6, 0),
+    )
+    schedule_update = schedule_commands.add_parser("update")
+    schedule_update.add_argument(
+        "--time",
+        dest="schedule_time",
+        type=_parse_schedule_time,
+        required=True,
+    )
+    schedule_commands.add_parser("status")
+    schedule_commands.add_parser("remove")
+
+    youtube_sync = commands.add_parser("youtube-sync")
+    youtube_sync_commands = youtube_sync.add_subparsers(
+        dest="youtube_sync_command", required=True
+    )
+    worker = youtube_sync_commands.add_parser("worker")
+    worker.add_argument("--once", action="store_true", required=True)
     return parser
 
 
@@ -87,6 +129,8 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     credential_store_factory: Callable[[], CredentialStore] | None = None,
+    task_scheduler_factory: Callable[[], object] | None = None,
+    worker_runner: Callable[[Settings], object] | None = None,
 ) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command == "serve":
@@ -118,6 +162,44 @@ def main(
         if arguments.credential_command == "delete":
             print("deleted" if store.delete_api_key() else "not configured")
             return 0
+    if arguments.command == "youtube" and arguments.youtube_command == "schedule":
+        scheduler_factory = task_scheduler_factory or TaskSchedulerAdapter
+        scheduler = scheduler_factory()
+        if arguments.schedule_command == "install":
+            scheduler.install(arguments.schedule_time)
+            print(f"installed {arguments.schedule_time.strftime('%H:%M')}")
+            return 0
+        if arguments.schedule_command == "update":
+            scheduler.update(arguments.schedule_time)
+            print(f"updated {arguments.schedule_time.strftime('%H:%M')}")
+            return 0
+        if arguments.schedule_command == "status":
+            status = scheduler.status()
+            if type(status) is not ScheduledTaskStatus:
+                raise DomainError(
+                    "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE",
+                    "YouTube schedule status is unavailable",
+                )
+            print(
+                f"installed {status.local_time}"
+                if status.installed
+                else "not installed"
+            )
+            return 0
+        if arguments.schedule_command == "remove":
+            print("removed" if scheduler.remove() else "not installed")
+            return 0
+    if (
+        arguments.command == "youtube-sync"
+        and arguments.youtube_sync_command == "worker"
+        and arguments.once is True
+    ):
+        if worker_runner is None:
+            from market_voice_forecast_ledger.workers.scheduled_sync import run_once
+
+            worker_runner = run_once
+        worker_runner(default_settings())
+        return 0
     raise DomainError("CLI_COMMAND_INVALID", "CLI command is invalid")
 
 
@@ -125,11 +207,15 @@ def run_cli(
     argv: Sequence[str] | None = None,
     *,
     credential_store_factory: Callable[[], CredentialStore] | None = None,
+    task_scheduler_factory: Callable[[], object] | None = None,
+    worker_runner: Callable[[Settings], object] | None = None,
 ) -> int:
     try:
         return main(
             argv,
             credential_store_factory=credential_store_factory,
+            task_scheduler_factory=task_scheduler_factory,
+            worker_runner=worker_runner,
         )
     except DomainError as error:
         code = (
