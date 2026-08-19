@@ -193,6 +193,11 @@ class YouTubeSyncService:
                         requested_at=requested_at,
                     )
                 )
+            elif self._discovery.find_manual_sync_job_id(request_id) is None:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "stored manual sync request has no linked job",
+                )
             requested = self._request_manual_sync_in_transaction(
                 request_id, requested_at
             )

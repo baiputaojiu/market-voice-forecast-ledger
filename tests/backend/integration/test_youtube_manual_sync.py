@@ -79,6 +79,23 @@ def _counts(db):
     }
 
 
+def _manual_request_state(db):
+    names = (
+        "manual_discovery_requests",
+        "jobs",
+        "job_units",
+        "job_events",
+        "youtube_sync_manifests",
+        "youtube_sync_manifest_profiles",
+        "youtube_sync_checkpoints",
+        "audit_events",
+    )
+    return {
+        name: tuple(tuple(row) for row in db.execute(f"SELECT * FROM {name}"))
+        for name in names
+    }
+
+
 def _manual_rows(db, request_id: int, job_id: int):
     request = db.execute(
         "SELECT * FROM manual_discovery_requests WHERE id=?", (request_id,)
@@ -176,6 +193,29 @@ def test_equivalent_urls_reuse_one_durable_request_and_exact_linked_job(db):
     assert URL_WATCH not in stored
     assert PRIVATE_SENTINEL not in stored
     assert TITLE_SENTINEL not in stored
+
+
+def test_existing_orphan_manual_request_fails_closed_without_healing(db):
+    profile = _profiles(db)[0]
+    with transaction(db):
+        request_id = DiscoveryRepository(db).create_manual_discovery_request(
+            profile_id=profile.profile_id,
+            youtube_video_id=VIDEO_ID,
+            requested_at=REQUESTED_AT,
+        )
+    before = _manual_request_state(db)
+
+    with pytest.raises(DomainError) as caught:
+        _service(db).request_manual_candidate(
+            profile.subject_id, URL_WATCH, REQUESTED_AT
+        )
+
+    assert caught.value.code == "STORED_YOUTUBE_SYNC_MANIFEST_INVALID"
+    assert _manual_request_state(db) == before
+    assert db.execute(
+        "SELECT youtube_video_id FROM manual_discovery_requests WHERE id=?",
+        (request_id,),
+    ).fetchone()[0] == VIDEO_ID
 
 
 def test_same_video_for_different_profiles_creates_distinct_request_and_job(db):
