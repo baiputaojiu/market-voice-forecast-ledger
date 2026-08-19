@@ -32,7 +32,12 @@ _JST = timezone(timedelta(hours=9))
 _TASK_ACTION_ARGUMENTS = (
     "-m market_voice_forecast_ledger.cli youtube-sync worker --once"
 )
+_TASK_URI = f"\\{YOUTUBE_SYNC_TASK_NAME}"
+_TASK_DESCRIPTION = (
+    "Managed by Market Voice Forecast Ledger for daily YouTube sync."
+)
 _MAX_WHOAMI_BYTES = 8_192
+_MAX_TASK_LIST_BYTES = 1_048_576
 
 
 class TaskWakeAdapter(Protocol):
@@ -120,40 +125,28 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
 
     def status(self) -> ScheduledTaskStatus:
         try:
-            completed = self._run(
-                (
-                    "schtasks.exe",
-                    "/Query",
-                    "/TN",
-                    YOUTUBE_SYNC_TASK_NAME,
-                    "/XML",
-                )
-            )
-            returncode = getattr(completed, "returncode", None)
+            status = self._managed_status()
         except Exception:
             self._raise_status_unavailable()
-        if returncode == 1:
-            return ScheduledTaskStatus.unavailable()
-        if returncode != 0:
-            self._raise_status_unavailable()
-        try:
-            return _parse_task_status(getattr(completed, "stdout", None))
-        except (DomainError, ElementTree.ParseError, TypeError, ValueError):
-            self._raise_status_unavailable()
+        return status or ScheduledTaskStatus.unavailable()
 
     def request_start(self) -> None:
         try:
+            if self._managed_status() is None:
+                raise ValueError("managed task is unavailable")
             completed = self._run(
                 ("schtasks.exe", "/Run", "/TN", YOUTUBE_SYNC_TASK_NAME)
             )
             returncode = getattr(completed, "returncode", None)
+            if returncode != 0:
+                raise ValueError("managed task could not be started")
         except Exception:
-            self._raise_sync_unavailable()
-        if returncode != 0:
             self._raise_sync_unavailable()
 
     def remove(self) -> bool:
         try:
+            if self._managed_status() is None:
+                return False
             completed = self._run(
                 (
                     "schtasks.exe",
@@ -164,13 +157,11 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
                 )
             )
             returncode = getattr(completed, "returncode", None)
+            if returncode != 0:
+                raise ValueError("managed task could not be removed")
+            return True
         except Exception:
             self._raise_operation_failed()
-        if returncode == 0:
-            return True
-        if returncode == 1:
-            return False
-        self._raise_operation_failed()
 
     def _register(self, local_time: time) -> None:
         try:
@@ -178,12 +169,10 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
             day = self._today()
             if type(day) is not date:
                 raise ValueError("task date is invalid")
-            identity = self._run(
-                ("whoami.exe", "/user", "/fo", "csv", "/nh")
-            )
-            if getattr(identity, "returncode", None) != 0:
-                raise ValueError("task identity is unavailable")
-            sid = _parse_current_user_sid(getattr(identity, "stdout", None))
+            existing_xml = self._query_task_xml()
+            sid = self._current_user_sid()
+            if existing_xml is not None:
+                _parse_task_status(existing_xml, sid)
             xml_bytes = _build_task_xml(day, canonical_time, sid)
             with tempfile.TemporaryDirectory(prefix="mvfl-youtube-sync-") as temp_dir:
                 xml_path = Path(temp_dir) / "youtube-sync-task.xml"
@@ -203,6 +192,43 @@ class TaskSchedulerAdapter(TaskWakeAdapter, TaskScheduleReader):
                     raise ValueError("task registration failed")
         except Exception:
             self._raise_operation_failed()
+
+    def _managed_status(self) -> ScheduledTaskStatus | None:
+        xml_bytes = self._query_task_xml()
+        if xml_bytes is None:
+            return None
+        return _parse_task_status(xml_bytes, self._current_user_sid())
+
+    def _query_task_xml(self) -> bytes | None:
+        completed = self._run(
+            (
+                "schtasks.exe",
+                "/Query",
+                "/TN",
+                YOUTUBE_SYNC_TASK_NAME,
+                "/XML",
+            )
+        )
+        returncode = getattr(completed, "returncode", None)
+        if returncode == 0:
+            xml_bytes = getattr(completed, "stdout", None)
+            if type(xml_bytes) is not bytes:
+                raise ValueError("task XML is unavailable")
+            return xml_bytes
+        if returncode != 1:
+            raise ValueError("task query failed")
+        listing = self._run(("schtasks.exe", "/Query", "/FO", "CSV", "/NH"))
+        if getattr(listing, "returncode", None) != 0 or not _proves_task_absent(
+            getattr(listing, "stdout", None)
+        ):
+            raise ValueError("task absence is unproven")
+        return None
+
+    def _current_user_sid(self) -> str:
+        identity = self._run(("whoami.exe", "/user", "/fo", "csv", "/nh"))
+        if getattr(identity, "returncode", None) != 0:
+            raise ValueError("task identity is unavailable")
+        return _parse_current_user_sid(getattr(identity, "stdout", None))
 
     def _run(self, argv: tuple[str, ...]):
         return self._runner(
@@ -273,10 +299,51 @@ def _parse_current_user_sid(csv_bytes: object) -> str:
     return sid
 
 
+def _proves_task_absent(csv_bytes: object) -> bool:
+    if (
+        type(csv_bytes) is not bytes
+        or not csv_bytes
+        or len(csv_bytes) > _MAX_TASK_LIST_BYTES
+        or b"\x00" in csv_bytes
+    ):
+        raise ValueError("task listing is invalid")
+    text = csv_bytes.decode(locale.getpreferredencoding(False), errors="strict")
+    rows = list(csv.reader(io.StringIO(text, newline=""), strict=True))
+    if not rows:
+        raise ValueError("task listing is invalid")
+    seen: set[str] = set()
+    for row in rows:
+        if len(row) != 3:
+            raise ValueError("task listing is invalid")
+        task_path = row[0]
+        if (
+            not task_path.startswith("\\")
+            or task_path == "\\"
+            or any(
+                not value
+                or value != value.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                for value in row
+            )
+        ):
+            raise ValueError("task listing is invalid")
+        normalized = task_path.casefold()
+        if normalized in seen:
+            raise ValueError("task listing is invalid")
+        seen.add(normalized)
+    return _TASK_URI.casefold() not in seen
+
+
 def _build_task_xml(day: date, local_time: time, sid: str) -> bytes:
     namespace = f"{{{_TASK_NAMESPACE}}}"
     ElementTree.register_namespace("", _TASK_NAMESPACE)
     task = ElementTree.Element(f"{namespace}Task", {"version": "1.4"})
+
+    registration = ElementTree.SubElement(task, f"{namespace}RegistrationInfo")
+    ElementTree.SubElement(registration, f"{namespace}URI").text = _TASK_URI
+    ElementTree.SubElement(registration, f"{namespace}Description").text = (
+        _TASK_DESCRIPTION
+    )
 
     triggers = ElementTree.SubElement(task, f"{namespace}Triggers")
     calendar = ElementTree.SubElement(triggers, f"{namespace}CalendarTrigger")
@@ -333,7 +400,10 @@ def _jst_today() -> date:
     return datetime.now(_JST).date()
 
 
-def _parse_task_status(xml_bytes: object) -> ScheduledTaskStatus:
+def _parse_task_status(
+    xml_bytes: object,
+    expected_sid: object,
+) -> ScheduledTaskStatus:
     if (
         type(xml_bytes) is not bytes
         or not xml_bytes
@@ -344,8 +414,18 @@ def _parse_task_status(xml_bytes: object) -> ScheduledTaskStatus:
         raise ValueError("task XML is invalid")
     root = ElementTree.fromstring(xml_bytes)
     namespace = f"{{{_TASK_NAMESPACE}}}"
-    if root.tag != f"{namespace}Task":
+    if root.tag != f"{namespace}Task" or root.attrib.get("version") != "1.4":
         raise ValueError("task XML root is invalid")
+
+    registrations = root.findall(f"./{namespace}RegistrationInfo")
+    if len(registrations) != 1:
+        raise ValueError("task ownership is invalid")
+    if (
+        _one_text(registrations[0], f"{namespace}URI") != _TASK_URI
+        or _one_text(registrations[0], f"{namespace}Description")
+        != _TASK_DESCRIPTION
+    ):
+        raise ValueError("task ownership is invalid")
 
     trigger_containers = root.findall(f"./{namespace}Triggers")
     if (
@@ -355,6 +435,14 @@ def _parse_task_status(xml_bytes: object) -> ScheduledTaskStatus:
     ):
         raise ValueError("daily trigger is invalid")
     trigger = trigger_containers[0][0]
+    if {
+        child.tag for child in trigger
+    } != {
+        f"{namespace}StartBoundary",
+        f"{namespace}Enabled",
+        f"{namespace}ScheduleByDay",
+    } or len(trigger) != 3:
+        raise ValueError("daily trigger is invalid")
     boundary = _one_text(trigger, f"{namespace}StartBoundary")
     match = _START_BOUNDARY.fullmatch(boundary)
     if match is None:
@@ -366,7 +454,13 @@ def _parse_task_status(xml_bytes: object) -> ScheduledTaskStatus:
         trigger,
         f"{namespace}ScheduleByDay/{namespace}DaysInterval",
     )
-    if interval != "1":
+    daily_schedules = trigger.findall(f"./{namespace}ScheduleByDay")
+    if (
+        interval != "1"
+        or len(daily_schedules) != 1
+        or tuple(child.tag for child in daily_schedules[0])
+        != (f"{namespace}DaysInterval",)
+    ):
         raise ValueError("daily interval is invalid")
 
     principal_containers = root.findall(f"./{namespace}Principals")
@@ -376,19 +470,58 @@ def _parse_task_status(xml_bytes: object) -> ScheduledTaskStatus:
         != (f"{namespace}Principal",)
     ):
         raise ValueError("task principal is invalid")
-    logon_types = principal_containers[0].findall(
-        f"./{namespace}Principal/{namespace}LogonType"
-    )
-    if len(logon_types) != 1 or logon_types[0].text != "InteractiveToken":
+    principal = principal_containers[0][0]
+    if (
+        principal.attrib != {"id": "Author"}
+        or tuple(child.tag for child in principal)
+        != (
+            f"{namespace}UserId",
+            f"{namespace}LogonType",
+            f"{namespace}RunLevel",
+        )
+        or type(expected_sid) is not str
+        or _CURRENT_USER_SID.fullmatch(expected_sid) is None
+        or _one_text(principal, f"{namespace}UserId") != expected_sid
+        or _one_text(principal, f"{namespace}LogonType") != "InteractiveToken"
+        or _one_text(principal, f"{namespace}RunLevel") != "LeastPrivilege"
+    ):
         raise ValueError("task principal is invalid")
+    settings_containers = root.findall(f"./{namespace}Settings")
+    if len(settings_containers) != 1:
+        raise ValueError("task settings are invalid")
     start_when_available = _one_text(
-        root, f"./{namespace}Settings/{namespace}StartWhenAvailable"
+        settings_containers[0], f"{namespace}StartWhenAvailable"
     )
     multiple_instances = _one_text(
-        root, f"./{namespace}Settings/{namespace}MultipleInstancesPolicy"
+        settings_containers[0], f"{namespace}MultipleInstancesPolicy"
     )
-    if start_when_available != "true" or multiple_instances != "Queue":
+    execution_time_limit = _one_text(
+        settings_containers[0], f"{namespace}ExecutionTimeLimit"
+    )
+    if (
+        start_when_available != "true"
+        or multiple_instances != "Queue"
+        or execution_time_limit != "PT0S"
+    ):
         raise ValueError("task settings are invalid")
+
+    action_containers = root.findall(f"./{namespace}Actions")
+    if (
+        len(action_containers) != 1
+        or action_containers[0].attrib != {"Context": "Author"}
+        or tuple(child.tag for child in action_containers[0])
+        != (f"{namespace}Exec",)
+    ):
+        raise ValueError("task action is invalid")
+    action = action_containers[0][0]
+    if (
+        tuple(child.tag for child in action)
+        != (f"{namespace}Command", f"{namespace}Arguments")
+        or _one_text(action, f"{namespace}Command") != sys.executable
+        or _one_text(action, f"{namespace}Arguments")
+        != _TASK_ACTION_ARGUMENTS
+    ):
+        raise ValueError("task action is invalid")
     return ScheduledTaskStatus(True, match.group(2), True, "Queue")
 
 

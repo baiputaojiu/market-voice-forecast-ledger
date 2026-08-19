@@ -41,9 +41,28 @@ _SCHEDULE_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
     def error(self, _message: str) -> None:
         self.print_usage(sys.stderr)
         self.exit(2, f"{self.prog}: error: invalid arguments\n")
+
+
+class _SingleUseAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        marker = f"_single_use_{self.dest}"
+        if getattr(namespace, marker, False):
+            parser.error("duplicate option")
+        setattr(namespace, marker, True)
+        setattr(namespace, self.dest, self.const if self.nargs == 0 else values)
 
 
 def validate_bind_host(host: str) -> str:
@@ -104,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--time",
         dest="schedule_time",
         type=_parse_schedule_time,
+        action=_SingleUseAction,
         default=time(6, 0),
     )
     schedule_update = schedule_commands.add_parser("update")
@@ -111,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--time",
         dest="schedule_time",
         type=_parse_schedule_time,
+        action=_SingleUseAction,
         required=True,
     )
     schedule_commands.add_parser("status")
@@ -121,7 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="youtube_sync_command", required=True
     )
     worker = youtube_sync_commands.add_parser("worker")
-    worker.add_argument("--once", action="store_true", required=True)
+    worker.add_argument(
+        "--once",
+        action=_SingleUseAction,
+        nargs=0,
+        const=True,
+        default=False,
+        required=True,
+    )
     return parser
 
 

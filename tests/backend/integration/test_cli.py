@@ -506,3 +506,51 @@ def test_app_construction_does_not_construct_or_run_task_scheduler(
 
     assert app is not None
     assert native_calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["youtube", "schedule", "install", "--ti", "06:00"],
+        ["youtube", "schedule", "update", "--ti", "06:00"],
+        ["youtube-sync", "worker", "--onc"],
+        [
+            "youtube",
+            "schedule",
+            "install",
+            "--time",
+            "06:00",
+            "--time",
+            "07:00",
+        ],
+        [
+            "youtube",
+            "schedule",
+            "update",
+            "--time",
+            "06:00",
+            "--time",
+            "07:00",
+        ],
+        ["youtube-sync", "worker", "--once", "--once"],
+    ),
+)
+def test_m1_parser_rejects_abbreviated_or_duplicate_single_use_options(
+    argv, monkeypatch, tmp_path
+):
+    scheduler = FakeTaskScheduler()
+    worker_calls: list[Settings] = []
+    settings = Settings.for_data_dir(tmp_path / "runtime")
+    monkeypatch.setattr(cli, "default_settings", lambda: settings)
+
+    with pytest.raises(SystemExit) as caught:
+        cli.main(
+            argv,
+            task_scheduler_factory=lambda: scheduler,
+            worker_runner=worker_calls.append,
+        )
+
+    assert caught.value.code == 2
+    assert scheduler.install_calls == []
+    assert scheduler.update_calls == []
+    assert worker_calls == []
