@@ -235,7 +235,34 @@ class JobResponse(StrictApiModel):
 
 
 YouTubeJobStatus = Literal[
-    "queued", "running", "retrying", "failed", "succeeded"
+    "queued",
+    "running",
+    "pause_requested",
+    "paused",
+    "cancel_requested",
+    "stopped",
+    "failed",
+    "retrying",
+    "succeeded",
+]
+
+YouTubePublicUnitErrorCode = Literal[
+    "YOUTUBE_CREDENTIAL_NOT_CONFIGURED",
+    "YOUTUBE_CREDENTIAL_INVALID",
+    "YOUTUBE_CREDENTIAL_STORAGE_FAILED",
+    "YOUTUBE_DISCOVERY_INVALID",
+    "YOUTUBE_INVALID_PAGE_TOKEN",
+    "YOUTUBE_METADATA_INVALID",
+    "YOUTUBE_PROVIDER_DEFERRED",
+    "YOUTUBE_PROVIDER_REQUEST_FAILED",
+    "YOUTUBE_PROVIDER_TRANSIENT",
+    "YOUTUBE_QUOTA_EXHAUSTED",
+    "YOUTUBE_RESPONSE_INVALID",
+    "YOUTUBE_SEARCH_RESPONSE_INVALID",
+    "YOUTUBE_SEARCH_WINDOW_SATURATED",
+    "YOUTUBE_SEED_RESPONSE_INVALID",
+    "YOUTUBE_SYNC_DEPENDENCY_MISSING",
+    "YOUTUBE_SYNC_FAILED",
 ]
 
 
@@ -267,7 +294,7 @@ class YouTubeSyncUnitResponse(StrictApiModel):
     discovered_count: int = Field(ge=0)
     persisted_count: int = Field(ge=0)
     unavailable_count: int = Field(ge=0)
-    error_code: str | None = Field(default=None, min_length=1, max_length=64)
+    error_code: YouTubePublicUnitErrorCode | None = None
 
     @model_validator(mode="after")
     def validate_counts_and_error(self):

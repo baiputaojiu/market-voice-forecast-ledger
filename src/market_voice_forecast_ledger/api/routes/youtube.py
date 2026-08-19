@@ -2,7 +2,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, Path, Query, Request
+from fastapi.exceptions import RequestValidationError
 
 from market_voice_forecast_ledger.api.dependencies import (
     PublicReadAdapter,
@@ -49,10 +50,16 @@ async def request_youtube_sync(
 
 @router.get("/youtube-syncs/{job_id}", response_model=YouTubeSyncStatusResponse)
 async def youtube_sync_status(
+    request: Request,
     job_id: Annotated[str, Path(pattern=r"^[1-9][0-9]{0,17}$")],
     _query: Annotated[NoQuery, Query()],
     conn: Annotated[sqlite3.Connection, Depends(get_connection)],
+    _body: Annotated[NoQuery | None, Body()] = None,
 ) -> YouTubeSyncStatusResponse:
+    if _body is None and (await request.body()).strip():
+        raise RequestValidationError(
+            [{"type": "model_type", "loc": ("body",)}]
+        )
     return PublicReadAdapter(conn).read_youtube_sync_status(
         parse_positive_path_id(job_id)
     )

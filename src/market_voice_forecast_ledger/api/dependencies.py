@@ -348,25 +348,34 @@ class PublicReadAdapter:
                 if spec.source_kind is DiscoverySourceKind.CROSS_CHANNEL_SEARCH:
                     repository.next_search_window(job_id, spec.unit_key)
 
-            observed: dict[tuple[int, str, str], list[str]] = {}
+            observed: dict[tuple[int, str, str], list[tuple[int, str]]] = {}
             for row in self._conn.execute(
-                "SELECT observation.profile_id, observation.source_kind, "
-                "observation.source_key, video.youtube_video_id "
+                "SELECT observation.id, observation.profile_id, "
+                "observation.source_kind, observation.source_key, "
+                "observation.metadata_snapshot_id, video.youtube_video_id, "
+                "video.current_metadata_snapshot_id "
                 "FROM discovery_observations AS observation "
-                "JOIN videos AS video ON video.id=observation.video_id "
+                "LEFT JOIN videos AS video ON video.id=observation.video_id "
                 "WHERE observation.job_id=? ORDER BY observation.id",
                 (job_id,),
             ):
                 key = (row["profile_id"], row["source_kind"], row["source_key"])
+                observation_id = row["id"]
                 youtube_video_id = row["youtube_video_id"]
                 if (
                     type(key[0]) is not int
                     or type(key[1]) is not str
                     or type(key[2]) is not str
+                    or type(observation_id) is not int
                     or type(youtube_video_id) is not str
+                    or type(row["metadata_snapshot_id"]) is not int
+                    or row["current_metadata_snapshot_id"]
+                    != row["metadata_snapshot_id"]
                 ):
                     raise ValueError("invalid YouTube observation provenance")
-                observed.setdefault(key, []).append(youtube_video_id)
+                observed.setdefault(key, []).append(
+                    (observation_id, youtube_video_id)
+                )
 
             expected_keys = {
                 (spec.profile_id, spec.source_kind.value, spec.source_key)
@@ -379,13 +388,50 @@ class PublicReadAdapter:
             for spec, checkpoint, unit in zip(
                 unit_specs, checkpoints, job.units, strict=True
             ):
-                observed_ids = observed.get(
+                observed_rows = observed.get(
                     (spec.profile_id, spec.source_kind.value, spec.source_key), []
                 )
+                observed_ids = tuple(row[0] for row in observed_rows)
                 if any(
                     video_id not in checkpoint.encountered_video_ids
-                    for video_id in observed_ids
+                    for _, video_id in observed_rows
                 ):
+                    raise ValueError("invalid YouTube observation binding")
+                if spec.source_kind is DiscoverySourceKind.SEED_UPLOADS:
+                    _, canonical_ids = repository.seed_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                elif (
+                    spec.source_kind
+                    is DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+                ):
+                    _, canonical_ids = repository.search_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                elif (
+                    unit.status == UnitStatus.SUCCESS.value or observed_ids
+                ):
+                    if manifest.manual_request_id is None:
+                        raise ValueError("invalid manual observation binding")
+                    _, canonical_ids = repository.manual_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        manual_request_id=manifest.manual_request_id,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                else:
+                    canonical_ids = ()
+                if canonical_ids != observed_ids:
                     raise ValueError("invalid YouTube observation binding")
                 units.append(
                     YouTubeSyncUnitResponse(

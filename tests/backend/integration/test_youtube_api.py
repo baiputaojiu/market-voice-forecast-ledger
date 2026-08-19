@@ -12,6 +12,7 @@ from market_voice_forecast_ledger.api.app import create_app
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.domain.common import utc_iso
+from market_voice_forecast_ledger.domain.discovery import DiscoverySourceKind
 from market_voice_forecast_ledger.domain.enums import JobKind
 from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
 from market_voice_forecast_ledger.services.discovery_profiles import (
@@ -20,6 +21,7 @@ from market_voice_forecast_ledger.services.discovery_profiles import (
 )
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
+from market_voice_forecast_ledger.youtube.metadata import normalize_video_item
 from tests.backend.youtube_fakes import FakeYouTubeClient, synthetic_video_item
 
 
@@ -117,6 +119,166 @@ def _assert_private_absent(response, values: tuple[str, ...]) -> None:
     surface = response.text + "\n" + repr(tuple(response.headers.items()))
     for value in values:
         assert value not in surface
+
+
+def _drop_table_triggers(conn, *table_names: str) -> None:
+    placeholders = ",".join("?" for _ in table_names)
+    names = tuple(
+        row["name"]
+        for row in conn.execute(
+            f"SELECT name FROM sqlite_master WHERE type='trigger' "
+            f"AND tbl_name IN ({placeholders}) ORDER BY name",
+            table_names,
+        )
+    )
+    for name in names:
+        conn.execute(f'DROP TRIGGER "{name}"')
+
+
+def _partial_seed_observation(settings: Settings, *, failed: bool):
+    requested_at = datetime(2026, 8, 19, 3, 4, 5, tzinfo=timezone.utc)
+    conn = open_database(settings.database_path)
+    try:
+        service = YouTubeSyncService(conn, clock=lambda: requested_at)
+        result = service.request_full_sync(requested_at)
+        claimed = service.claim_next_runnable(requested_at)
+        assert claimed is not None and claimed.job_id == result.job_id
+        unit_key = conn.execute(
+            "SELECT unit_key FROM job_units WHERE job_id=? AND status='running'",
+            (result.job_id,),
+        ).fetchone()["unit_key"]
+        repository = DiscoveryRepository(conn)
+        checkpoint = repository.get_youtube_sync_checkpoint(
+            result.job_id, unit_key
+        )
+        manifest = service.get_sync_manifest(result.job_id)
+        profiles = tuple(
+            repository.get_profile_version(item.profile_version_id)
+            for item in manifest.profiles
+        )
+        profile = next(
+            item
+            for item in profiles
+            if checkpoint.source_key in item.seed_channel_ids
+        )
+        metadata = normalize_video_item(
+            synthetic_video_item(
+                video_id=VIDEO_ID,
+                title=PRIVATE_TITLE,
+                description=PRIVATE_DESCRIPTION,
+                snippet_published_at="2026-08-18T01:02:03Z",
+            ),
+            fetched_at=requested_at,
+        )
+        with transaction(conn):
+            repository.bind_seed_uploads_playlist(
+                job_id=result.job_id,
+                unit_key=unit_key,
+                source_key=checkpoint.source_key,
+                uploads_playlist_id="UU" + checkpoint.source_key[2:],
+            )
+            repository.persist_metadata_batch(
+                result.job_id,
+                profile.id,
+                DiscoverySourceKind.SEED_UPLOADS,
+                checkpoint.source_key,
+                (metadata,),
+                requested_at,
+            )
+            repository.advance_seed_checkpoint(
+                job_id=result.job_id,
+                unit_key=unit_key,
+                next_page_token=PRIVATE_PAGE_TOKEN,
+                encountered_video_ids=(VIDEO_ID,),
+                unavailable_video_ids=(),
+            )
+        if failed:
+            JobStateService(conn, clock=lambda: requested_at).fail_unit(
+                result.job_id, unit_key, "YOUTUBE_PROVIDER_TRANSIENT"
+            )
+        row = conn.execute(
+            "SELECT observation.id AS observation_id, observation.video_id, "
+            "observation.metadata_snapshot_id, candidate.id AS candidate_id, "
+            "candidate.current_presence_decision_id, checkpoint.source_key "
+            "FROM discovery_observations AS observation "
+            "JOIN subject_video_candidates AS candidate "
+            "ON candidate.profile_id=observation.profile_id "
+            "AND candidate.video_id=observation.video_id "
+            "JOIN youtube_sync_checkpoints AS checkpoint "
+            "ON checkpoint.job_id=observation.job_id "
+            "AND checkpoint.unit_key=? WHERE observation.job_id=?",
+            (unit_key, result.job_id),
+        ).fetchone()
+        assert row is not None
+        return result.job_id, dict(row)
+    finally:
+        conn.close()
+
+
+def _job_storage_snapshot(settings: Settings, job_id: int):
+    conn = open_database(settings.database_path)
+    try:
+        tables = (
+            "jobs",
+            "job_units",
+            "job_unit_attempts",
+            "job_events",
+            "manual_discovery_requests",
+            "youtube_sync_manifests",
+            "youtube_sync_manifest_profiles",
+            "youtube_sync_checkpoints",
+            "youtube_search_windows",
+            "youtube_source_cursors",
+            "youtube_sync_proposed_cursors",
+            "youtube_quota_reservations",
+            "youtube_daily_sync_requests",
+            "videos",
+            "video_metadata_snapshots",
+            "discovery_observations",
+            "subject_video_candidates",
+            "presence_decisions",
+        )
+        return tuple(
+            (
+                table,
+                tuple(tuple(row) for row in conn.execute(f"SELECT * FROM {table}")),
+            )
+            for table in tables
+        )
+    finally:
+        conn.close()
+
+
+def _set_youtube_job_status(
+    settings: Settings,
+    job_id: int,
+    status: str,
+    *,
+    running: bool,
+) -> None:
+    conn = open_database(settings.database_path)
+    try:
+        if running:
+            now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+            claimed = YouTubeSyncService(
+                conn, clock=lambda: now
+            ).claim_next_runnable(now)
+            assert claimed is not None and claimed.job_id == job_id
+            state = JobStateService(conn, clock=lambda: now)
+            if status == "pause_requested":
+                assert state.request_pause(job_id).value == status
+            else:
+                assert status == "cancel_requested"
+                assert state.request_stop(job_id).value == status
+        elif status == "stopped":
+            assert JobStateService(conn).request_stop(job_id).value == status
+        else:
+            assert status == "paused"
+            _drop_table_triggers(conn, "jobs")
+            conn.execute("UPDATE jobs SET status='paused' WHERE id=?", (job_id,))
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def test_post_sync_persists_before_wake_and_reuses_the_same_job(settings: Settings):
@@ -498,7 +660,7 @@ def test_get_sync_status_reports_defer_totals_and_only_safe_unit_errors(
             (job_id,),
         ).fetchone()["unit_key"]
         JobStateService(conn).fail_unit(
-            job_id, failed_unit, "YOUTUBE_SAFE_PROVIDER_ERROR"
+            job_id, failed_unit, "YOUTUBE_PROVIDER_REQUEST_FAILED"
         )
     finally:
         conn.close()
@@ -507,7 +669,7 @@ def test_get_sync_status_reports_defer_totals_and_only_safe_unit_errors(
     assert failed.status_code == 200
     assert failed.json()["status"] == "failed"
     assert [unit["error_code"] for unit in failed.json()["units"]].count(
-        "YOUTUBE_SAFE_PROVIDER_ERROR"
+        "YOUTUBE_PROVIDER_REQUEST_FAILED"
     ) == 1
 
 
@@ -574,6 +736,10 @@ def test_completed_manual_status_aggregates_counts_without_metadata_or_url(
     with _client(settings, wake) as client:
         response = client.get(f"/api/youtube-syncs/{job_id}")
         generic = client.get(f"/api/jobs/{job_id}")
+        reused = client.post(
+            "/api/youtube-manual-candidates",
+            json={"subject_id": subject_id, "url": WATCH_URL},
+        )
 
     assert response.status_code == 200
     assert response.json() == {
@@ -598,6 +764,13 @@ def test_completed_manual_status_aggregates_counts_without_metadata_or_url(
     }
     assert generic.status_code == 200
     assert generic.json()["kind"] == "youtube_sync"
+    assert reused.status_code == 202
+    assert reused.json() == {
+        "request_id": created.json()["request_id"],
+        "job_id": job_id,
+        "status": "succeeded",
+        "reused": True,
+    }
     _assert_private_absent(
         response,
         (PRIVATE_TITLE, PRIVATE_DESCRIPTION, SHORT_URL, WATCH_URL, VIDEO_ID),
@@ -660,3 +833,332 @@ def test_status_hides_stored_query_page_token_and_source_key(settings: Settings)
         response,
         (PRIVATE_QUERY, PRIVATE_PAGE_TOKEN, source_key),
     )
+
+
+@pytest.mark.parametrize("failed", (False, True), ids=("running", "failed"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "observation_hash",
+        "observation_profile",
+        "observation_source",
+        "observation_video",
+        "snapshot_owner",
+        "snapshot_hash",
+        "current_snapshot_link",
+        "candidate_owner",
+        "candidate_video_owner",
+        "candidate_first_observation",
+        "presence_evidence_hash",
+    ),
+)
+def test_partial_status_revalidates_every_persisted_discovery_binding(
+    settings: Settings,
+    failed: bool,
+    mutation: str,
+):
+    job_id, identity = _partial_seed_observation(settings, failed=failed)
+    conn = open_database(settings.database_path)
+    private_mutation = f"private_{mutation}_sentinel"
+    try:
+        _drop_table_triggers(
+            conn,
+            "discovery_observations",
+            "video_metadata_snapshots",
+            "videos",
+            "subject_video_candidates",
+            "presence_decisions",
+        )
+        conn.execute("PRAGMA foreign_keys=OFF")
+        if mutation == "observation_hash":
+            conn.execute(
+                "UPDATE discovery_observations SET observation_hash=? WHERE id=?",
+                (private_mutation, identity["observation_id"]),
+            )
+        elif mutation == "observation_profile":
+            conn.execute(
+                "UPDATE discovery_observations SET profile_id=999999 WHERE id=?",
+                (identity["observation_id"],),
+            )
+        elif mutation == "observation_source":
+            conn.execute(
+                "UPDATE discovery_observations SET source_key=? WHERE id=?",
+                (private_mutation, identity["observation_id"]),
+            )
+        elif mutation == "observation_video":
+            conn.execute(
+                "UPDATE discovery_observations SET video_id=999999 WHERE id=?",
+                (identity["observation_id"],),
+            )
+        elif mutation == "snapshot_owner":
+            conn.execute(
+                "UPDATE video_metadata_snapshots SET video_id=999999 WHERE id=?",
+                (identity["metadata_snapshot_id"],),
+            )
+        elif mutation == "snapshot_hash":
+            conn.execute(
+                "UPDATE video_metadata_snapshots SET canonical_hash=? WHERE id=?",
+                (private_mutation, identity["metadata_snapshot_id"]),
+            )
+        elif mutation == "current_snapshot_link":
+            conn.execute(
+                "UPDATE videos SET current_metadata_snapshot_id=NULL WHERE id=?",
+                (identity["video_id"],),
+            )
+        elif mutation == "candidate_owner":
+            other_profile_id = conn.execute(
+                "SELECT id FROM discovery_profiles WHERE id<>(SELECT profile_id "
+                "FROM subject_video_candidates WHERE id=?) ORDER BY id LIMIT 1",
+                (identity["candidate_id"],),
+            ).fetchone()["id"]
+            conn.execute(
+                "UPDATE subject_video_candidates SET profile_id=? WHERE id=?",
+                (other_profile_id, identity["candidate_id"]),
+            )
+        elif mutation == "candidate_video_owner":
+            conn.execute(
+                "UPDATE subject_video_candidates SET video_id=999999 WHERE id=?",
+                (identity["candidate_id"],),
+            )
+        elif mutation == "candidate_first_observation":
+            conn.execute(
+                "UPDATE subject_video_candidates SET first_observation_id=999999 "
+                "WHERE id=?",
+                (identity["candidate_id"],),
+            )
+        else:
+            conn.execute(
+                "UPDATE presence_decisions SET evidence_hash=? WHERE id=?",
+                (private_mutation, identity["current_presence_decision_id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    before = _job_storage_snapshot(settings, job_id)
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        response = client.get(f"/api/youtube-syncs/{job_id}")
+    after = _job_storage_snapshot(settings, job_id)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "INTERNAL_ERROR"}
+    _assert_private_absent(
+        response,
+        (
+            private_mutation,
+            PRIVATE_TITLE,
+            PRIVATE_DESCRIPTION,
+            PRIVATE_PAGE_TOKEN,
+            identity["source_key"],
+            VIDEO_ID,
+        ),
+    )
+    assert after == before
+    assert wake.request_count == 0
+
+
+PUBLIC_YOUTUBE_UNIT_ERROR_CODES = (
+    "YOUTUBE_CREDENTIAL_NOT_CONFIGURED",
+    "YOUTUBE_CREDENTIAL_INVALID",
+    "YOUTUBE_CREDENTIAL_STORAGE_FAILED",
+    "YOUTUBE_DISCOVERY_INVALID",
+    "YOUTUBE_INVALID_PAGE_TOKEN",
+    "YOUTUBE_METADATA_INVALID",
+    "YOUTUBE_PROVIDER_DEFERRED",
+    "YOUTUBE_PROVIDER_REQUEST_FAILED",
+    "YOUTUBE_PROVIDER_TRANSIENT",
+    "YOUTUBE_QUOTA_EXHAUSTED",
+    "YOUTUBE_RESPONSE_INVALID",
+    "YOUTUBE_SEARCH_RESPONSE_INVALID",
+    "YOUTUBE_SEARCH_WINDOW_SATURATED",
+    "YOUTUBE_SEED_RESPONSE_INVALID",
+    "YOUTUBE_SYNC_DEPENDENCY_MISSING",
+    "YOUTUBE_SYNC_FAILED",
+)
+
+
+def test_status_exposes_only_finite_provenanced_unit_error_codes(
+    settings: Settings,
+):
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        job_id = client.post("/api/youtube-syncs", json={}).json()["job_id"]
+    service, conn, unit_key = _claim_running_unit(settings, job_id)
+    del service
+    try:
+        JobStateService(conn).fail_unit(
+            job_id, unit_key, PUBLIC_YOUTUBE_UNIT_ERROR_CODES[0]
+        )
+        _drop_table_triggers(conn, "job_units")
+        conn.commit()
+    finally:
+        conn.close()
+
+    app = create_app(settings)
+    with _client_for_app(app, wake) as client:
+        for code in PUBLIC_YOUTUBE_UNIT_ERROR_CODES:
+            conn = open_database(settings.database_path)
+            try:
+                conn.execute(
+                    "UPDATE job_units SET error_code=? WHERE job_id=? "
+                    "AND status='failed'",
+                    (code, job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            response = client.get(f"/api/youtube-syncs/{job_id}")
+            assert response.status_code == 200
+            assert response.json()["units"][0]["error_code"] == code
+
+        for private_code in (
+            "private_retry_detail_sentinel",
+            "private_provider_body_sentinel",
+            "private_api_key_sentinel_000001",
+            "private_local_path_C_drive_sentinel",
+        ):
+            conn = open_database(settings.database_path)
+            try:
+                conn.execute(
+                    "UPDATE job_units SET error_code=? WHERE job_id=? "
+                    "AND status='failed'",
+                    (private_code, job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            before = _job_storage_snapshot(settings, job_id)
+            response = client.get(f"/api/youtube-syncs/{job_id}")
+            after = _job_storage_snapshot(settings, job_id)
+            assert response.status_code == 500
+            assert response.json() == {"error": "INTERNAL_ERROR"}
+            _assert_private_absent(response, (private_code,))
+            assert after == before
+
+
+@pytest.mark.parametrize(
+    ("status", "running"),
+    (
+        ("pause_requested", True),
+        ("paused", False),
+        ("cancel_requested", True),
+        ("stopped", False),
+    ),
+)
+def test_get_and_manual_reuse_serialize_every_reachable_control_status(
+    settings: Settings,
+    status: str,
+    running: bool,
+):
+    subject_id = _subject_id(settings)
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        created = client.post(
+            "/api/youtube-manual-candidates",
+            json={"subject_id": subject_id, "url": SHORT_URL},
+        ).json()
+    _set_youtube_job_status(
+        settings, created["job_id"], status, running=running
+    )
+
+    with _client(settings, wake) as client:
+        read = client.get(f"/api/youtube-syncs/{created['job_id']}")
+        reused = client.post(
+            "/api/youtube-manual-candidates",
+            json={"subject_id": subject_id, "url": WATCH_URL},
+        )
+
+    assert read.status_code == 200
+    assert read.json()["status"] == status
+    assert reused.status_code == 202
+    assert reused.json() == {
+        "request_id": created["request_id"],
+        "job_id": created["job_id"],
+        "status": status,
+        "reused": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "running"),
+    (
+        ("pause_requested", True),
+        ("paused", False),
+        ("cancel_requested", True),
+        ("stopped", False),
+    ),
+)
+def test_full_request_after_noncoalescible_status_creates_then_reuses_one_job(
+    settings: Settings,
+    status: str,
+    running: bool,
+):
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        original_id = client.post("/api/youtube-syncs", json={}).json()["job_id"]
+    _set_youtube_job_status(settings, original_id, status, running=running)
+
+    with _client(settings, wake) as client:
+        created = client.post("/api/youtube-syncs", json={})
+        reused = client.post("/api/youtube-syncs", json={})
+
+    assert created.status_code == 202
+    assert created.json() == {
+        "job_id": original_id + 1,
+        "status": "queued",
+        "reused": False,
+    }
+    assert reused.status_code == 202
+    assert reused.json() == {
+        "job_id": original_id + 1,
+        "status": "queued",
+        "reused": True,
+    }
+
+
+def test_get_sync_status_allows_only_an_optional_exact_empty_body(
+    settings: Settings,
+):
+    wake = FakeWakeAdapter()
+    with _client(settings, wake) as client:
+        job_id = client.post("/api/youtube-syncs", json={}).json()["job_id"]
+        bodyless = client.get(f"/api/youtube-syncs/{job_id}")
+        empty = client.request(
+            "GET", f"/api/youtube-syncs/{job_id}", json={}
+        )
+        invalid = (
+            client.request(
+                "GET",
+                f"/api/youtube-syncs/{job_id}",
+                json={"unknown": "private_get_body_sentinel"},
+            ),
+            client.request("GET", f"/api/youtube-syncs/{job_id}", json=[]),
+            client.request(
+                "GET",
+                f"/api/youtube-syncs/{job_id}",
+                content="null",
+                headers={"content-type": "application/json"},
+            ),
+            client.request("GET", f"/api/youtube-syncs/{job_id}", json=True),
+            client.request("GET", f"/api/youtube-syncs/{job_id}", json="value"),
+            client.request(
+                "GET",
+                f"/api/youtube-syncs/{job_id}",
+                content="{private_invalid_json_sentinel",
+                headers={"content-type": "application/json"},
+            ),
+        )
+
+    assert bodyless.status_code == 200
+    assert empty.status_code == 200
+    for response in invalid:
+        assert response.status_code == 422
+        assert response.json()["error"] == "REQUEST_VALIDATION_FAILED"
+        _assert_private_absent(
+            response,
+            (
+                "private_get_body_sentinel",
+                "private_invalid_json_sentinel",
+            ),
+        )
