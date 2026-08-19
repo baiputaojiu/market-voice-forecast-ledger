@@ -280,7 +280,7 @@ def test_long_idle_existing_cursor_precedes_initial_floor_across_profile_version
 
 @pytest.mark.parametrize(
     "corruption",
-    ("at_upper_bound", "malformed_bound", "hash", "owner_hash"),
+    ("after_upper_bound", "malformed_bound", "hash", "owner_hash"),
 )
 def test_existing_cursor_still_fails_closed_on_invalid_bound_hash_or_owner(
     db, corruption
@@ -289,8 +289,8 @@ def test_existing_cursor_still_fails_closed_on_invalid_bound_hash_or_owner(
     upper = datetime(2026, 1, 1, tzinfo=timezone.utc)
     source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
     cursor_bound = (
-        upper
-        if corruption == "at_upper_bound"
+        upper + timedelta(seconds=1)
+        if corruption == "after_upper_bound"
         else datetime(2022, 1, 1, tzinfo=timezone.utc)
     )
     _insert_cursor(
@@ -350,6 +350,114 @@ def test_existing_cursor_still_fails_closed_on_invalid_bound_hash_or_owner(
         YouTubeSyncService(db).request_full_sync(upper)
 
     assert caught.value.code == "STORED_YOUTUBE_SOURCE_CURSOR_INVALID"
+
+
+def test_cursor_equal_to_upper_completes_empty_increment_without_provider_calls(db):
+    profile = _search_profile(db)
+    upper = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
+    _insert_cursor(
+        db,
+        profile_id=profile.profile_id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key=source_key,
+        completed_upper_bound=upper,
+    )
+    with transaction(db):
+        db.execute(
+            "UPDATE discovery_profiles SET is_active=0 WHERE id<>?",
+            (profile.profile_id,),
+        )
+    durable_before = tuple(
+        dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")
+    )
+    client = FakeYouTubeClient()
+    service = YouTubeSyncService(db, clock=lambda: upper, youtube_client=client)
+
+    request = service.request_full_sync(upper)
+    unit_key = _unit_key(profile.profile_id)
+    JobStateService(db, clock=lambda: upper).begin_unit(request.job_id, unit_key)
+    result = service.execute_search_unit(request.job_id, unit_key)
+
+    expected_output_hash = _canonical_hash({
+        "completed_upper_bound": utc_iso(upper),
+        "persisted_observation_ids": [],
+        "profile_version_id": profile.id,
+        "schema": "youtube-search-unit-output.v1",
+        "source_key": source_key,
+    })
+    assert (
+        result.discovered_count,
+        result.persisted_count,
+        result.unavailable_count,
+        result.output_hash,
+    ) == (0, 0, 0, expected_output_hash)
+    assert JobStateService(db).unit(
+        request.job_id, unit_key
+    ).status is UnitStatus.SUCCESS
+    root = db.execute(
+        "SELECT * FROM youtube_search_windows WHERE job_id=? AND unit_key=?",
+        (request.job_id, unit_key),
+    ).fetchone()
+    assert root["lower_bound"] == root["upper_bound"] == utc_iso(upper)
+    assert root["page_count"] == 0
+    assert root["completed_at"] is not None
+    proposal = db.execute(
+        "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=?",
+        (request.job_id,),
+    ).fetchone()
+    assert proposal is not None
+    assert (
+        proposal["profile_id"],
+        proposal["source_kind"],
+        proposal["source_key"],
+        proposal["completed_upper_bound"],
+    ) == (
+        profile.profile_id,
+        DiscoverySourceKind.CROSS_CHANNEL_SEARCH.value,
+        source_key,
+        utc_iso(upper),
+    )
+    assert db.execute(
+        "SELECT COUNT(*) FROM youtube_sync_proposed_cursors WHERE job_id=?",
+        (request.job_id,),
+    ).fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM discovery_observations WHERE job_id=?",
+        (request.job_id,),
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM youtube_quota_reservations WHERE job_id=?",
+        (request.job_id,),
+    ).fetchone()[0] == 0
+    assert (
+        client.channel_calls,
+        client.playlist_calls,
+        client.search_calls,
+        client.video_calls,
+    ) == ([], [], [], [])
+    assert tuple(
+        dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")
+    ) == durable_before
+
+    replay_client = FakeYouTubeClient()
+    replay = YouTubeSyncService(
+        db, clock=lambda: upper, youtube_client=replay_client
+    ).execute_search_unit(request.job_id, unit_key)
+    assert replay == result
+    assert (
+        replay_client.channel_calls,
+        replay_client.playlist_calls,
+        replay_client.search_calls,
+        replay_client.video_calls,
+    ) == ([], [], [], [])
+
+    service.finalize_full_job(request.job_id)
+
+    assert JobStateService(db).status(request.job_id) is JobStatus.SUCCEEDED
+    assert tuple(
+        dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")
+    ) == durable_before
 
 
 def test_manual_manifest_never_reads_or_writes_source_cursors(db):

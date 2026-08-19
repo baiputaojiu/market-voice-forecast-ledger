@@ -724,7 +724,7 @@ class DiscoveryRepository:
             or row["source_kind"] != source_kind.value
             or row["source_key"] != source_key
             or row["cursor_hash"] != expected_hash
-            or completed_upper_bound >= upper_bound
+            or completed_upper_bound > upper_bound
             or updated_at < completed_upper_bound
         ):
             raise DomainError(
@@ -1877,7 +1877,7 @@ class DiscoveryRepository:
                 or effective_lower > upper_bound
                 or upper_bound != manifest_upper_bound
                 or (manual and effective_lower != upper_bound)
-                or (not manual and effective_lower >= upper_bound)
+                or (not manual and effective_lower > upper_bound)
                 or type(row["page_count"]) is not int
                 or row["page_count"] < 0
                 or type(row["batch_ordinal"]) is not int
