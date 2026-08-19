@@ -153,7 +153,10 @@ class YouTubeSyncService:
             return self._request_full_sync_in_transaction(requested_at)
 
     def _request_full_sync_in_transaction(
-        self, requested_at: datetime
+        self,
+        requested_at: datetime,
+        *,
+        excluded_job_ids: frozenset[int] = frozenset(),
     ) -> SyncRequestResult:
         profiles = self._discovery.list_active_profile_versions()
         backfill_floor = initial_backfill_floor(requested_at)
@@ -166,6 +169,8 @@ class YouTubeSyncService:
             _COALESCIBLE_STATUSES,
             newest_first=True,
         ):
+            if job_id in excluded_job_ids:
+                continue
             stored = self.get_sync_manifest(job_id)
             status = self._jobs.get(job_id).status
             if not self._is_compatible_full(
@@ -213,18 +218,21 @@ class YouTubeSyncService:
                 return SyncRequestResult(
                     job_id, self._jobs.get(job_id).status, True
                 )
-            result = self._request_full_sync_in_transaction(requested_at)
-            linked = self._conn.execute(
-                "SELECT jst_day FROM youtube_daily_sync_requests "
-                "WHERE job_id=?",
-                (result.job_id,),
-            ).fetchone()
-            if linked is None:
-                self._discovery.record_daily_youtube_sync_request(
-                    jst_day=jst_day,
-                    job_id=result.job_id,
-                    requested_at=requested_at,
+            prior_daily_job_ids = frozenset(
+                row["job_id"]
+                for row in self._conn.execute(
+                    "SELECT job_id FROM youtube_daily_sync_requests"
                 )
+            )
+            result = self._request_full_sync_in_transaction(
+                requested_at,
+                excluded_job_ids=prior_daily_job_ids,
+            )
+            self._discovery.record_daily_youtube_sync_request(
+                jst_day=jst_day,
+                job_id=result.job_id,
+                requested_at=requested_at,
+            )
             return result
 
     def request_manual_sync(

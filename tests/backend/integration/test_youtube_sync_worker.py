@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -451,6 +452,179 @@ def test_daily_schedule_matrix_uses_task_scheduler_time_and_jst_day(
         assert conn.execute(
             "SELECT COUNT(*) FROM youtube_daily_sync_requests"
         ).fetchone()[0] == expected_daily
+    finally:
+        conn.close()
+
+
+def test_cross_day_daily_request_creates_a_distinct_job_and_drains_both_fifo(
+    settings,
+):
+    prior_now = NOW - timedelta(hours=13)
+    prior_day = date(2026, 8, 18)
+    today = date(2026, 8, 19)
+    schedule = ScheduledTaskStatus(True, "06:00", True, "Queue")
+    conn = _open_ready(settings)
+    service = YouTubeSyncService(conn, clock=lambda: prior_now)
+    prior = service.ensure_daily_full_request(prior_day)
+    prior_manifest = service.get_sync_manifest(prior.job_id)
+    conn.close()
+
+    summary = run_once(
+        settings,
+        _dependencies(now=NOW, schedule=schedule),
+    )
+
+    assert summary == WorkerSummary(2, 2, 0, 0)
+    conn = open_database(settings.database_path)
+    try:
+        daily = tuple(
+            conn.execute(
+                "SELECT jst_day, job_id, requested_at "
+                "FROM youtube_daily_sync_requests ORDER BY jst_day"
+            )
+        )
+        assert tuple(row["jst_day"] for row in daily) == (
+            prior_day.isoformat(),
+            today.isoformat(),
+        )
+        assert daily[0]["job_id"] == prior.job_id
+        assert daily[1]["job_id"] != prior.job_id
+        assert daily[0]["requested_at"] == _utc_text(prior_now)
+        assert daily[1]["requested_at"] == _utc_text(NOW)
+        current_job_id = daily[1]["job_id"]
+        current_manifest = YouTubeSyncService(
+            conn, clock=lambda: NOW
+        ).get_sync_manifest(current_job_id)
+        assert prior_manifest.upper_bound == prior_now
+        assert current_manifest.upper_bound == NOW
+        assert current_manifest.profile_set_hash == prior_manifest.profile_set_hash
+        assert current_manifest.profiles == prior_manifest.profiles
+        assert tuple(
+            row["status"]
+            for row in conn.execute("SELECT status FROM jobs ORDER BY id")
+        ) == ("succeeded", "succeeded")
+        starts = tuple(
+            row["job_id"]
+            for row in conn.execute(
+                "SELECT job_id FROM job_events "
+                "WHERE event_kind='unit_started' ORDER BY id"
+            )
+        )
+        assert tuple(dict.fromkeys(starts)) == (prior.job_id, current_job_id)
+    finally:
+        conn.close()
+
+
+def test_cross_day_daily_request_is_atomic_across_connections_and_repeated_wakes(
+    settings,
+):
+    prior_now = NOW - timedelta(hours=13)
+    prior_day = date(2026, 8, 18)
+    today = date(2026, 8, 19)
+    conn = _open_ready(settings)
+    prior = YouTubeSyncService(
+        conn, clock=lambda: prior_now
+    ).ensure_daily_full_request(prior_day)
+    conn.close()
+    barrier = threading.Barrier(2)
+    results: list[int] = []
+    failures: list[BaseException] = []
+
+    def request_today() -> None:
+        other = open_database(settings.database_path)
+        try:
+            barrier.wait(timeout=5)
+            result = YouTubeSyncService(
+                other, clock=lambda: NOW
+            ).ensure_daily_full_request(today)
+            results.append(result.job_id)
+        except BaseException as cause:
+            failures.append(cause)
+        finally:
+            other.close()
+
+    threads = tuple(threading.Thread(target=request_today) for _ in range(2))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    conn = open_database(settings.database_path)
+    try:
+        repeated = YouTubeSyncService(
+            conn, clock=lambda: NOW
+        ).ensure_daily_full_request(today)
+        rows = tuple(
+            conn.execute(
+                "SELECT jst_day, job_id FROM youtube_daily_sync_requests "
+                "ORDER BY jst_day"
+            )
+        )
+        assert failures == []
+        assert len(results) == 2
+        assert results[0] == results[1] == repeated.job_id
+        assert repeated.job_id != prior.job_id
+        assert tuple((row["jst_day"], row["job_id"]) for row in rows) == (
+            (prior_day.isoformat(), prior.job_id),
+            (today.isoformat(), repeated.job_id),
+        )
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_cross_day_daily_request_stays_queued_behind_a_deferred_prior_day_head(
+    settings,
+):
+    prior_now = NOW - timedelta(hours=13)
+    prior_day = date(2026, 8, 18)
+    today = date(2026, 8, 19)
+    schedule = ScheduledTaskStatus(True, "06:00", True, "Queue")
+    conn = _open_ready(settings)
+    prior = YouTubeSyncService(
+        conn, clock=lambda: prior_now
+    ).ensure_daily_full_request(prior_day)
+    conn.close()
+    quota = SafeTransportFailure(
+        kind="http", status_code=403, provider_signal="quota"
+    )
+    deferred = run_once(
+        settings,
+        _dependencies(
+            now=prior_now,
+            transport=EndpointYouTubeTransport(responses=(quota,)),
+        ),
+    )
+
+    current = run_once(
+        settings,
+        _dependencies(now=NOW, schedule=schedule),
+    )
+
+    assert deferred == WorkerSummary(1, 0, 1, 0)
+    assert current == WorkerSummary(0, 0, 0, 0)
+    conn = open_database(settings.database_path)
+    try:
+        rows = tuple(
+            conn.execute(
+                "SELECT daily.jst_day, daily.job_id, jobs.status "
+                "FROM youtube_daily_sync_requests AS daily "
+                "JOIN jobs ON jobs.id=daily.job_id ORDER BY daily.jst_day"
+            )
+        )
+        assert tuple(row["jst_day"] for row in rows) == (
+            prior_day.isoformat(),
+            today.isoformat(),
+        )
+        assert rows[0]["job_id"] == prior.job_id
+        assert rows[0]["status"] == "retrying"
+        assert rows[1]["job_id"] != prior.job_id
+        assert rows[1]["status"] == "queued"
+        current_manifest = YouTubeSyncService(
+            conn, clock=lambda: NOW
+        ).get_sync_manifest(rows[1]["job_id"])
+        assert current_manifest.upper_bound == NOW
     finally:
         conn.close()
 

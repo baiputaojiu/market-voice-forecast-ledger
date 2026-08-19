@@ -1049,17 +1049,23 @@ class DiscoveryRepository:
         ))
         verified: dict[str, str] = {}
         try:
+            successful_specs = tuple(
+                specs[row["unit_key"]]
+                for row in rows
+                if row["unit_key"] in specs
+            )
+            if len(successful_specs) != len(rows):
+                self._raise_seed_artifact_invalid()
+            self._verify_successful_unit_proposals(
+                job_id=job_id,
+                manifest=manifest,
+                sync_kind=sync_kind,
+                successful_specs=successful_specs,
+            )
             for row in rows:
                 spec = specs.get(row["unit_key"])
                 if spec is None:
                     self._raise_seed_artifact_invalid()
-                if self._is_legacy_checkpoint_artifact(
-                    job_id=job_id,
-                    spec=spec,
-                    output_hash=row["output_hash"],
-                ):
-                    verified[spec.unit_key] = row["output_hash"]
-                    continue
                 if spec.source_kind is DiscoverySourceKind.SEED_UPLOADS:
                     output_hash, _ = self.seed_unit_artifact(
                         job_id=job_id,
@@ -1104,41 +1110,63 @@ class DiscoveryRepository:
             ) from cause
         return verified
 
-    def _is_legacy_checkpoint_artifact(
-        self, *, job_id: int, spec: object, output_hash: object
-    ) -> bool:
-        source_kind = getattr(spec, "source_kind", None)
-        if source_kind not in {
-            DiscoverySourceKind.SEED_UPLOADS,
-            DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
-        }:
-            return False
-        checkpoint = self.get_youtube_sync_checkpoint(
-            job_id, getattr(spec, "unit_key", "")
+    def _verify_successful_unit_proposals(
+        self, *, job_id: int, manifest, sync_kind, successful_specs
+    ) -> None:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=? "
+                "ORDER BY profile_id, source_kind, source_key",
+                (job_id,),
+            )
         )
-        if output_hash != checkpoint.checkpoint_hash:
-            return False
-        observation_count = self._conn.execute(
-            "SELECT COUNT(*) FROM discovery_observations "
-            "WHERE job_id=? AND profile_id=? AND source_kind=? AND source_key=?",
-            (
-                job_id,
-                getattr(spec, "profile_id", None),
-                source_kind.value,
-                getattr(spec, "source_key", None),
-            ),
-        ).fetchone()[0]
-        proposed_cursor_count = self._conn.execute(
-            "SELECT COUNT(*) FROM youtube_sync_proposed_cursors "
-            "WHERE job_id=? AND profile_id=? AND source_kind=? AND source_key=?",
-            (
-                job_id,
-                getattr(spec, "profile_id", None),
-                source_kind.value,
-                getattr(spec, "source_key", None),
-            ),
-        ).fetchone()[0]
-        return observation_count == 0 and proposed_cursor_count == 0
+        if sync_kind is YouTubeSyncKind.MANUAL:
+            if rows:
+                self._raise_manual_artifact_invalid()
+            return
+        expected = {
+            (spec.profile_id, spec.source_kind.value, spec.source_key): spec
+            for spec in successful_specs
+            if spec.source_kind
+            in {
+                DiscoverySourceKind.SEED_UPLOADS,
+                DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+            }
+        }
+        if len(expected) != len(successful_specs) or len(rows) != len(expected):
+            self._raise_seed_artifact_invalid()
+        seen: set[tuple[int, str, str]] = set()
+        for row in rows:
+            identity = (
+                row["profile_id"],
+                row["source_kind"],
+                row["source_key"],
+            )
+            spec = expected.get(identity)
+            try:
+                source_kind = DiscoverySourceKind(row["source_kind"])
+                completed_upper_bound = _parse_canonical_utc(
+                    row["completed_upper_bound"]
+                )
+                cursor_hash = canonical_source_cursor_hash(
+                    profile_id=row["profile_id"],
+                    source_kind=source_kind,
+                    source_key=row["source_key"],
+                    completed_upper_bound=completed_upper_bound,
+                )
+            except (DomainError, TypeError, ValueError):
+                self._raise_seed_artifact_invalid()
+            if (
+                spec is None
+                or identity in seen
+                or source_kind is DiscoverySourceKind.MANUAL_URL
+                or completed_upper_bound != manifest.upper_bound
+                or row["cursor_hash"] != cursor_hash
+            ):
+                self._raise_seed_artifact_invalid()
+            seen.add(identity)
+        if seen != set(expected):
+            self._raise_seed_artifact_invalid()
 
     def has_daily_youtube_sync_request(self, jst_day: date) -> bool:
         day_text = self._validate_jst_day(jst_day)

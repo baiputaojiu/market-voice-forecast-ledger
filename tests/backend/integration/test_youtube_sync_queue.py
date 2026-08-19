@@ -1,4 +1,3 @@
-import hashlib
 import json
 import sqlite3
 import threading
@@ -18,6 +17,8 @@ from market_voice_forecast_ledger.services.discovery_profiles import (
 )
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
+from market_voice_forecast_ledger.youtube.client import ChannelUploads, YouTubePage
+from tests.backend.youtube_fakes import FakeYouTubeClient
 
 
 FIXED_NOW = datetime(2026, 8, 19, 3, 4, 5, tzinfo=timezone.utc)
@@ -42,41 +43,6 @@ def db(db_path):
 
 def _utc_text(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def _hash(payload: object) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _completed_checkpoint_hash(row, completed_at: datetime) -> str:
-    return _hash(
-        {
-            "batch_ordinal": row["batch_ordinal"],
-            "completed_at": _utc_text(completed_at),
-            "effective_lower_bound": row["effective_lower_bound"],
-            "encountered_video_ids": json.loads(
-                row["encountered_video_ids_json"]
-            ),
-            "job_id": row["job_id"],
-            "next_page_token": row["next_page_token"],
-            "page_count": row["page_count"],
-            "schema": "youtube-sync-checkpoint.v1",
-            "source_key": row["source_key"],
-            "source_kind": row["source_kind"],
-            "unit_key": row["unit_key"],
-            "unavailable_video_ids": json.loads(
-                row["unavailable_video_ids_json"]
-            ),
-            "uploads_playlist_id": row["uploads_playlist_id"],
-            "upper_bound": row["upper_bound"],
-        }
-    )
 
 
 def _bootstrap(db):
@@ -153,24 +119,29 @@ def _claim_and_fail_first(db, job_id: int) -> str:
 
 
 def _complete_first_and_fail_second(db, job_id: int) -> tuple[str, str, str]:
-    service = _service(db)
+    checkpoint = db.execute(
+        "SELECT checkpoint.source_key FROM youtube_sync_checkpoints AS checkpoint "
+        "JOIN job_units AS unit ON unit.job_id=checkpoint.job_id "
+        "AND unit.unit_key=checkpoint.unit_key "
+        "WHERE checkpoint.job_id=? AND checkpoint.source_kind='seed_uploads' "
+        "ORDER BY unit.ordinal LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    assert checkpoint is not None
+    channel_id = checkpoint["source_key"]
+    playlist_id = "UU" + channel_id[2:]
+    service = YouTubeSyncService(
+        db,
+        clock=lambda: FIXED_NOW,
+        youtube_client=FakeYouTubeClient(
+            channel_responses=((ChannelUploads(channel_id, playlist_id),),),
+            playlist_responses=(YouTubePage((), None),),
+        ),
+    )
     first_claim = service.claim_next_runnable(FIXED_NOW)
     assert first_claim is not None and first_claim.job_id == job_id
     first_key = _running_unit_key(db, job_id)
-    checkpoint = db.execute(
-        "SELECT * FROM youtube_sync_checkpoints "
-        "WHERE job_id=? AND unit_key=?",
-        (job_id, first_key),
-    ).fetchone()
-    checkpoint_hash = _completed_checkpoint_hash(checkpoint, FIXED_NOW)
-    db.execute(
-        "UPDATE youtube_sync_checkpoints SET completed_at=?, checkpoint_hash=? "
-        "WHERE job_id=? AND unit_key=?",
-        (_utc_text(FIXED_NOW), checkpoint_hash, job_id, first_key),
-    )
-    JobStateService(db, clock=lambda: FIXED_NOW).complete_unit(
-        job_id, first_key, checkpoint_hash
-    )
+    completed = service.execute_seed_unit(job_id, first_key)
 
     second_claim = service.claim_next_runnable(FIXED_NOW)
     assert second_claim is not None and second_claim.job_id == job_id
@@ -179,7 +150,7 @@ def _complete_first_and_fail_second(db, job_id: int) -> tuple[str, str, str]:
         job_id, second_key, "SYNTHETIC_RETRYABLE"
     )
     assert JobStateService(db).status(job_id) is JobStatus.FAILED
-    return first_key, second_key, checkpoint_hash
+    return first_key, second_key, completed.output_hash
 
 
 def _sync_retry_state(db, job_id: int) -> dict[str, tuple[dict, ...]]:
@@ -319,8 +290,8 @@ def test_failed_coalescing_rejects_checkpoint_artifact_tamper_without_retry(db):
 @pytest.mark.parametrize(
     ("column", "corrupt_value"),
     (
-        ("page_count", 1),
-        ("batch_ordinal", 1),
+        ("page_count", 2),
+        ("batch_ordinal", 2),
         ("next_page_token", "tampered-next-page"),
         ("uploads_playlist_id", "UUtamperedPlaylistIdentity"),
         (
