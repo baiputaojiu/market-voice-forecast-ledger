@@ -24,12 +24,14 @@ from market_voice_forecast_ledger.domain.discovery import (
     YouTubeSyncManifest,
     YouTubeSyncManifestProfile,
     build_youtube_sync_shape,
+    canonical_manual_unit_output_hash,
     canonical_search_window_hash,
     canonical_source_cursor_hash,
     canonical_youtube_sync_checkpoint_hash,
     canonical_presence_decision_hash,
     canonical_profile_hash,
     validate_canonical_video_metadata,
+    youtube_manual_video_hash,
     youtube_profile_set_hash,
 )
 from market_voice_forecast_ledger.domain.enums import (
@@ -399,6 +401,41 @@ class DiscoveryRepository:
             raise LookupError(f"active discovery profile not found: {subject_id}")
         version = self.get_profile_version(row["current_version_id"])
         self._validate_profile_owner(version, row["id"], row["subject_id"])
+        return version
+
+    def get_active_manual_profile_version(
+        self, subject_id: int
+    ) -> DiscoveryProfileVersion:
+        if type(subject_id) is not int or subject_id <= 0:
+            raise DomainError(
+                "YOUTUBE_SYNC_REQUEST_INVALID",
+                "manual YouTube subject identity is invalid",
+            )
+        subject = self._conn.execute(
+            "SELECT id, is_active FROM analysis_subjects WHERE id=?",
+            (subject_id,),
+        ).fetchone()
+        if subject is None:
+            raise LookupError(f"analysis subject not found: {subject_id}")
+        profile = self._conn.execute(
+            "SELECT id, subject_id, current_version_id, is_active "
+            "FROM discovery_profiles WHERE subject_id=?",
+            (subject_id,),
+        ).fetchone()
+        if (
+            subject["is_active"] != 1
+            or profile is None
+            or profile["is_active"] != 1
+            or profile["current_version_id"] is None
+        ):
+            raise DomainError(
+                "DISCOVERY_PROFILE_NOT_ACTIVE",
+                "manual discovery requires an active subject and profile",
+            )
+        version = self.get_profile_version(profile["current_version_id"])
+        self._validate_profile_owner(
+            version, profile["id"], profile["subject_id"]
+        )
         return version
 
     def get_current_profile_version_by_subject_name(
@@ -873,7 +910,11 @@ class DiscoveryRepository:
             job_id=job_id,
             unit_specs=unit_specs,
             manifest_upper_bound=upper_bound,
-            manual=(kind is YouTubeSyncKind.MANUAL),
+            manual_request_id=(
+                row["manual_request_id"]
+                if kind is YouTubeSyncKind.MANUAL
+                else None
+            ),
         )
         return YouTubeSyncManifest(
             job_id=job_id,
@@ -1278,6 +1319,96 @@ class DiscoveryRepository:
             completed_at=completed_at,
         )
 
+    def complete_manual_checkpoint_and_artifact(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        manual_request_id: int,
+        profile_version_id: int,
+        youtube_video_id: str,
+        unavailable: bool,
+        completed_at: datetime,
+    ) -> tuple[YouTubeSyncCheckpoint, str, tuple[int, ...]]:
+        self._require_transaction()
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        try:
+            profile_version = self.get_profile_version(profile_version_id)
+            request = self._manual_request(manual_request_id)
+        except (LookupError, DomainError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        if (
+            checkpoint.source_kind is not DiscoverySourceKind.MANUAL_URL
+            or checkpoint.source_key != f"manual-request:{manual_request_id}"
+            or checkpoint.effective_lower_bound != checkpoint.upper_bound
+            or checkpoint.uploads_playlist_id is not None
+            or checkpoint.next_page_token is not None
+            or checkpoint.encountered_video_ids
+            or checkpoint.unavailable_video_ids
+            or checkpoint.page_count != 0
+            or checkpoint.batch_ordinal != 0
+            or checkpoint.completed_at is not None
+            or request["profile_id"] != profile_version.profile_id
+            or request["youtube_video_id"] != youtube_video_id
+            or type(unavailable) is not bool
+            or not _is_exact_utc(completed_at)
+        ):
+            self._raise_manual_artifact_invalid()
+        checkpoint = self._replace_youtube_checkpoint(
+            checkpoint,
+            uploads_playlist_id=None,
+            next_page_token=None,
+            encountered_video_ids=(youtube_video_id,),
+            unavailable_video_ids=(youtube_video_id,) if unavailable else (),
+            page_count=1,
+            batch_ordinal=1,
+            completed_at=completed_at,
+        )
+        output_hash, observation_ids = self._canonical_manual_artifact(
+            profile_version=profile_version,
+            checkpoint=checkpoint,
+            manual_request_id=manual_request_id,
+            youtube_video_id=youtube_video_id,
+        )
+        return checkpoint, output_hash, observation_ids
+
+    def manual_unit_artifact(
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        manual_request_id: int,
+        profile_version_id: int,
+        profile_id: int,
+        source_key: str,
+    ) -> tuple[str, tuple[int, ...]]:
+        checkpoint = self.get_youtube_sync_checkpoint(job_id, unit_key)
+        try:
+            profile_version = self.get_profile_version(profile_version_id)
+            request = self._manual_request(manual_request_id)
+        except (LookupError, DomainError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        if (
+            checkpoint.source_kind is not DiscoverySourceKind.MANUAL_URL
+            or checkpoint.source_key != source_key
+            or source_key != f"manual-request:{manual_request_id}"
+            or profile_version.profile_id != profile_id
+            or request["profile_id"] != profile_id
+        ):
+            self._raise_manual_artifact_invalid()
+        return self._canonical_manual_artifact(
+            profile_version=profile_version,
+            checkpoint=checkpoint,
+            manual_request_id=manual_request_id,
+            youtube_video_id=request["youtube_video_id"],
+        )
+
     def seed_unit_artifact(
         self,
         *,
@@ -1662,6 +1793,92 @@ class DiscoveryRepository:
             )
         self.get_youtube_sync_manifest(job_id)
 
+    def find_manual_discovery_request_id(
+        self, *, profile_id: int, youtube_video_id: str
+    ) -> int | None:
+        if (
+            type(profile_id) is not int
+            or profile_id <= 0
+            or type(youtube_video_id) is not str
+            or _YOUTUBE_VIDEO_ID.fullmatch(youtube_video_id) is None
+        ):
+            raise DomainError(
+                "YOUTUBE_SYNC_REQUEST_INVALID",
+                "manual YouTube request identity is invalid",
+            )
+        row = self._conn.execute(
+            "SELECT id FROM manual_discovery_requests "
+            "WHERE profile_id=? AND youtube_video_id=?",
+            (profile_id, youtube_video_id),
+        ).fetchone()
+        if row is None:
+            return None
+        request = self._manual_request(row["id"])
+        if (
+            request["profile_id"] != profile_id
+            or request["youtube_video_id"] != youtube_video_id
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored manual sync request binding is invalid",
+            )
+        return request["id"]
+
+    def create_manual_discovery_request(
+        self,
+        *,
+        profile_id: int,
+        youtube_video_id: str,
+        requested_at: datetime,
+    ) -> int:
+        self._require_transaction()
+        if (
+            type(profile_id) is not int
+            or profile_id <= 0
+            or type(youtube_video_id) is not str
+            or _YOUTUBE_VIDEO_ID.fullmatch(youtube_video_id) is None
+            or not _is_exact_utc(requested_at)
+        ):
+            raise DomainError(
+                "YOUTUBE_SYNC_REQUEST_INVALID",
+                "manual YouTube request is invalid",
+            )
+        profile = self._conn.execute(
+            "SELECT profile.id, profile.current_version_id, "
+            "profile.is_active, subject.is_active AS subject_is_active "
+            "FROM discovery_profiles AS profile "
+            "JOIN analysis_subjects AS subject ON subject.id=profile.subject_id "
+            "WHERE profile.id=?",
+            (profile_id,),
+        ).fetchone()
+        if (
+            profile is None
+            or profile["is_active"] != 1
+            or profile["subject_is_active"] != 1
+            or profile["current_version_id"] is None
+        ):
+            raise DomainError(
+                "DISCOVERY_PROFILE_NOT_ACTIVE",
+                "manual discovery requires an active subject and profile",
+            )
+        cursor = self._conn.execute(
+            "INSERT INTO manual_discovery_requests("
+            "profile_id, youtube_video_id, requested_at) VALUES (?, ?, ?)",
+            (profile_id, youtube_video_id, utc_iso(requested_at)),
+        )
+        request_id = cursor.lastrowid
+        request = self._manual_request(request_id)
+        if (
+            request["profile_id"] != profile_id
+            or request["youtube_video_id"] != youtube_video_id
+            or request["requested_at"] != utc_iso(requested_at)
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored manual sync request is invalid",
+            )
+        return request_id
+
     def find_manual_sync_job_id(self, manual_request_id: int) -> int | None:
         rows = tuple(
             self._conn.execute(
@@ -1676,6 +1893,12 @@ class DiscoveryRepository:
                 "manual request is linked to multiple sync jobs",
             )
         return None if not rows else rows[0]["job_id"]
+
+    def manual_request_binding(
+        self, manual_request_id: int
+    ) -> tuple[int, str]:
+        request = self._manual_request(manual_request_id)
+        return request["profile_id"], request["youtube_video_id"]
 
     def manual_sync_request_binding(
         self, manual_request_id: int
@@ -1824,8 +2047,12 @@ class DiscoveryRepository:
         job_id: int,
         unit_specs,
         manifest_upper_bound: datetime,
-        manual: bool,
+        manual_request_id: int | None,
     ) -> tuple[YouTubeSyncCheckpoint, ...]:
+        manual = manual_request_id is not None
+        manual_request = (
+            self._manual_request(manual_request_id) if manual else None
+        )
         rows = tuple(
             self._conn.execute(
                 "SELECT checkpoint.* FROM youtube_sync_checkpoints AS checkpoint "
@@ -1878,6 +2105,11 @@ class DiscoveryRepository:
                 or upper_bound != manifest_upper_bound
                 or (manual and effective_lower != upper_bound)
                 or (not manual and effective_lower > upper_bound)
+                or manual
+                and (
+                    row["uploads_playlist_id"] is not None
+                    or row["next_page_token"] is not None
+                )
                 or type(row["page_count"]) is not int
                 or row["page_count"] < 0
                 or type(row["batch_ordinal"]) is not int
@@ -1942,10 +2174,21 @@ class DiscoveryRepository:
                         "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                         "stored YouTube sync artifact is invalid",
                     )
-                if unit["output_hash"] != expected_hash:
-                    profile_version = self.get_profile_version(
-                        spec.profile_version_id
+                profile_version = self.get_profile_version(
+                    spec.profile_version_id
+                )
+                if source_kind is DiscoverySourceKind.MANUAL_URL:
+                    if manual_request is None:
+                        self._raise_manual_artifact_invalid()
+                    artifact_hash, _ = self._canonical_manual_artifact(
+                        profile_version=profile_version,
+                        checkpoint=checkpoint,
+                        manual_request_id=manual_request_id,
+                        youtube_video_id=manual_request["youtube_video_id"],
                     )
+                    if unit["output_hash"] != artifact_hash:
+                        self._raise_manual_artifact_invalid()
+                elif unit["output_hash"] != expected_hash:
                     if source_kind is DiscoverySourceKind.SEED_UPLOADS:
                         artifact_hash, _ = self._canonical_seed_artifact(
                             profile_version, checkpoint
@@ -1965,7 +2208,12 @@ class DiscoveryRepository:
                     if unit["output_hash"] != artifact_hash:
                         self._raise_seed_artifact_invalid()
             else:
-                if completed_at is not None:
+                if completed_at is not None or manual and (
+                    encountered_video_ids
+                    or unavailable_video_ids
+                    or row["page_count"] != 0
+                    or row["batch_ordinal"] != 0
+                ):
                     raise DomainError(
                         "STORED_YOUTUBE_SYNC_CHECKPOINT_INVALID",
                         "stored YouTube sync checkpoint is invalid",
@@ -2409,6 +2657,84 @@ class DiscoveryRepository:
             observation_ids,
         )
 
+    def _canonical_manual_artifact(
+        self,
+        *,
+        profile_version: DiscoveryProfileVersion,
+        checkpoint: YouTubeSyncCheckpoint,
+        manual_request_id: int,
+        youtube_video_id: str,
+    ) -> tuple[str, tuple[int, ...]]:
+        try:
+            if (
+                checkpoint.source_kind is not DiscoverySourceKind.MANUAL_URL
+                or checkpoint.source_key
+                != f"manual-request:{manual_request_id}"
+                or checkpoint.effective_lower_bound != checkpoint.upper_bound
+                or checkpoint.uploads_playlist_id is not None
+                or checkpoint.next_page_token is not None
+                or checkpoint.encountered_video_ids != (youtube_video_id,)
+                or checkpoint.unavailable_video_ids
+                not in ((), (youtube_video_id,))
+                or checkpoint.page_count != 1
+                or checkpoint.batch_ordinal != 1
+                or checkpoint.completed_at is None
+            ):
+                self._raise_manual_artifact_invalid()
+            rows = tuple(
+                self._conn.execute(
+                    "SELECT observation.*, video.youtube_video_id "
+                    "FROM discovery_observations AS observation "
+                    "JOIN videos AS video ON video.id=observation.video_id "
+                    "WHERE observation.job_id=? ORDER BY observation.id",
+                    (checkpoint.job_id,),
+                )
+            )
+            unavailable = bool(checkpoint.unavailable_video_ids)
+            if len(rows) != (0 if unavailable else 1):
+                self._raise_manual_artifact_invalid()
+            for row in rows:
+                self._validate_stored_observation(row)
+                if (
+                    row["profile_id"] != profile_version.profile_id
+                    or row["source_kind"]
+                    != DiscoverySourceKind.MANUAL_URL.value
+                    or row["source_key"] != checkpoint.source_key
+                    or row["youtube_video_id"] != youtube_video_id
+                ):
+                    self._raise_manual_artifact_invalid()
+                candidate = self._conn.execute(
+                    "SELECT * FROM subject_video_candidates "
+                    "WHERE profile_id=? AND video_id=?",
+                    (profile_version.profile_id, row["video_id"]),
+                ).fetchone()
+                if candidate is None:
+                    self._raise_manual_artifact_invalid()
+                self._validate_candidate_row(
+                    candidate,
+                    profile_id=profile_version.profile_id,
+                    video_id=row["video_id"],
+                )
+            observation_ids = tuple(row["id"] for row in rows)
+            output_hash = canonical_manual_unit_output_hash(
+                manual_request_id=manual_request_id,
+                profile_version_id=profile_version.id,
+                source_key=checkpoint.source_key,
+                youtube_video_id_hash=youtube_manual_video_hash(
+                    youtube_video_id
+                ),
+                persisted_observation_ids=observation_ids,
+                unavailable=unavailable,
+            )
+        except DomainError as cause:
+            if cause.code == "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID":
+                raise
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                "stored YouTube sync artifact is invalid",
+            ) from cause
+        return output_hash, observation_ids
+
     @classmethod
     def _stored_seed_progress(
         cls,
@@ -2430,8 +2756,8 @@ class DiscoveryRepository:
             or source_kind not in {
                 DiscoverySourceKind.SEED_UPLOADS,
                 DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+                DiscoverySourceKind.MANUAL_URL,
             }
-            and (encountered or unavailable)
         ):
             raise ValueError("checkpoint progress is not canonical")
         return encountered, unavailable
@@ -2466,6 +2792,13 @@ class DiscoveryRepository:
 
     @staticmethod
     def _raise_seed_artifact_invalid() -> None:
+        raise DomainError(
+            "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+            "stored YouTube sync artifact is invalid",
+        )
+
+    @staticmethod
+    def _raise_manual_artifact_invalid() -> None:
         raise DomainError(
             "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
             "stored YouTube sync artifact is invalid",

@@ -132,6 +132,19 @@ def test_url_parser_accepts_only_the_four_approved_https_form_families(url: str)
     assert extract_youtube_video_id(url) == VIDEO_ID
 
 
+def test_equivalent_manual_url_forms_have_one_canonical_request_identity():
+    urls = (
+        f"https://youtube.com/watch?v={VIDEO_ID}",
+        f"https://www.youtube.com/watch?v={VIDEO_ID}",
+        f"https://m.youtube.com/watch?v={VIDEO_ID}",
+        f"https://youtube.com/shorts/{VIDEO_ID}",
+        f"https://www.youtube.com/live/{VIDEO_ID}",
+        f"https://youtu.be/{VIDEO_ID}",
+    )
+
+    assert {extract_youtube_video_id(url) for url in urls} == {VIDEO_ID}
+
+
 @pytest.mark.parametrize(
     "url",
     (

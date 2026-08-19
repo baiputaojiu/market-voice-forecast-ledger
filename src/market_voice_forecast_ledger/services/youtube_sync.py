@@ -34,7 +34,9 @@ from market_voice_forecast_ledger.youtube.client import (
 )
 from market_voice_forecast_ledger.youtube.discovery import (
     CrossChannelSearchDiscoverer,
+    ManualUrlDiscoverer,
     SeedUploadsDiscoverer,
+    extract_youtube_video_id,
 )
 from market_voice_forecast_ledger.youtube.metadata import normalize_video_item
 
@@ -63,6 +65,14 @@ _ACTIVE_STATUSES = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class SyncRequestResult:
+    job_id: int
+    status: JobStatus
+    reused: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ManualRequestResult:
+    request_id: int
     job_id: int
     status: JobStatus
     reused: bool
@@ -157,52 +167,100 @@ class YouTubeSyncService:
                 "YouTube sync request is invalid",
             )
         with transaction(self._conn):
-            existing_id = self._discovery.find_manual_sync_job_id(
-                manual_request_id
+            return self._request_manual_sync_in_transaction(
+                manual_request_id, requested_at
             )
-            if existing_id is not None:
-                manifest = self.get_sync_manifest(existing_id)
-                if (
-                    manifest.sync_kind != YouTubeSyncKind.MANUAL.value
-                    or manifest.manual_request_id != manual_request_id
-                ):
-                    raise DomainError(
-                        "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
-                        "stored manual sync manifest is invalid",
-                    )
-                return SyncRequestResult(
-                    existing_id, self._jobs.get(existing_id).status, True
-                )
 
-            profile, manual_video_id = (
-                self._discovery.manual_sync_request_binding(manual_request_id)
+    def request_manual_candidate(
+        self, subject_id: int, url: str, requested_at: datetime
+    ) -> ManualRequestResult:
+        self._require_exact_utc(requested_at)
+        youtube_video_id = extract_youtube_video_id(url)
+        with transaction(self._conn):
+            profile = self._discovery.get_active_manual_profile_version(
+                subject_id
             )
-            profiles = (profile,)
-            _, unit_specs = build_youtube_sync_shape(
-                sync_kind=YouTubeSyncKind.MANUAL,
-                profiles=profiles,
-                upper_bound=requested_at,
-                backfill_floor=requested_at,
-                quota_contract_version=QUOTA_CONTRACT_VERSION,
-                manual_request_id=manual_request_id,
-                manual_video_id=manual_video_id,
+            request_id = self._discovery.find_manual_discovery_request_id(
+                profile_id=profile.profile_id,
+                youtube_video_id=youtube_video_id,
             )
-            generic = _generic_manifest(unit_specs)
-            job_id = self._job_state.create_in_transaction(
-                generic,
-                created_at=requested_at,
+            request_reused = request_id is not None
+            if request_id is None:
+                request_id = (
+                    self._discovery.create_manual_discovery_request(
+                        profile_id=profile.profile_id,
+                        youtube_video_id=youtube_video_id,
+                        requested_at=requested_at,
+                    )
+                )
+            requested = self._request_manual_sync_in_transaction(
+                request_id, requested_at
             )
-            self._discovery.create_youtube_sync_manifest(
-                job_id=job_id,
-                sync_kind=YouTubeSyncKind.MANUAL.value,
-                upper_bound=requested_at,
-                backfill_floor=requested_at,
-                quota_contract_version=QUOTA_CONTRACT_VERSION,
-                profiles=profiles,
-                manual_request_id=manual_request_id,
-                created_at=requested_at,
+            status = requested.status
+            if status is JobStatus.FAILED:
+                artifacts = self._discovery.verified_youtube_artifact_hashes(
+                    requested.job_id
+                )
+                self._job_state.retry_failed_in_transaction(
+                    requested.job_id, artifacts
+                )
+                status = JobStatus.RETRYING
+            return ManualRequestResult(
+                request_id=request_id,
+                job_id=requested.job_id,
+                status=status,
+                reused=request_reused or requested.reused,
             )
-            return SyncRequestResult(job_id, JobStatus.QUEUED, False)
+
+    def _request_manual_sync_in_transaction(
+        self, manual_request_id: int, requested_at: datetime
+    ) -> SyncRequestResult:
+        existing_id = self._discovery.find_manual_sync_job_id(
+            manual_request_id
+        )
+        if existing_id is not None:
+            manifest = self.get_sync_manifest(existing_id)
+            if (
+                manifest.sync_kind != YouTubeSyncKind.MANUAL.value
+                or manifest.manual_request_id != manual_request_id
+            ):
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "stored manual sync manifest is invalid",
+                )
+            return SyncRequestResult(
+                existing_id, self._jobs.get(existing_id).status, True
+            )
+
+        profile, manual_video_id = (
+            self._discovery.manual_sync_request_binding(manual_request_id)
+        )
+        profiles = (profile,)
+        _, unit_specs = build_youtube_sync_shape(
+            sync_kind=YouTubeSyncKind.MANUAL,
+            profiles=profiles,
+            upper_bound=requested_at,
+            backfill_floor=requested_at,
+            quota_contract_version=QUOTA_CONTRACT_VERSION,
+            manual_request_id=manual_request_id,
+            manual_video_id=manual_video_id,
+        )
+        generic = _generic_manifest(unit_specs)
+        job_id = self._job_state.create_in_transaction(
+            generic,
+            created_at=requested_at,
+        )
+        self._discovery.create_youtube_sync_manifest(
+            job_id=job_id,
+            sync_kind=YouTubeSyncKind.MANUAL.value,
+            upper_bound=requested_at,
+            backfill_floor=requested_at,
+            quota_contract_version=QUOTA_CONTRACT_VERSION,
+            profiles=profiles,
+            manual_request_id=manual_request_id,
+            created_at=requested_at,
+        )
+        return SyncRequestResult(job_id, JobStatus.QUEUED, False)
 
     def get_sync_manifest(self, job_id: int) -> YouTubeSyncManifest:
         generic = self._job_state.stored_manifest(job_id)
@@ -435,6 +493,96 @@ class YouTubeSyncService:
             discovered_count=len(encountered_video_ids),
             persisted_count=len(observation_ids),
             unavailable_count=len(unavailable_video_ids),
+            output_hash=output_hash,
+        )
+
+    def execute_manual_unit(
+        self, job_id: int, unit_key: str
+    ) -> UnitExecutionResult:
+        manifest = self.get_sync_manifest(job_id)
+        profile_version, spec, youtube_video_id = self._bound_manual_unit(
+            manifest=manifest,
+            unit_key=unit_key,
+        )
+        unit = self._job_state.unit(job_id, unit_key)
+        if (
+            unit.stage is not JobStage.YOUTUBE_MANUAL_DISCOVERY
+            or unit.declared_input_hash != spec.declared_input_hash
+            or unit.execution_contract_hash != spec.execution_contract_hash
+        ):
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube manual unit is invalid",
+            )
+        if unit.status is UnitStatus.SUCCESS:
+            checkpoint = self._discovery.get_youtube_sync_checkpoint(
+                job_id, unit_key
+            )
+            output_hash, observation_ids = (
+                self._discovery.manual_unit_artifact(
+                    job_id=job_id,
+                    unit_key=unit_key,
+                    manual_request_id=manifest.manual_request_id,
+                    profile_version_id=profile_version.id,
+                    profile_id=profile_version.profile_id,
+                    source_key=spec.source_key,
+                )
+            )
+            if unit.output_hash != output_hash:
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_ARTIFACT_INVALID",
+                    "stored YouTube sync artifact is invalid",
+                )
+            return UnitExecutionResult(
+                discovered_count=len(checkpoint.encountered_video_ids),
+                persisted_count=len(observation_ids),
+                unavailable_count=len(checkpoint.unavailable_video_ids),
+                output_hash=output_hash,
+            )
+        if unit.status is not UnitStatus.RUNNING:
+            raise DomainError(
+                "YOUTUBE_MANUAL_UNIT_NOT_RUNNING",
+                "YouTube manual unit must be claimed before execution",
+            )
+        if self._youtube_client is None:
+            raise DomainError(
+                "YOUTUBE_SYNC_DEPENDENCY_MISSING",
+                "YouTube sync dependency is not configured",
+            )
+
+        completed_at = self._exact_clock_value()
+        items = ManualUrlDiscoverer(
+            self._youtube_client, clock=lambda: completed_at
+        ).fetch(youtube_video_id)
+        unavailable = not items
+        with transaction(self._conn):
+            self._discovery.persist_metadata_batch(
+                job_id,
+                profile_version.id,
+                DiscoverySourceKind.MANUAL_URL,
+                spec.source_key,
+                items,
+                completed_at,
+            )
+            _, output_hash, observation_ids = (
+                self._discovery.complete_manual_checkpoint_and_artifact(
+                    job_id=job_id,
+                    unit_key=unit_key,
+                    manual_request_id=manifest.manual_request_id,
+                    profile_version_id=profile_version.id,
+                    youtube_video_id=youtube_video_id,
+                    unavailable=unavailable,
+                    completed_at=completed_at,
+                )
+            )
+            self._job_state.complete_unit_in_transaction(
+                job_id, unit_key, output_hash
+            )
+            self._job_state.succeed_job_in_transaction(job_id)
+        return UnitExecutionResult(
+            discovered_count=1,
+            persisted_count=len(observation_ids),
+            unavailable_count=int(unavailable),
             output_hash=output_hash,
         )
 
@@ -828,6 +976,62 @@ class YouTubeSyncService:
                 "stored YouTube search profile binding is invalid",
             )
         return profile_matches[0], spec
+
+    def _bound_manual_unit(self, *, manifest, unit_key):
+        if (
+            manifest.sync_kind != YouTubeSyncKind.MANUAL.value
+            or type(manifest.manual_request_id) is not int
+            or manifest.manual_request_id <= 0
+            or len(manifest.profiles) != 1
+        ):
+            raise DomainError(
+                "YOUTUBE_MANUAL_UNIT_INVALID",
+                "YouTube manual execution requires a manual sync manifest",
+            )
+        try:
+            stored_profile = manifest.profiles[0]
+            profile = self._discovery.get_profile_version(
+                stored_profile.profile_version_id
+            )
+            request_profile_id, youtube_video_id = (
+                self._discovery.manual_request_binding(
+                    manifest.manual_request_id
+                )
+            )
+            if (
+                profile.profile_id != request_profile_id
+                or stored_profile.profile_id != request_profile_id
+            ):
+                raise DomainError(
+                    "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                    "stored manual sync profile binding is invalid",
+                )
+            _, unit_specs = build_youtube_sync_shape(
+                sync_kind=YouTubeSyncKind.MANUAL,
+                profiles=(profile,),
+                upper_bound=manifest.upper_bound,
+                backfill_floor=manifest.backfill_floor,
+                quota_contract_version=manifest.quota_contract_version,
+                manual_request_id=manifest.manual_request_id,
+                manual_video_id=youtube_video_id,
+            )
+        except (LookupError, DomainError) as cause:
+            raise DomainError(
+                "STORED_YOUTUBE_SYNC_MANIFEST_INVALID",
+                "stored YouTube sync manifest is invalid",
+            ) from cause
+        matches = tuple(
+            spec
+            for spec in unit_specs
+            if spec.unit_key == unit_key
+            and spec.stage is JobStage.YOUTUBE_MANUAL_DISCOVERY
+        )
+        if len(matches) != 1:
+            raise DomainError(
+                "YOUTUBE_MANUAL_UNIT_INVALID",
+                "YouTube manual unit is not in the sealed manifest",
+            )
+        return profile, matches[0], youtube_video_id
 
     def _normalize_seed_response(self, requested_ids, raw_items):
         return self._normalize_video_response(

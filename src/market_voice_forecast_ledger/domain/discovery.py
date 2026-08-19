@@ -558,6 +558,50 @@ def youtube_manual_video_hash(youtube_video_id: str) -> str:
     }))
 
 
+def canonical_manual_unit_output_hash(
+    *,
+    manual_request_id: int,
+    profile_version_id: int,
+    source_key: str,
+    youtube_video_id_hash: str,
+    persisted_observation_ids: tuple[int, ...],
+    unavailable: bool,
+) -> str:
+    if (
+        type(manual_request_id) is not int
+        or manual_request_id <= 0
+        or type(profile_version_id) is not int
+        or profile_version_id <= 0
+        or source_key != f"manual-request:{manual_request_id}"
+        or type(youtube_video_id_hash) is not str
+        or _CANONICAL_HASH.fullmatch(youtube_video_id_hash) is None
+        or type(persisted_observation_ids) is not tuple
+        or any(
+            type(observation_id) is not int or observation_id <= 0
+            for observation_id in persisted_observation_ids
+        )
+        or persisted_observation_ids
+        != tuple(sorted(set(persisted_observation_ids)))
+        or type(unavailable) is not bool
+        or (unavailable and persisted_observation_ids)
+        or (not unavailable and len(persisted_observation_ids) != 1)
+    ):
+        raise DomainError(
+            "YOUTUBE_MANUAL_ARTIFACT_INVALID",
+            "manual YouTube artifact is invalid",
+        )
+    return sha256_text(canonical_json({
+        "discovered_count": 1,
+        "manual_request_id": manual_request_id,
+        "persisted_observation_ids": list(persisted_observation_ids),
+        "profile_version_id": profile_version_id,
+        "schema": "youtube-manual-unit-output.v1",
+        "source_key": source_key,
+        "unavailable_count": int(unavailable),
+        "youtube_video_id_hash": youtube_video_id_hash,
+    }))
+
+
 def youtube_sync_unit_input_hash(
     *,
     sync_kind: YouTubeSyncKind,
