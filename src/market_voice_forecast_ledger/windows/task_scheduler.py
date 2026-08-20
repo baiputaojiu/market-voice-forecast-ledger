@@ -356,8 +356,6 @@ def _proves_task_absent(csv_bytes: object) -> bool:
         ):
             raise ValueError("task listing is invalid")
         normalized = task_path.casefold()
-        if normalized in seen:
-            raise ValueError("task listing is invalid")
         seen.add(normalized)
     return _TASK_URI.casefold() not in seen
 

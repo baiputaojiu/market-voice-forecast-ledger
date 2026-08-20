@@ -537,6 +537,10 @@ OTHER_TASK_LISTING = (
     '"\\Synthetic Other Task","PRIVATE LOCALIZED TIME",'
     '"PRIVATE LOCALIZED STATUS"\r\n'
 ).encode()
+CONFLICTING_DUPLICATE_OTHER_TASK_LISTING = (
+    '"\\Synthetic Other Task","PRIVATE TIME 1","PRIVATE STATUS 1"\r\n'
+    '"\\Synthetic Other Task","PRIVATE TIME 2","PRIVATE STATUS 2"\r\n'
+).encode()
 
 
 class ReviewSchedulerRunner:
@@ -789,15 +793,15 @@ TARGET_TASK_LISTING = (
     "listing_output",
     (
         TARGET_TASK_LISTING,
+        TARGET_TASK_LISTING + TARGET_TASK_LISTING,
         b'"\\Other","PRIVATE","STATUS\r\n',
-        OTHER_TASK_LISTING + OTHER_TASK_LISTING,
         b'"\\Other","PRIVATE"\r\n',
         b"",
     ),
     ids=(
         "target-still-listed",
+        "duplicate-target-row",
         "malformed-quote",
-        "duplicate-task-row",
         "wrong-column-count",
         "empty-listing",
     ),
@@ -821,6 +825,59 @@ def test_i2_target_or_malformed_listing_never_proves_absence(listing_output):
     assert caught.value.code == "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE"
     assert "private" not in str(caught.value).lower()
     assert [call[0] for call in runner.calls] == [QUERY_XML_ARGV, QUERY_LIST_ARGV]
+
+
+@pytest.mark.parametrize(
+    "listing_output",
+    (
+        OTHER_TASK_LISTING + OTHER_TASK_LISTING,
+        CONFLICTING_DUPLICATE_OTHER_TASK_LISTING,
+    ),
+    ids=("identical-duplicate", "different-state-duplicate"),
+)
+@pytest.mark.parametrize("operation", ("status", "remove"))
+def test_i2_duplicate_unrelated_task_rows_still_prove_target_absence(
+    listing_output, operation
+):
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(returncode=1),
+        listing_response=FakeCompletedProcess(stdout=listing_output),
+    )
+    adapter = TaskSchedulerAdapter(runner=runner)
+
+    result = getattr(adapter, operation)()
+
+    expected = ScheduledTaskStatus.unavailable() if operation == "status" else False
+    assert result == expected
+    assert [call[0] for call in runner.calls] == [QUERY_XML_ARGV, QUERY_LIST_ARGV]
+
+
+@pytest.mark.parametrize("operation", ("install", "update"))
+def test_i2_registration_accepts_duplicate_unrelated_task_rows(operation):
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(returncode=1),
+        listing_response=FakeCompletedProcess(
+            stdout=CONFLICTING_DUPLICATE_OTHER_TASK_LISTING
+        ),
+    )
+    adapter = TaskSchedulerAdapter(runner=runner, today=lambda: date(2026, 8, 19))
+
+    getattr(adapter, operation)(time(7, 30))
+
+    assert [call[0] for call in runner.calls] == [
+        QUERY_XML_ARGV,
+        QUERY_LIST_ARGV,
+        WHOAMI_ARGV,
+        (
+            "schtasks.exe",
+            "/Create",
+            "/TN",
+            YOUTUBE_SYNC_TASK_NAME,
+            "/XML",
+            str(runner.captured["xml_path"]),
+            "/F",
+        ),
+    ]
 
 
 @pytest.mark.parametrize("operation", ("status", "remove"))
