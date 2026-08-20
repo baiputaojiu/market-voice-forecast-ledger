@@ -14,12 +14,8 @@ from market_voice_forecast_ledger.domain.common import sha256_text
 from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     AssignmentOrigin,
-    ConfigurationStatus,
-    DiscoveryMethod,
     JobKind,
     JobStage,
-    PolicyKind,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -33,20 +29,14 @@ from market_voice_forecast_ledger.domain.jobs import (
     JobManifest,
     ManifestUnit,
 )
-from market_voice_forecast_ledger.domain.sources import ChannelPolicy, VideoInput
 from market_voice_forecast_ledger.domain.speakers import SpeakerAssignment
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
 from market_voice_forecast_ledger.repositories.sources import SourceRepository
 from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
-from market_voice_forecast_ledger.services.channel_policy import ChannelPolicyService
-from market_voice_forecast_ledger.services.corrections import (
-    SpeakerCorrection,
-    SpeakerCorrectionService,
-)
 from market_voice_forecast_ledger.services.job_state import JobStateService
-from market_voice_forecast_ledger.services.speaker_assignment import (
-    SpeakerAssignmentService,
+from tests.backend.synthetic_collection_fixture import (
+    create_synthetic_collection_candidate,
 )
 
 
@@ -84,27 +74,11 @@ def _channel_id(index: int) -> str:
 def _create_subject(
     db,
     name: str,
-    kind: SubjectKind,
     *,
     channel_index: int,
 ) -> int:
-    sources = SourceRepository(db)
-    subject_id = sources.create_subject(name, kind)
-    policy = (
-        ChannelPolicy(
-            policy_kind=PolicyKind.FIXED_CHANNEL,
-            configuration_status=ConfigurationStatus.CONFIGURED,
-            youtube_channel_id=_channel_id(channel_index),
-            channel_display_name=f"Synthetic channel {channel_index}",
-        )
-        if kind is SubjectKind.ORGANIZATION
-        else ChannelPolicy(
-            policy_kind=PolicyKind.ALL_CHANNELS,
-            configuration_status=ConfigurationStatus.CONFIGURED,
-        )
-    )
-    sources.create_policy(subject_id, policy)
-    return subject_id
+    del channel_index
+    return SourceRepository(db).create_subject(name)
 
 
 def _add_video_with_segments(
@@ -117,33 +91,27 @@ def _add_video_with_segments(
     channel_index: int,
     transcript_created_at: datetime = FIXED_UTC,
 ) -> tuple[int, tuple[int, ...]]:
-    sources = SourceRepository(db)
-    policy = sources.get_policy(subject_id)
-    video_id = sources.upsert_video(
-        VideoInput(
-            youtube_video_id=youtube_video_id,
-            youtube_channel_id=policy.youtube_channel_id or _channel_id(channel_index),
-            channel_display_name=f"Synthetic channel {channel_index}",
-            title=f"Synthetic source {youtube_video_id}",
-            published_at=published_at,
-            duration_seconds=max(1, len(texts)) * 10,
-            live_kind="upload",
-        )
-    )
-    ChannelPolicyService(db).evaluate(
-        subject_id, video_id, DiscoveryMethod.AUTO_SEARCH
-    )
-    speakers = SpeakerRepository(db)
-    chunk_id = speakers.add_chunk(
-        video_id=video_id,
-        chunk_no=0,
+    del channel_index
+    fixture = create_synthetic_collection_candidate(
+        db,
+        presence_state="presence_confirmed",
+        assignment_kind="subject",
+        subject_id=subject_id,
+        youtube_video_id=youtube_video_id,
+        published_at=published_at,
+        text_body=texts[0],
+        transcript_created_at=transcript_created_at,
+        segment_no=0,
         start_ms=0,
-        end_ms=max(1, len(texts)) * 10_000,
-        input_hash=f"chunk-input-{youtube_video_id}",
-        output_hash=f"chunk-output-{youtube_video_id}",
-        status=UnitStatus.SUCCESS,
+        end_ms=10_000,
     )
-    segment_ids = tuple(
+    video_id = fixture.video_id
+    speakers = SpeakerRepository(db)
+    chunk_id = db.execute(
+        "SELECT id FROM transcription_chunks WHERE video_id=? ORDER BY id LIMIT 1",
+        (video_id,),
+    ).fetchone()[0]
+    segment_ids = (fixture.segment_id,) + tuple(
         speakers.add_segment(
             video_id=video_id,
             chunk_id=chunk_id,
@@ -155,7 +123,7 @@ def _add_video_with_segments(
             transcript_created_at=transcript_created_at,
             expires_at=None,
         )
-        for segment_no, text in enumerate(texts)
+        for segment_no, text in enumerate(texts[1:], start=1)
     )
     return video_id, segment_ids
 
@@ -287,10 +255,10 @@ def _create_job_for_input(
 
 def _prepare_personal_analysis(db) -> PreparedAnalysis:
     subject_id = _create_subject(
-        db, "Synthetic Person", SubjectKind.PERSON, channel_index=1
+        db, "Synthetic Person", channel_index=1
     )
     other_subject_id = _create_subject(
-        db, "Synthetic Other Person", SubjectKind.PERSON, channel_index=2
+        db, "Synthetic Other Person", channel_index=2
     )
     _, before_segments = _add_video_with_segments(
         db,
@@ -364,7 +332,7 @@ def _begin(db, prepared: PreparedAnalysis):
 
 def test_required_settings_are_fail_closed_for_preview_and_begin(db):
     subject_id = _create_subject(
-        db, "Synthetic Settings Person", SubjectKind.PERSON, channel_index=3
+        db, "Synthetic Settings Person", channel_index=3
     )
     required = AnalysisRunSettings.required()
     assert required == AnalysisRunSettings(
@@ -457,145 +425,9 @@ def test_begin_rejects_interviewer_context_drift_after_preview(db):
     assert db.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 0
 
 
-def test_organization_scope_requires_channel_organization_assignments(db):
-    subject_id = _create_subject(
-        db, "Synthetic Organization", SubjectKind.ORGANIZATION, channel_index=4
-    )
-    video_id, segment_ids = _add_video_with_segments(
-        db,
-        subject_id=subject_id,
-        youtube_video_id="synthetic-organization-source",
-        published_at=datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
-        texts=(
-            "Synthetic presenter statement.",
-            "Synthetic guest statement.",
-            "Synthetic interviewer statement.",
-        ),
-        channel_index=4,
-    )
-    SpeakerAssignmentService(db).assign_organization_video(subject_id, video_id)
-
-    prepared = _create_job_for_input(db, subject_id)
-    run = _begin(db, prepared)
-
-    assert tuple(
-        item.segment_id
-        for item in AnalysisRepository(db).get_input_segments(run.id)
-    ) == segment_ids
-    assert json.loads(
-        AnalysisRepository(db).get_snapshot(run.id).metadata_json
-    )["interviewer_market_context"] == []
-
-
-@pytest.mark.parametrize(
-    ("assignment_kind", "uses_organization_subject"),
-    (
-        pytest.param(AssignmentKind.HOLD, False, id="hold"),
-        pytest.param(AssignmentKind.INTERVIEWER, False, id="interviewer"),
-        pytest.param(AssignmentKind.SUBJECT, True, id="manual-subject"),
-    ),
-)
-def test_rejected_organization_correction_preserves_every_official_input_segment(
-    db, assignment_kind, uses_organization_subject
-):
-    subject_id = _create_subject(
-        db,
-        "Synthetic Organization Correction Boundary",
-        SubjectKind.ORGANIZATION,
-        channel_index=41,
-    )
-    video_id, segment_ids = _add_video_with_segments(
-        db,
-        subject_id=subject_id,
-        youtube_video_id="synthetic-organization-correction-boundary",
-        published_at=datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
-        texts=(
-            "Synthetic presenter organization statement.",
-            "Synthetic guest organization statement.",
-            "Synthetic interviewer organization statement.",
-        ),
-        channel_index=41,
-    )
-    organization_assignments = SpeakerAssignmentService(
-        db,
-        clock=lambda: FIXED_UTC,
-    )
-    assert organization_assignments.assign_organization_video(
-        subject_id,
-        video_id,
-    ) == segment_ids
-
-    with pytest.raises(DomainError) as error:
-        SpeakerCorrectionService(db).correct(
-            SpeakerCorrection(
-                segment_ids[1],
-                assignment_kind,
-                subject_id if uses_organization_subject else None,
-                "user",
-                "Synthetic prohibited organization correction",
-            )
-        )
-
-    assert error.value.code == "ORGANIZATION_SPEAKER_CORRECTION_FORBIDDEN"
-    assignments = SpeakerRepository(db).list_assignments(segment_ids)
-    assert tuple(row.segment_id for row in assignments) == segment_ids
-    assert {row.assignment_kind for row in assignments} == {
-        AssignmentKind.SUBJECT
-    }
-    assert {row.assignment_origin for row in assignments} == {
-        AssignmentOrigin.CHANNEL_ORGANIZATION
-    }
-
-    run = _begin(db, _create_job_for_input(db, subject_id))
-    assert tuple(
-        row.segment_id for row in AnalysisRepository(db).get_input_segments(run.id)
-    ) == segment_ids
-
-    assert organization_assignments.assign_organization_video(
-        subject_id,
-        video_id,
-    ) == segment_ids
-    reassigned = SpeakerRepository(db).list_assignments(segment_ids)
-    assert tuple(row.segment_id for row in reassigned) == segment_ids
-    assert {row.assignment_kind for row in reassigned} == {
-        AssignmentKind.SUBJECT
-    }
-    assert {row.assignment_origin for row in reassigned} == {
-        AssignmentOrigin.CHANNEL_ORGANIZATION
-    }
-
-
-def test_organization_scope_excludes_manual_subject_assignment(db):
-    subject_id = _create_subject(
-        db,
-        "Synthetic Organization Manual Boundary",
-        SubjectKind.ORGANIZATION,
-        channel_index=5,
-    )
-    _, segment_ids = _add_video_with_segments(
-        db,
-        subject_id=subject_id,
-        youtube_video_id="synthetic-organization-manual",
-        published_at=datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
-        texts=("Synthetic manual organization assignment.",),
-        channel_index=5,
-    )
-    _save_assignment(
-        db,
-        segment_id=segment_ids[0],
-        kind=AssignmentKind.SUBJECT,
-        subject_id=subject_id,
-        evidence_hash="manual-organization-evidence-v1",
-    )
-
-    run = _begin(db, _create_job_for_input(db, subject_id))
-
-    assert AnalysisRepository(db).get_input_segments(run.id) == ()
-
-
 def test_distinct_repost_video_segments_with_identical_text_are_not_deduplicated(db):
     subject_id = _create_subject(
-        db, "Synthetic Repost Person", SubjectKind.PERSON, channel_index=6
+        db, "Synthetic Repost Person", channel_index=6
     )
     inserted = []
     for youtube_video_id in ("synthetic-repost-b", "synthetic-repost-a"):
@@ -653,15 +485,10 @@ def test_analysis_job_for_different_input_contract_is_rejected_atomically(db):
             "WHERE assigned_subject_id=?",
             "changed-assignment-evidence",
         ),
-        (
-            "UPDATE subject_channel_policies SET policy_hash=? "
-            "WHERE subject_id=?",
-            "changed-policy-hash",
-        ),
     ],
-    ids=["assignment", "policy"],
+    ids=["assignment"],
 )
-def test_begin_recomputes_current_policy_and_assignment_contract(db, drift_sql):
+def test_begin_recomputes_current_assignment_contract(db, drift_sql):
     prepared = _prepare_personal_analysis(db)
     statement, changed_value = drift_sql
     db.execute(statement, (changed_value, prepared.subject_id))
@@ -673,118 +500,9 @@ def test_begin_recomputes_current_policy_and_assignment_contract(db, drift_sql):
     assert db.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 0
 
 
-def test_unchanged_eligibility_reevaluation_time_does_not_change_input(db):
-    prepared = _prepare_personal_analysis(db)
-    eligible_video_ids = tuple(
-        row["video_id"]
-        for row in db.execute(
-            """
-            SELECT video_id
-            FROM subject_video_eligibility
-            WHERE subject_id=?
-            ORDER BY video_id
-            """,
-            (prepared.subject_id,),
-        )
-    )
-    for video_id in eligible_video_ids:
-        ChannelPolicyService(db).evaluate(
-            prepared.subject_id, video_id, DiscoveryMethod.AUTO_SEARCH
-        )
-
-    run = _begin(db, prepared)
-
-    assert tuple(
-        item.segment_id
-        for item in AnalysisRepository(db).get_input_segments(run.id)
-    ) == prepared.expected_segment_ids
-
-
-def test_empty_input_contract_changes_with_current_policy_hash(db):
-    subject_id = _create_subject(
-        db, "Synthetic Empty Policy Person", SubjectKind.PERSON, channel_index=8
-    )
-    service = AnalysisRunService(db)
-    first = service.preview_input_contract(
-        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
-    )
-    assert db.execute("SELECT COUNT(*) FROM transcript_segments").fetchone()[0] == 0
-
-    db.execute(
-        "UPDATE subject_channel_policies SET policy_hash=? WHERE subject_id=?",
-        ("synthetic-empty-policy-v2", subject_id),
-    )
-    second = service.preview_input_contract(
-        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
-    )
-
-    assert second != first
-
-
-def test_empty_input_contract_ignores_policy_display_and_update_time(db):
-    subject_id = _create_subject(
-        db,
-        "Synthetic Empty Policy Metadata Person",
-        SubjectKind.PERSON,
-        channel_index=9,
-    )
-    service = AnalysisRunService(db)
-    first = service.preview_input_contract(
-        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
-    )
-
-    db.execute(
-        """
-        UPDATE subject_channel_policies
-        SET channel_display_name=?, updated_at=?
-        WHERE subject_id=?
-        """,
-        ("Changed display only", "2026-09-01T00:00:00.000000Z", subject_id),
-    )
-    second = service.preview_input_contract(
-        subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
-    )
-
-    assert second == first
-
-
-def test_configuration_required_policy_rejects_preview_and_begin(db):
-    subject_id = _create_subject(
-        db,
-        "Synthetic Configuration Required Person",
-        SubjectKind.PERSON,
-        channel_index=10,
-    )
-    prepared = _create_job_for_input(db, subject_id)
-    db.execute(
-        """
-        UPDATE subject_channel_policies
-        SET configuration_status=?, policy_hash=?
-        WHERE subject_id=?
-        """,
-        (
-            ConfigurationStatus.CONFIGURATION_REQUIRED.value,
-            "synthetic-configuration-required-policy",
-            subject_id,
-        ),
-    )
-
-    with pytest.raises(DomainError) as preview_error:
-        AnalysisRunService(db).preview_input_contract(
-            subject_id, CUTOFF_DAY, AnalysisRunSettings.required()
-        )
-    assert preview_error.value.code == "ANALYSIS_POLICY_NOT_CONFIGURED"
-
-    with pytest.raises(DomainError) as begin_error:
-        _begin(db, prepared)
-    assert begin_error.value.code == "ANALYSIS_POLICY_NOT_CONFIGURED"
-    assert db.execute("SELECT COUNT(*) FROM analysis_scopes").fetchone()[0] == 0
-    assert db.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 0
-
-
 def test_preview_is_read_only(db):
     subject_id = _create_subject(
-        db, "Synthetic Preview Person", SubjectKind.PERSON, channel_index=7
+        db, "Synthetic Preview Person", channel_index=7
     )
 
     first = AnalysisRunService(db).preview_input_contract(

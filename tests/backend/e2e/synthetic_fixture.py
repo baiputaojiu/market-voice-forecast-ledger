@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from market_voice_forecast_ledger.api import dependencies
 from market_voice_forecast_ledger.api.app import create_app
+from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
@@ -25,18 +27,14 @@ from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
     ConditionKind,
     Confidence,
-    ConfigurationStatus,
     DirectionKind,
-    DiscoveryMethod,
     ForecastBasis,
     HeatmapGranularity,
     JobKind,
     JobStage,
     MappingReviewDecision,
     PeriodReviewDecision,
-    PolicyKind,
     StatementType,
-    SubjectKind,
     TurningPointKind,
     UnitStatus,
 )
@@ -57,11 +55,6 @@ from market_voice_forecast_ledger.domain.jobs import (
 )
 from market_voice_forecast_ledger.domain.mappings import AssetMapping
 from market_voice_forecast_ledger.domain.periods import NormalizedPeriod
-from market_voice_forecast_ledger.domain.sources import (
-    ChannelPolicy,
-    VideoInput,
-    VideoRecord,
-)
 from market_voice_forecast_ledger.domain.speakers import (
     PersonalAssignmentCommand,
     ScoreRule,
@@ -76,7 +69,6 @@ from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
 from market_voice_forecast_ledger.repositories.sources import SourceRepository
 from market_voice_forecast_ledger.services.analysis_runs import AnalysisRunService
 from market_voice_forecast_ledger.services.asset_mapping import AssetMappingService
-from market_voice_forecast_ledger.services.channel_policy import ChannelPolicyService
 from market_voice_forecast_ledger.services.codex_contract import (
     CODEX_BATCH_UNIT_KEY,
     AnalysisEnvelope,
@@ -111,6 +103,18 @@ from market_voice_forecast_ledger.services.speaker_assignment import (
     SpeakerAssignmentService,
 )
 from market_voice_forecast_ledger.services.statements import StatementService
+from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
+from market_voice_forecast_ledger.workers.scheduled_sync import (
+    WorkerDependencies,
+    WorkerSummary,
+    run_once,
+)
+from market_voice_forecast_ledger.windows.task_scheduler import (
+    ScheduledTaskStatus,
+)
+from tests.backend.synthetic_collection_fixture import (
+    create_synthetic_collection_candidate,
+)
 
 
 UTC: Final = timezone.utc
@@ -125,6 +129,29 @@ SYNTHETIC_THRESHOLD: Final = SpeakerThresholdConfig(
     subject_rule=ScoreRule("gte", 0.8),
     interviewer_rule=ScoreRule("lte", 0.2),
 )
+SYNTHETIC_YOUTUBE_SYNC_AT: Final = datetime(
+    2026, 8, 18, 3, 4, 5, tzinfo=UTC
+)
+SYNTHETIC_DISCOVERY: Final = MappingProxyType(
+    {
+        "木野内栄治": {
+            "seed": ("vidseed0001",),
+            "search": ("vidshared01",),
+        },
+        "大川智宏": {
+            "seed": (),
+            "search": ("vidsearch02",),
+        },
+        "江守哲": {
+            "seed": ("vidseed0003",),
+            "search": ("vidextern03",),
+        },
+        "千竈 鉄平": {
+            "seed": ("vidseed0004",),
+            "search": ("vidshared01",),
+        },
+    }
+)
 _SUBJECT_ROLES: Final = (
     "personal_japan",
     "organization_us",
@@ -135,22 +162,18 @@ _SUBJECT_DEFINITIONS: Final = MappingProxyType(
     {
         "personal_japan": (
             "Synthetic Personal Japan",
-            SubjectKind.PERSON,
             1,
         ),
         "organization_us": (
             "Synthetic Organization US",
-            SubjectKind.ORGANIZATION,
             2,
         ),
         "conflict_history": (
             "Synthetic Conflict History",
-            SubjectKind.PERSON,
             3,
         ),
         "review_boundary": (
             "Synthetic Review Boundary",
-            SubjectKind.PERSON,
             4,
         ),
     }
@@ -187,9 +210,15 @@ class SyntheticStatementSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class SyntheticVideo:
+    id: int
+    published_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SyntheticSource:
     label: str
-    video: VideoRecord
+    video: SyntheticVideo
     segment_id: int
     body: str
 
@@ -260,7 +289,7 @@ class SyntheticFlowEvidence:
     api_month: dict[str, object]
     mapping_review_evidence: tuple[MappingReviewEvidence, ...]
     period_review_evidence: tuple[PeriodReviewEvidence, ...]
-    later_source: VideoRecord
+    later_source: SyntheticVideo
     later_segment_id: int
     original_video_id: int
     repost_video_id: int
@@ -290,7 +319,7 @@ class SyntheticFlowEvidence:
         return sum(receipt.tool_call_count for receipt in self.receipts)
 
     @property
-    def input_sources(self) -> tuple[VideoRecord, ...]:
+    def input_sources(self) -> tuple[SyntheticVideo, ...]:
         return tuple(source.video for run in self.runs for source in run.sources)
 
     @property
@@ -473,6 +502,180 @@ class CrashPromotionFixture:
         return self.pending_run.batch.id
 
 
+@dataclass(frozen=True, slots=True)
+class SyntheticYouTubeCollectionEvidence:
+    settings: Settings
+    job_id: int
+    worker_summary: WorkerSummary
+    safe_requests: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
+    credential_read_count: int
+    schedule_status_count: int
+    sleeper_delays: tuple[float, ...]
+
+
+class _SyntheticYouTubeCredentialStore:
+    def __init__(self) -> None:
+        self.read_count = 0
+
+    def set_api_key(self, _api_key: str) -> None:
+        raise AssertionError("synthetic collection must not write credentials")
+
+    def has_api_key(self) -> bool:
+        return True
+
+    def read_api_key(self) -> str:
+        self.read_count += 1
+        return "synthetic-youtube-key-000001"
+
+    def delete_api_key(self) -> bool:
+        raise AssertionError("synthetic collection must not delete credentials")
+
+
+class _SyntheticScheduleReader:
+    def __init__(self) -> None:
+        self.status_count = 0
+
+    def status(self) -> ScheduledTaskStatus:
+        self.status_count += 1
+        return ScheduledTaskStatus.unavailable()
+
+
+class _SyntheticYouTubeTransport:
+    _SEED_NAMES = {
+        "UCJ1DVBLVpe4FvBZZ94kreaQ": "木野内栄治",
+        "UCVXka7buS_WptsAzSE0LcKg": "江守哲",
+        "UCOfzLmXpI3qmZfV7_Cs1sYA": "千竈 鉄平",
+    }
+    _SEARCH_NAMES = {
+        "木野内栄治": "木野内栄治",
+        "大川智宏": "大川智宏",
+        "江守哲": "江守哲",
+        "千竈鉄平|千竃鉄平": "千竈 鉄平",
+    }
+
+    def __init__(self) -> None:
+        self.safe_requests: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+
+    def get_json(
+        self,
+        endpoint: str,
+        params: Mapping[str, str],
+        api_key: str,
+    ) -> dict[str, object]:
+        safe_params = dict(params)
+        if any(
+            type(key) is not str or type(value) is not str
+            for key, value in safe_params.items()
+        ):
+            raise AssertionError("synthetic transport received unsafe parameters")
+        if api_key != "synthetic-youtube-key-000001":
+            raise AssertionError("synthetic transport received an unexpected credential")
+        self.safe_requests.append((endpoint, tuple(sorted(safe_params.items()))))
+
+        if endpoint == "channels":
+            channel_ids = tuple(safe_params["id"].split(","))
+            if any(channel_id not in self._SEED_NAMES for channel_id in channel_ids):
+                raise AssertionError("synthetic transport received an unknown seed")
+            return {
+                "items": [
+                    {
+                        "id": channel_id,
+                        "contentDetails": {
+                            "relatedPlaylists": {
+                                "uploads": "UU" + channel_id[2:],
+                            }
+                        },
+                    }
+                    for channel_id in channel_ids
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint == "playlistItems":
+            playlist_id = safe_params["playlistId"]
+            channel_id = "UC" + playlist_id[2:]
+            name = self._SEED_NAMES.get(channel_id)
+            if name is None:
+                raise AssertionError("synthetic transport received an unknown playlist")
+            return {
+                "items": [
+                    {
+                        "kind": "youtube#playlistItem",
+                        "snippet": {
+                            "playlistId": playlist_id,
+                            "resourceId": {
+                                "kind": "youtube#video",
+                                "videoId": video_id,
+                            },
+                        },
+                        "contentDetails": {"videoId": video_id},
+                    }
+                    for video_id in SYNTHETIC_DISCOVERY[name]["seed"]
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint == "search":
+            name = self._SEARCH_NAMES.get(safe_params["q"])
+            if name is None:
+                raise AssertionError("synthetic transport received an unknown search")
+            return {
+                "items": [
+                    {
+                        "kind": "youtube#searchResult",
+                        "id": {
+                            "kind": "youtube#video",
+                            "videoId": video_id,
+                        },
+                    }
+                    for video_id in SYNTHETIC_DISCOVERY[name]["search"]
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint == "videos":
+            video_ids = tuple(safe_params["id"].split(","))
+            known_ids = {
+                video_id
+                for sources in SYNTHETIC_DISCOVERY.values()
+                for discovered in sources.values()
+                for video_id in discovered
+            }
+            if any(video_id not in known_ids for video_id in video_ids):
+                raise AssertionError("synthetic transport received an unknown video")
+            return {
+                "items": [
+                    _synthetic_youtube_metadata_item(video_id)
+                    for video_id in video_ids
+                ],
+                "nextPageToken": None,
+            }
+        raise AssertionError("synthetic transport received an unknown endpoint")
+
+
+def _synthetic_youtube_metadata_item(video_id: str) -> dict[str, object]:
+    return {
+        "kind": "youtube#video",
+        "id": video_id,
+        "snippet": {
+            "publishedAt": "2026-08-10T01:02:03Z",
+            "channelId": "UCSyntheticChannel000001",
+            "channelTitle": "Synthetic Provider Channel",
+            "title": f"Synthetic collection item {video_id}",
+            "description": "Synthetic metadata for collection verification.",
+            "liveBroadcastContent": "none",
+            "tags": ["synthetic", "collection"],
+        },
+        "contentDetails": {
+            "duration": "PT12M34S",
+            "licensedContent": False,
+        },
+        "status": {
+            "privacyStatus": "public",
+            "uploadStatus": "processed",
+            "embeddable": True,
+            "publicStatsViewable": True,
+        },
+    }
+
+
 class DeterministicCodexAnalysisService:
     """In-process test double that crosses the real validated output boundary."""
 
@@ -506,28 +709,13 @@ def _channel_id(index: int) -> str:
     return f"UC{index:022d}"
 
 
-def _create_subject_and_policy(
+def _create_subject(
     conn: sqlite3.Connection,
     name: str,
-    kind: SubjectKind,
     channel_index: int,
 ) -> int:
-    sources = SourceRepository(conn)
-    subject_id = sources.create_subject(name, kind)
-    if kind is SubjectKind.ORGANIZATION:
-        policy = ChannelPolicy(
-            policy_kind=PolicyKind.FIXED_CHANNEL,
-            configuration_status=ConfigurationStatus.CONFIGURED,
-            youtube_channel_id=_channel_id(channel_index),
-            channel_display_name=f"Synthetic Channel {channel_index}",
-        )
-    else:
-        policy = ChannelPolicy(
-            policy_kind=PolicyKind.ALL_CHANNELS,
-            configuration_status=ConfigurationStatus.CONFIGURED,
-        )
-    sources.create_policy(subject_id, policy)
-    return subject_id
+    del channel_index
+    return SourceRepository(conn).create_subject(name)
 
 
 def _ensure_personal_threshold(conn: sqlite3.Connection) -> None:
@@ -579,7 +767,6 @@ def _create_source(
     conn: sqlite3.Connection,
     *,
     subject_id: int,
-    subject_kind: SubjectKind,
     channel_index: int,
     label: str,
     youtube_video_id: str,
@@ -589,69 +776,28 @@ def _create_source(
     expires_at: datetime | None = None,
     chunk_input_hash: str | None = None,
 ) -> SyntheticSource:
-    sources = SourceRepository(conn)
-    policy = sources.get_policy(subject_id)
-    video_id = sources.upsert_video(
-        VideoInput(
-            youtube_video_id=youtube_video_id,
-            youtube_channel_id=policy.youtube_channel_id or _channel_id(channel_index),
-            channel_display_name=f"Synthetic Channel {channel_index}",
-            title=f"Synthetic Source {youtube_video_id}",
-            published_at=published_at,
-            duration_seconds=12,
-            live_kind="upload",
-        )
-    )
-    decision = ChannelPolicyService(conn).evaluate(
-        subject_id,
-        video_id,
-        DiscoveryMethod.AUTO_SEARCH,
-    )
-    if not decision.may_analyze:
-        raise AssertionError("synthetic source unexpectedly ineligible")
-
-    speakers = SpeakerRepository(conn)
-    chunk_id = speakers.add_chunk(
-        video_id=video_id,
-        chunk_no=0,
-        start_ms=0,
-        end_ms=12_000,
-        input_hash=(
-            chunk_input_hash
-            or f"synthetic-chunk-input-{youtube_video_id}"
-        ),
-        output_hash=f"synthetic-chunk-output-{youtube_video_id}",
-        status=UnitStatus.SUCCESS,
-    )
-    segment_id = speakers.add_segment(
-        video_id=video_id,
-        chunk_id=chunk_id,
-        segment_no=0,
-        start_ms=1_000,
-        end_ms=9_000,
+    del channel_index, chunk_input_hash
+    fixture = create_synthetic_collection_candidate(
+        conn,
+        presence_state="presence_confirmed",
+        assignment_kind="subject",
+        subject_id=subject_id,
+        youtube_video_id=youtube_video_id,
+        published_at=published_at,
         text_body=body,
-        anonymous_speaker_id=f"synthetic-speaker-{youtube_video_id}",
         transcript_created_at=SYNTHETIC_CREATED_AT,
         expires_at=expires_at,
     )
-    if subject_kind is SubjectKind.ORGANIZATION:
-        assigned = SpeakerAssignmentService(
-            conn,
-            clock=_synthetic_clock,
-        ).assign_organization_video(subject_id, video_id)
-        if assigned != (segment_id,):
-            raise AssertionError("organization assignment did not cover source")
-    else:
-        _record_personal_assignment(
-            conn,
-            subject_id,
-            segment_id,
-            assignment_kind,
-        )
+    _record_personal_assignment(
+        conn,
+        subject_id,
+        fixture.segment_id,
+        assignment_kind,
+    )
     return SyntheticSource(
         label=label,
-        video=sources.get_video(video_id),
-        segment_id=segment_id,
+        video=SyntheticVideo(fixture.video_id, published_at),
+        segment_id=fixture.segment_id,
         body=body,
     )
 
@@ -848,7 +994,6 @@ def _create_and_execute_subject(
     *,
     role: str,
     subject_id: int,
-    subject_kind: SubjectKind,
     channel_index: int,
     cutoff_day: date,
     specs: tuple[SyntheticStatementSpec, ...],
@@ -858,7 +1003,6 @@ def _create_and_execute_subject(
         _create_source(
             conn,
             subject_id=subject_id,
-            subject_kind=subject_kind,
             channel_index=channel_index,
             label=spec.label,
             youtube_video_id=spec.youtube_video_id,
@@ -1113,11 +1257,10 @@ class SyntheticLedgerFixture:
         self._conn = open_database(self.settings.database_path)
         apply_migrations(self._conn)
         for role in self.subject_order:
-            name, kind, channel_index = _SUBJECT_DEFINITIONS[role]
-            self._subject_ids[role] = _create_subject_and_policy(
+            name, channel_index = _SUBJECT_DEFINITIONS[role]
+            self._subject_ids[role] = _create_subject(
                 self._conn,
                 name,
-                kind,
                 channel_index,
             )
         return self
@@ -1142,7 +1285,7 @@ class SyntheticLedgerFixture:
         later_source: SyntheticSource | None = None
 
         for role in self.subject_order:
-            name, subject_kind, channel_index = _SUBJECT_DEFINITIONS[role]
+            name, channel_index = _SUBJECT_DEFINITIONS[role]
             subject_id = self._subject_ids[role]
             specs = _e2e_specs(role)
             if role == "personal_japan":
@@ -1150,7 +1293,6 @@ class SyntheticLedgerFixture:
                     _create_source(
                         conn,
                         subject_id=subject_id,
-                        subject_kind=subject_kind,
                         channel_index=channel_index,
                         label=spec.label,
                         youtube_video_id=spec.youtube_video_id,
@@ -1162,7 +1304,6 @@ class SyntheticLedgerFixture:
                 later_source = _create_source(
                     conn,
                     subject_id=subject_id,
-                    subject_kind=subject_kind,
                     channel_index=channel_index,
                     label="post-cutoff",
                     youtube_video_id="synjp999999",
@@ -1182,7 +1323,6 @@ class SyntheticLedgerFixture:
                     conn,
                     role=role,
                     subject_id=subject_id,
-                    subject_kind=subject_kind,
                     channel_index=channel_index,
                     cutoff_day=SYNTHETIC_CUTOFF,
                     specs=specs,
@@ -1323,17 +1463,15 @@ def create_accepted_low_mapping_fixture(
         0 <= additional_active_subjects <= 3
     ):
         raise ValueError("additional_active_subjects must be from zero to three")
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Low Mapping Subject",
-        SubjectKind.PERSON,
         81,
     )
     for ordinal in range(additional_active_subjects):
-        _create_subject_and_policy(
+        _create_subject(
             conn,
             f"Synthetic Empty Heatmap Subject {ordinal + 1}",
-            SubjectKind.PERSON,
             90 + ordinal,
         )
     spec = SyntheticStatementSpec(
@@ -1354,7 +1492,6 @@ def create_accepted_low_mapping_fixture(
         conn,
         role="accepted-low-mapping",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=81,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(spec,),
@@ -1368,10 +1505,9 @@ def create_accepted_unknown_period_fixture(
     conn: sqlite3.Connection,
     label: str = "unknown-review",
 ) -> tuple[PreparedSyntheticRun, ForecastProjectionBatch, int]:
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Unknown Period Subject",
-        SubjectKind.PERSON,
         82,
     )
     spec = SyntheticStatementSpec(
@@ -1389,7 +1525,6 @@ def create_accepted_unknown_period_fixture(
         conn,
         role="accepted-unknown-period",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=82,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(spec,),
@@ -1418,26 +1553,22 @@ def create_speaker_correction_fixture(
     initial_kind: AssignmentKind = AssignmentKind.SUBJECT,
 ) -> SpeakerFixture:
     sources = SourceRepository(conn)
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Corrected Person",
-        SubjectKind.PERSON,
         100,
     )
     wrong_subject_id = sources.create_subject(
         "Synthetic Unrelated Person",
-        SubjectKind.PERSON,
     )
     inactive_subject_id = sources.create_subject(
         "Synthetic Inactive Person",
-        SubjectKind.PERSON,
     )
     _deactivate_negative_control_subject(conn, inactive_subject_id)
 
     source = _create_source(
         conn,
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=100,
         label="speaker-correction",
         youtube_video_id="synspk00001",
@@ -1486,10 +1617,9 @@ def create_retained_forecast_fixture(
     conn: sqlite3.Connection,
     tmp_path: Path,
 ) -> RetainedForecastFixture:
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Retention Subject",
-        SubjectKind.PERSON,
         83,
     )
     source_body = (
@@ -1509,7 +1639,6 @@ def create_retained_forecast_fixture(
         conn,
         role="retained-forecast",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=83,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(spec,),
@@ -1534,17 +1663,15 @@ def create_retained_forecast_fixture(
 def create_crash_promotion_fixture(
     conn: sqlite3.Connection,
 ) -> CrashPromotionFixture:
-    subject_id = _create_subject_and_policy(
+    subject_id = _create_subject(
         conn,
         "Synthetic Crash Recovery Subject",
-        SubjectKind.PERSON,
         84,
     )
     old_run = _create_and_execute_subject(
         conn,
         role="crash-old-current",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=84,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(
@@ -1563,7 +1690,6 @@ def create_crash_promotion_fixture(
         conn,
         role="crash-pending-current",
         subject_id=subject_id,
-        subject_kind=SubjectKind.PERSON,
         channel_index=84,
         cutoff_day=SYNTHETIC_CUTOFF,
         specs=(
@@ -1599,4 +1725,44 @@ def create_crash_promotion_fixture(
         old_run=old_run,
         pending_run=pending_run,
         artifact_hashes=tuple(artifact_hashes),
+    )
+
+
+def run_synthetic_youtube_collection(
+    tmp_path: Path,
+) -> SyntheticYouTubeCollectionEvidence:
+    settings = Settings.for_data_dir(Path(tmp_path) / "youtube-collection-runtime")
+    conn = open_database(settings.database_path)
+    try:
+        apply_migrations(conn)
+        bootstrap_reference_data(conn)
+        request = YouTubeSyncService(
+            conn,
+            clock=lambda: SYNTHETIC_YOUTUBE_SYNC_AT,
+        ).request_full_sync(SYNTHETIC_YOUTUBE_SYNC_AT)
+    finally:
+        conn.close()
+
+    credential_store = _SyntheticYouTubeCredentialStore()
+    transport = _SyntheticYouTubeTransport()
+    schedule_reader = _SyntheticScheduleReader()
+    sleeper_delays: list[float] = []
+    summary = run_once(
+        settings,
+        WorkerDependencies(
+            credential_store=credential_store,
+            transport=transport,
+            schedule_reader=schedule_reader,
+            clock=lambda: SYNTHETIC_YOUTUBE_SYNC_AT,
+            sleeper=sleeper_delays.append,
+        ),
+    )
+    return SyntheticYouTubeCollectionEvidence(
+        settings=settings,
+        job_id=request.job_id,
+        worker_summary=summary,
+        safe_requests=tuple(transport.safe_requests),
+        credential_read_count=credential_store.read_count,
+        schedule_status_count=schedule_reader.status_count,
+        sleeper_delays=tuple(sleeper_delays),
     )

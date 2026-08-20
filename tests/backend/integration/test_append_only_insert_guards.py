@@ -27,16 +27,16 @@ def _video_manifest() -> JobManifest:
     )
 
 
-def test_migration_runner_records_0017_once_and_remains_idempotent(tmp_path):
+def test_migration_runner_records_0018_once_and_remains_idempotent(tmp_path):
     conn = open_database(tmp_path / "runner.sqlite3")
     try:
         first = apply_migrations(conn)
         second = apply_migrations(conn)
-        assert first[-1] == "0017_append_only_guards"
+        assert first[-1] == "0018_youtube_discovery_cutover"
         assert second == ()
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "
-            "WHERE name='0017_append_only_guards'"
+            "WHERE name='0018_youtube_discovery_cutover'"
         ).fetchone()[0] == 1
     finally:
         conn.close()
@@ -54,6 +54,18 @@ def populated_database(tmp_path_factory) -> Path:
         subject_id = conn.execute(
             "SELECT id FROM analysis_subjects ORDER BY id LIMIT 1"
         ).fetchone()[0]
+        profile_version_id = conn.execute(
+            "SELECT id FROM discovery_profile_versions ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        if conn.execute(
+            "SELECT COUNT(*) FROM discovery_seed_channels"
+        ).fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO discovery_seed_channels("
+                "profile_version_id, ordinal, youtube_channel_id"
+                ") VALUES (?, 1, 'UCabcdefghijklmnopqrstuv')",
+                (profile_version_id,),
+            )
         conn.execute(
             """
             INSERT INTO voice_reference_profiles(
@@ -65,12 +77,11 @@ def populated_database(tmp_path_factory) -> Path:
             """,
             (subject_id, threshold),
         )
-        eligibility_id = conn.execute(
-            "SELECT id FROM subject_video_eligibility "
-            "WHERE status='eligible' ORDER BY id LIMIT 1"
+        candidate_id = conn.execute(
+            "SELECT id FROM subject_video_candidates ORDER BY id LIMIT 1"
         ).fetchone()[0]
         JobStateService(conn).create_video_pipeline(
-            _video_manifest(), (eligibility_id,)
+            _video_manifest(), (candidate_id,)
         )
         conn.execute(
             """
@@ -128,10 +139,10 @@ def populated_database(tmp_path_factory) -> Path:
         )
         conn.execute(
             """
-            INSERT INTO video_pipeline_job_bindings(job_id, eligibility_id)
+            INSERT INTO video_pipeline_job_bindings(job_id, candidate_id)
             VALUES (900103, ?)
             """,
-            (eligibility_id,),
+            (candidate_id,),
         )
         database_path = fixture.settings.database_path
     return database_path
@@ -140,6 +151,12 @@ def populated_database(tmp_path_factory) -> Path:
 _COLLISION_TABLES = (
     ("schema_migrations", "APPEND_ONLY"),
     ("audit_events", "APPEND_ONLY"),
+    ("discovery_profile_versions", "APPEND_ONLY"),
+    ("discovery_seed_channels", "APPEND_ONLY"),
+    ("discovery_search_terms", "APPEND_ONLY"),
+    ("video_metadata_snapshots", "APPEND_ONLY"),
+    ("discovery_observations", "APPEND_ONLY"),
+    ("presence_decisions", "APPEND_ONLY"),
     ("transcription_chunks", "APPEND_ONLY"),
     ("transcript_segments", "IMMUTABLE_TRANSCRIPT_BODY"),
     ("speaker_threshold_configs", "APPEND_ONLY"),
@@ -167,6 +184,152 @@ _COLLISION_TABLES = (
     ("video_pipeline_job_binding_sets", "IMMUTABLE_JOB_BINDING"),
     ("video_pipeline_job_bindings", "IMMUTABLE_JOB_BINDING"),
 )
+
+
+@pytest.mark.parametrize(
+    "table",
+    (
+        "discovery_profile_versions",
+        "discovery_seed_channels",
+        "discovery_search_terms",
+        "video_metadata_snapshots",
+        "discovery_observations",
+        "presence_decisions",
+    ),
+)
+def test_plain_sqlite_discovery_records_reject_raw_update_and_delete(
+    populated_database, table
+):
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        before = tuple(
+            tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")
+        )
+        assert before, table
+        first_column = conn.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchone()[1]
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            conn.execute(
+                f"UPDATE {table} SET {first_column}={first_column} "
+                f"WHERE rowid=(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1)"
+            )
+        conn.execute("ROLLBACK")
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            conn.execute(
+                f"DELETE FROM {table} "
+                f"WHERE rowid=(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1)"
+            )
+        conn.execute("ROLLBACK")
+        assert tuple(
+            tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")
+        ) == before
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "pointer_column"),
+    (
+        ("discovery_profiles", "current_version_id"),
+        ("videos", "current_metadata_snapshot_id"),
+        ("subject_video_candidates", "current_presence_decision_id"),
+    ),
+)
+def test_plain_sqlite_completed_discovery_pointers_cannot_be_cleared(
+    populated_database, table, pointer_column
+):
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE {pointer_column} IS NOT NULL "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        assert row is not None, table
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="POINTER_OWNER_MISMATCH"):
+            conn.execute(
+                f"UPDATE {table} SET {pointer_column}=NULL WHERE id=?",
+                (row["id"],),
+            )
+        conn.execute("ROLLBACK")
+
+        assert tuple(
+            conn.execute(
+                f"SELECT * FROM {table} WHERE id=?", (row["id"],)
+            ).fetchone()
+        ) == tuple(row)
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
+
+
+def test_plain_sqlite_discovery_construction_allows_initial_null_pointers(
+    populated_database,
+):
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            INSERT INTO discovery_profiles(
+                id, subject_id, current_version_id, is_active, created_at
+            ) VALUES (
+                990001, 990001, NULL, 1, '2026-08-18T00:00:00.000000Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO videos(
+                id, youtube_video_id, current_metadata_snapshot_id, created_at
+            ) VALUES (
+                990002, 'initial00001', NULL, '2026-08-18T00:00:00.000000Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO subject_video_candidates(
+                id, profile_id, video_id, first_observation_id,
+                current_presence_decision_id, created_at
+            ) VALUES (
+                990003, 990001, 990002, 990001, NULL,
+                '2026-08-18T00:00:00.000000Z'
+            )
+            """
+        )
+        assert conn.execute(
+            "SELECT current_version_id FROM discovery_profiles WHERE id=990001"
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT current_metadata_snapshot_id FROM videos WHERE id=990002"
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT current_presence_decision_id "
+            "FROM subject_video_candidates WHERE id=990003"
+        ).fetchone()[0] is None
+        conn.execute("ROLLBACK")
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
 
 
 @pytest.mark.parametrize(("table", "error_code"), _COLLISION_TABLES)

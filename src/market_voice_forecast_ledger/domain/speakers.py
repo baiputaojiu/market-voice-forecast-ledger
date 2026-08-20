@@ -83,6 +83,7 @@ class SpeakerAssignment:
     threshold_config_version: str | None
     evidence_hash: str
     assigned_at: datetime
+    id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

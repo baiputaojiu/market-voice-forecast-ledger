@@ -50,16 +50,27 @@ class JobStateService:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def create(self, manifest: JobManifest) -> int:
-        normalized = self._validate_manifest(manifest)
         with transaction(self._conn):
-            return self._jobs.create(
-                normalized, source_job_id=None, created_at=self._clock()
-            )
+            return self.create_in_transaction(manifest)
+
+    def create_in_transaction(
+        self,
+        manifest: JobManifest,
+        *,
+        created_at: datetime | None = None,
+    ) -> int:
+        self._require_transaction()
+        normalized = self._validate_manifest(manifest)
+        return self._jobs.create(
+            normalized,
+            source_job_id=None,
+            created_at=created_at or self._clock(),
+        )
 
     def create_video_pipeline(
         self,
         manifest: JobManifest,
-        eligibility_ids: list[int] | tuple[int, ...],
+        candidate_ids: list[int] | tuple[int, ...],
     ) -> int:
         normalized = self._validate_manifest(manifest)
         if normalized.kind is not JobKind.VIDEO_PIPELINE:
@@ -67,30 +78,30 @@ class JobStateService:
                 "VIDEO_PIPELINE_MANIFEST_REQUIRED",
                 "bound video creation requires a video-pipeline manifest",
             )
-        if type(eligibility_ids) not in {list, tuple}:
+        if type(candidate_ids) not in {list, tuple}:
             raise DomainError(
                 "INVALID_VIDEO_PIPELINE_BINDINGS",
                 "video-pipeline bindings require a list or tuple of ids",
             )
-        bindings = tuple(eligibility_ids)
+        bindings = tuple(candidate_ids)
         if (
             not bindings
             or any(
-                type(eligibility_id) is not int or eligibility_id <= 0
-                for eligibility_id in bindings
+                type(candidate_id) is not int or candidate_id <= 0
+                for candidate_id in bindings
             )
             or len(set(bindings)) != len(bindings)
         ):
             raise DomainError(
                 "INVALID_VIDEO_PIPELINE_BINDINGS",
-                "video-pipeline bindings require unique positive eligibility ids",
+                "video-pipeline bindings require unique positive candidate ids",
             )
         with transaction(self._conn):
             job_id = self._jobs.create(
                 normalized, source_job_id=None, created_at=self._clock()
             )
             self._jobs.create_sealed_video_pipeline_bindings(job_id, bindings)
-            self._require_video_pipeline_eligible(self._jobs.get(job_id))
+            self._require_video_pipeline_runnable(self._jobs.get(job_id))
             return job_id
 
     def create_successor(
@@ -122,7 +133,7 @@ class JobStateService:
                     "SUCCESSOR_KIND_MISMATCH",
                     "a successor must use the source job kind",
                 )
-            self._require_video_pipeline_eligible(source_job)
+            self._require_video_pipeline_runnable(source_job)
             self._stored_manifest(source_job)
             source_units = self._jobs.list_units(source_job_id)
             if any(
@@ -227,7 +238,7 @@ class JobStateService:
         input_changed = False
         with transaction(self._conn):
             job = self._jobs.get(job_id)
-            self._require_video_pipeline_eligible(job)
+            self._require_video_pipeline_runnable(job)
             unit = self._jobs.get_unit(job_id, unit_key)
             if unit.status is not UnitStatus.PENDING:
                 raise DomainError(
@@ -292,6 +303,76 @@ class JobStateService:
             )
         return self.unit(job_id, unit_key)
 
+    def begin_unit_in_transaction(
+        self,
+        job_id: int,
+        unit_key: str,
+        external_input_hash: str | None = None,
+        *,
+        started_at: datetime | None = None,
+    ) -> JobUnit:
+        self._require_transaction()
+        self._validate_hash(
+            external_input_hash,
+            "UNSAFE_EXTERNAL_INPUT_HASH",
+            allow_none=True,
+        )
+        job = self._jobs.get(job_id)
+        self._require_video_pipeline_runnable(job)
+        unit = self._jobs.get_unit(job_id, unit_key)
+        if unit.status is not UnitStatus.PENDING:
+            raise DomainError(
+                "JOB_UNIT_NOT_PENDING", "only a pending unit can begin"
+            )
+        if job.status not in {
+            JobStatus.QUEUED,
+            JobStatus.RUNNING,
+            JobStatus.RETRYING,
+        }:
+            raise DomainError(
+                "JOB_NOT_RUNNABLE", "job status does not allow a unit to begin"
+            )
+        units_by_key = {
+            item.unit_key: item for item in self._jobs.list_units(job_id)
+        }
+        dependency_outputs: list[str] = []
+        dependencies = sorted(
+            (units_by_key[key] for key in unit.dependency_keys),
+            key=lambda item: item.ordinal,
+        )
+        for dependency in dependencies:
+            if (
+                dependency.status is not UnitStatus.SUCCESS
+                or dependency.output_hash is None
+            ):
+                raise DomainError(
+                    "UNIT_DEPENDENCY_NOT_SUCCESS",
+                    "all declared dependencies must be successful",
+                )
+            dependency_outputs.append(dependency.output_hash)
+        computed_input = effective_input_hash(
+            unit.declared_input_hash,
+            dependency_outputs,
+            external_input_hash,
+        )
+        if unit.bound_input_hash is not None and (
+            unit.external_input_hash != external_input_hash
+            or unit.bound_input_hash != computed_input
+        ):
+            raise DomainError(
+                "UNIT_INPUT_CHANGED",
+                "a retried unit must use its originally bound input",
+            )
+        if job.status in {JobStatus.QUEUED, JobStatus.RETRYING}:
+            self._transition(job, JobStatus.RUNNING)
+        self._jobs.start_unit(
+            unit,
+            external_input_hash=external_input_hash,
+            bound_input_hash=computed_input,
+            started_at=started_at or self._clock(),
+        )
+        return self._jobs.get_unit(job_id, unit_key)
+
     def request_pause(self, job_id: int) -> JobStatus:
         with transaction(self._conn):
             job = self._jobs.get(job_id)
@@ -332,6 +413,9 @@ class JobStateService:
 
     def status(self, job_id: int) -> JobStatus:
         return self._jobs.get(job_id).status
+
+    def stored_manifest(self, job_id: int) -> JobManifest:
+        return self._stored_manifest(self._jobs.get(job_id))
 
     def unit(self, job_id: int, unit_key: str) -> JobUnit:
         return self._jobs.get_unit(job_id, unit_key)
@@ -463,7 +547,7 @@ class JobStateService:
             self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
         with transaction(self._conn):
             job = self._jobs.get(job_id)
-            self._require_video_pipeline_eligible(job)
+            self._require_video_pipeline_runnable(job)
             self._stored_manifest(job)
             if job.status in {JobStatus.STOPPED, JobStatus.CANCEL_REQUESTED}:
                 raise DomainError(
@@ -500,7 +584,7 @@ class JobStateService:
                 )
 
             if job.status is JobStatus.FAILED:
-                self._transition(job, JobStatus.RETRYING)
+                return self.retry_failed_in_transaction(job_id, artifact_hashes)
             elif job.status is JobStatus.PAUSED:
                 self._transition(job, JobStatus.RUNNING)
             elif job.status not in {
@@ -520,60 +604,45 @@ class JobStateService:
                 reset_failed=True,
             )
 
+    def retry_failed_in_transaction(
+        self, job_id: int, artifact_hashes: Mapping[str, str]
+    ) -> ResumePlan:
+        self._require_transaction()
+        for artifact_hash in artifact_hashes.values():
+            self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
+        job = self._jobs.get(job_id)
+        self._require_video_pipeline_runnable(job)
+        self._stored_manifest(job)
+        if job.status is not JobStatus.FAILED:
+            raise DomainError(
+                "FAILED_JOB_REQUIRED",
+                "retry requires the same failed job",
+            )
+        units = self._jobs.list_units(job_id)
+        if any(unit.status is UnitStatus.RUNNING for unit in units):
+            raise DomainError(
+                "INTERRUPTED_RECOVERY_REQUIRED",
+                "running attempts require explicit interrupted recovery",
+            )
+        self._transition(job, JobStatus.RETRYING)
+        return self._reset_and_plan(
+            job_id,
+            units,
+            artifact_hashes,
+            reset_running=False,
+            reset_failed=True,
+        )
+
     def recover_interrupted(
         self, job_id: int, artifact_hashes: Mapping[str, str]
     ) -> ResumePlan:
         for artifact_hash in artifact_hashes.values():
             self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
 
-        stopped = False
         with transaction(self._conn):
-            job = self._jobs.get(job_id)
-            self._stored_manifest(job)
-            units = self._jobs.list_units(job_id)
-
-            if job.status is JobStatus.CANCEL_REQUESTED:
-                plan = self._reset_and_plan(
-                    job_id,
-                    units,
-                    artifact_hashes,
-                    reset_running=True,
-                    reset_failed=True,
-                )
-                self._transition(job, JobStatus.STOPPED)
-                stopped = True
-            else:
-                self._require_video_pipeline_eligible(job)
-                if job.status is JobStatus.PAUSE_REQUESTED:
-                    plan = self._reset_and_plan(
-                        job_id,
-                        units,
-                        artifact_hashes,
-                        reset_running=True,
-                        reset_failed=True,
-                    )
-                    self._transition(job, JobStatus.PAUSED)
-                elif job.status is JobStatus.FAILED:
-                    plan = self._reset_and_plan(
-                        job_id,
-                        units,
-                        artifact_hashes,
-                        reset_running=True,
-                        reset_failed=True,
-                    )
-                elif job.status is JobStatus.RUNNING:
-                    plan = self._reset_and_plan(
-                        job_id,
-                        units,
-                        artifact_hashes,
-                        reset_running=True,
-                        reset_failed=True,
-                    )
-                else:
-                    raise DomainError(
-                        "JOB_NOT_RECOVERABLE",
-                        "job status has no interrupted worker to recover",
-                    )
+            plan, stopped = self._recover_interrupted_in_transaction(
+                job_id, artifact_hashes
+            )
 
         if stopped:
             raise DomainError(
@@ -581,6 +650,66 @@ class JobStateService:
                 "a stopped job can continue only through a successor",
             )
         return plan
+
+    def recover_interrupted_in_transaction(
+        self, job_id: int, artifact_hashes: Mapping[str, str]
+    ) -> ResumePlan:
+        self._require_transaction()
+        for artifact_hash in artifact_hashes.values():
+            self._validate_hash(artifact_hash, "UNSAFE_ARTIFACT_HASH")
+        plan, stopped = self._recover_interrupted_in_transaction(
+            job_id, artifact_hashes
+        )
+        if stopped:
+            raise DomainError(
+                "STOPPED_JOB_REQUIRES_SUCCESSOR",
+                "a stopped job can continue only through a successor",
+            )
+        return plan
+
+    def _recover_interrupted_in_transaction(
+        self, job_id: int, artifact_hashes: Mapping[str, str]
+    ) -> tuple[ResumePlan, bool]:
+        self._require_transaction()
+        job = self._jobs.get(job_id)
+        self._stored_manifest(job)
+        units = self._jobs.list_units(job_id)
+
+        if job.status is JobStatus.CANCEL_REQUESTED:
+            plan = self._reset_and_plan(
+                job_id,
+                units,
+                artifact_hashes,
+                reset_running=True,
+                reset_failed=True,
+            )
+            self._transition(job, JobStatus.STOPPED)
+            return plan, True
+
+        self._require_video_pipeline_runnable(job)
+        if job.status is JobStatus.PAUSE_REQUESTED:
+            plan = self._reset_and_plan(
+                job_id,
+                units,
+                artifact_hashes,
+                reset_running=True,
+                reset_failed=True,
+            )
+            self._transition(job, JobStatus.PAUSED)
+        elif job.status in {JobStatus.FAILED, JobStatus.RUNNING}:
+            plan = self._reset_and_plan(
+                job_id,
+                units,
+                artifact_hashes,
+                reset_running=True,
+                reset_failed=True,
+            )
+        else:
+            raise DomainError(
+                "JOB_NOT_RECOVERABLE",
+                "job status has no interrupted worker to recover",
+            )
+        return plan, False
 
     def _reset_and_plan(
         self,
@@ -657,14 +786,14 @@ class JobStateService:
             )
         return normalized
 
-    def _require_video_pipeline_eligible(self, job: StoredJob) -> None:
+    def _require_video_pipeline_runnable(self, job: StoredJob) -> None:
         if job.kind is not JobKind.VIDEO_PIPELINE:
             return
         bindings = self._jobs.list_video_pipeline_binding_ids(job.id)
-        if bindings and not self._jobs.has_current_eligible_video_binding(job.id):
+        if bindings and not self._jobs.has_current_runnable_video_binding(job.id):
             raise DomainError(
                 "VIDEO_PIPELINE_INELIGIBLE",
-                "bound video work requires a current eligible subject binding",
+                "bound video work requires a current non-rejected candidate",
             )
 
     def _stored_manifest(self, job: StoredJob) -> JobManifest:

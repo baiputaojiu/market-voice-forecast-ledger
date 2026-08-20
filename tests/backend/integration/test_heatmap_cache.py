@@ -16,7 +16,6 @@ from market_voice_forecast_ledger.domain.enums import (
     MappingReviewDecision,
     PeriodReviewDecision,
     ScopeStatus,
-    SubjectKind,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.forecasts import ProjectionTrigger
@@ -219,7 +218,7 @@ def test_read_cutoff_returns_four_assets_for_each_of_exactly_four_subjects(db):
     scope = AnalysisRepository(db).get_scope(scope_id)
     sources = SourceRepository(db)
     for ordinal in range(3):
-        sources.create_subject(f"Synthetic empty subject {ordinal}", SubjectKind.PERSON)
+        sources.create_subject(f"Synthetic empty subject {ordinal}")
     HeatmapService(db).rebuild_scope(scope_id)
 
     view = HeatmapService(db).read_cutoff(
@@ -261,7 +260,7 @@ def test_read_cutoff_fails_closed_for_malformed_active_subject_set(
     sources = SourceRepository(db)
     for ordinal in range(subject_count):
         sources.create_subject(
-            f"Synthetic malformed subject {ordinal}", SubjectKind.PERSON
+            f"Synthetic malformed subject {ordinal}"
         )
 
     with pytest.raises(DomainError) as error:

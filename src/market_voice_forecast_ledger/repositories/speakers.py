@@ -272,6 +272,7 @@ def _assignment_from_row(row: sqlite3.Row) -> SpeakerAssignment:
         threshold_config_version=row["threshold_config_version"],
         evidence_hash=row["evidence_hash"],
         assigned_at=_parse_utc(row["assigned_at"]),
+        id=row["id"],
     )
 
 

@@ -5,6 +5,7 @@ import pytest
 
 from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.db.migrate import apply_migrations
+from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
 from market_voice_forecast_ledger.services.current_results import CurrentResultService
 from tests.backend.integration.test_stale_transitions import (
@@ -37,7 +38,7 @@ def _legacy_generation_zero_scope_and_run(db):
     )
 
 
-def test_migrated_generation_zero_current_rows_remain_readable(tmp_path):
+def test_preexisting_generation_ledger_requires_reset_without_mutation(tmp_path):
     conn = open_database(tmp_path / "legacy-ledger.sqlite3")
     try:
         conn.execute(
@@ -48,20 +49,31 @@ def test_migrated_generation_zero_current_rows_remain_readable(tmp_path):
             "INSERT INTO schema_migrations(name, applied_at) "
             "VALUES ('0016_scope_generations', '2026-08-15T01:02:03.456789Z')"
         )
-        apply_migrations(conn)
-        scope_id, run_id = _legacy_generation_zero_scope_and_run(conn)
-        conn.execute(
-            "DELETE FROM schema_migrations WHERE name='0016_scope_generations'"
+        before = tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            )
         )
 
-        assert apply_migrations(conn) == ("0016_scope_generations",)
-        repository = AnalysisRepository(conn)
-        scope = repository.get_scope(scope_id)
-        run = repository.get_run(run_id)
+        with pytest.raises(DomainError, match="COLLECTION_MODEL_RESET_REQUIRED") as caught:
+            apply_migrations(conn)
 
-        assert scope.generation == 0
-        assert run.scope_generation == 0
-        assert CurrentResultService(conn).get_scope(scope_id).source_run_id == run_id
+        assert caught.value.code == "COLLECTION_MODEL_RESET_REQUIRED"
+        assert tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            )
+        ) == before
+        assert tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT name, applied_at FROM schema_migrations ORDER BY name"
+            )
+        ) == (("0016_scope_generations", "2026-08-15T01:02:03.456789Z"),)
     finally:
         conn.close()
 

@@ -55,7 +55,6 @@ from tests.backend.integration.test_analysis_input_boundaries import (
     _save_assignment,
 )
 from tests.backend.integration.test_statement_evidence import _valid_receipt
-from market_voice_forecast_ledger.domain.enums import SubjectKind
 
 
 UTC = timezone.utc
@@ -102,7 +101,6 @@ def _prepare_upstream(db, specs: tuple[StatementSpec, ...]) -> PreparedProjectio
     subject_id = _create_subject(
         db,
         f"Synthetic projection subject {db.execute('SELECT COUNT(*) FROM analysis_subjects').fetchone()[0]}",
-        SubjectKind.PERSON,
         channel_index=81,
     )
     segment_ids: list[int] = []
@@ -354,8 +352,10 @@ def test_projection_uses_frozen_run_publication_timestamp(db):
             StatementSpec("new-up", NEWER, DirectionKind.UP),
         ),
     )
+    db.execute("DROP TRIGGER video_metadata_snapshots_no_update")
     db.execute(
-        "UPDATE videos SET published_at=? WHERE id=?",
+        "UPDATE video_metadata_snapshots SET published_at=? "
+        "WHERE id=(SELECT current_metadata_snapshot_id FROM videos WHERE id=?)",
         ("2030-01-01T00:00:00.000000Z", prepared.video_ids[0]),
     )
 
@@ -370,6 +370,7 @@ def test_projection_uses_frozen_youtube_id_in_result_and_artifact_hash(db):
     prepared = _prepare_upstream(
         db, (StatementSpec("frozen-youtube-id", NEWER),)
     )
+    db.execute("DROP TRIGGER videos_limited_update")
     db.execute(
         "UPDATE videos SET youtube_video_id=? WHERE id=?",
         ("mutable-current-youtube-id", prepared.video_ids[0]),

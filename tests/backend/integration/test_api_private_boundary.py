@@ -25,6 +25,7 @@ from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
 from market_voice_forecast_ledger.services.heatmap import HeatmapService
 from market_voice_forecast_ledger.services.job_state import JobStateService
+from market_voice_forecast_ledger.windows.task_scheduler import TaskSchedulerAdapter
 
 
 FORBIDDEN_KEYS = {
@@ -39,6 +40,15 @@ FORBIDDEN_KEYS = {
     "declared_input_hash",
     "execution_contract_hash",
     "output_hash",
+    "query",
+    "search_terms",
+    "page_token",
+    "next_page_token",
+    "description",
+    "title",
+    "source_key",
+    "api_key",
+    "provider_body",
 }
 
 
@@ -163,6 +173,40 @@ def test_unexpected_exception_is_exact_private_internal_error(
     assert response.json() == {"error": "INTERNAL_ERROR"}
 
 
+def test_youtube_wake_failure_never_exposes_retry_credential_provider_or_path(
+    client: TestClient, settings: Settings, monkeypatch
+):
+    private_values = (
+        "private retry detail sentinel",
+        "synthetic-youtube-key-000001",
+        "C:/private/ledger.sqlite3",
+        "private provider body sentinel",
+    )
+
+    def fail_start(_self):
+        raise RuntimeError(" ".join(private_values))
+
+    monkeypatch.setattr(TaskSchedulerAdapter, "request_start", fail_start)
+
+    response = client.post("/api/youtube-syncs", json={})
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "YOUTUBE_SYNC_UNAVAILABLE"}
+    serialized_headers = repr(tuple(response.headers.items()))
+    for forbidden in private_values:
+        assert forbidden not in response.text
+        assert forbidden not in serialized_headers
+    conn = open_database(settings.database_path)
+    try:
+        row = conn.execute(
+            "SELECT status FROM jobs WHERE job_kind='youtube_sync'"
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "queued"
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     "code",
     (
@@ -245,26 +289,6 @@ def test_job_read_rejects_incoherent_header_and_unit_state(
         conn.close()
 
     response = client.get(f"/api/jobs/{job_id}")
-
-    assert response.status_code == 500
-    assert response.json() == {"error": "INTERNAL_ERROR"}
-
-
-def test_subject_read_revalidates_the_sealed_policy(
-    client: TestClient, settings: Settings
-):
-    conn = open_database(settings.database_path)
-    try:
-        conn.execute(
-            "UPDATE subject_channel_policies SET policy_hash=? "
-            "WHERE subject_id=(SELECT MIN(id) FROM analysis_subjects)",
-            ("0" * 64,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    response = client.get("/api/subjects")
 
     assert response.status_code == 500
     assert response.json() == {"error": "INTERNAL_ERROR"}

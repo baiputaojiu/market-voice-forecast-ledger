@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from market_voice_forecast_ledger.db.connection import transaction
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
-from market_voice_forecast_ledger.domain.enums import SubjectKind, UnitStatus
+from market_voice_forecast_ledger.domain.enums import UnitStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.jobs import (
     ASSET_MAPPING_UNIT_KEY,
@@ -140,17 +140,14 @@ class AssetMappingService:
     def _resolve_mappings(self, run_id: int) -> tuple[AssetMapping, ...]:
         run = self._analysis.get_run(run_id)
         scope = self._analysis.get_scope(run.scope_id)
-        subject_kind = self._analysis.get_active_subject_kind(scope.subject_id)
+        self._analysis.require_active_subject(scope.subject_id)
         statements = self._statements.list_run_statements(run_id)
         hints = self._hints_by_statement(run_id, statements)
-        interviewer_by_video = self._frozen_interviewer_evidence(
-            run_id, subject_kind
-        )
+        interviewer_by_video = self._frozen_interviewer_evidence(run_id)
 
         resolved: list[AssetMapping] = []
         for statement in statements:
             context = StatementContext(
-                subject_kind=subject_kind,
                 codex_asset_hints=hints[statement.id],
                 adopted_subject_evidence=self._surrounding_evidence(
                     statement, statements
@@ -163,24 +160,18 @@ class AssetMappingService:
         return tuple(resolved)
 
     def _frozen_interviewer_evidence(
-        self, run_id: int, subject_kind: SubjectKind
+        self, run_id: int
     ) -> dict[int, tuple[MarketEvidence, ...]]:
         try:
             metadata = json.loads(self._analysis.get_snapshot(run_id).metadata_json)
             if (
                 not isinstance(metadata, dict)
-                or metadata.get("subject_kind") != subject_kind.value
                 or "interviewer_market_context" not in metadata
             ):
                 raise ValueError
             raw_context = metadata["interviewer_market_context"]
             if not isinstance(raw_context, list):
                 raise ValueError
-            if subject_kind is SubjectKind.ORGANIZATION:
-                if raw_context:
-                    raise ValueError
-                return {}
-
             by_video: dict[int, list[MarketEvidence]] = {}
             seen_segment_ids: set[int] = set()
             for item in raw_context:

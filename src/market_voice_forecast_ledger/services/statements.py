@@ -10,10 +10,8 @@ from market_voice_forecast_ledger.domain.analysis import RunSegment
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.enums import (
     AssignmentKind,
-    AssignmentOrigin,
     JobStage,
     StatementType,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -171,7 +169,7 @@ class StatementService:
     ) -> tuple[_ResolvedStatement, ...]:
         run = self._analysis.get_run(run_id)
         scope = self._analysis.get_scope(run.scope_id)
-        subject_kind = self._analysis.get_active_subject_kind(scope.subject_id)
+        self._analysis.require_active_subject(scope.subject_id)
         ordered_envelopes = self._ordered_envelopes(run_id, job_id)
         evidence_segment_ids = tuple(
             dict.fromkeys(
@@ -203,7 +201,6 @@ class StatementService:
                     by_segment_id,
                     current_segments,
                     assignments,
-                    subject_kind,
                     scope.subject_id,
                 )
                 resolved.append(
@@ -314,7 +311,6 @@ class StatementService:
         run_segments: dict[int, RunSegment],
         current_segments: dict[int, TranscriptSegment],
         assignments: dict[int, SpeakerAssignment],
-        subject_kind: SubjectKind,
         subject_id: int,
     ) -> tuple[_ResolvedEvidence, ...]:
         seen: set[int] = set()
@@ -337,7 +333,6 @@ class StatementService:
             self._validate_assignment(
                 run_segment,
                 assignment,
-                subject_kind,
                 subject_id,
             )
             if segment.text_body is None:
@@ -371,7 +366,6 @@ class StatementService:
     def _validate_assignment(
         run_segment: RunSegment,
         assignment: SpeakerAssignment | None,
-        subject_kind: SubjectKind,
         subject_id: int,
     ) -> None:
         frozen_subject_matches = (
@@ -383,23 +377,10 @@ class StatementService:
             and assignment.assignment_kind is AssignmentKind.SUBJECT
             and assignment.assigned_subject_id == subject_id
         )
-        if subject_kind is SubjectKind.PERSON:
-            if not frozen_subject_matches or not current_subject_matches:
-                raise DomainError(
-                    "EVIDENCE_SUBJECT_ASSIGNMENT_REQUIRED",
-                    "personal evidence must remain assigned to the run subject",
-                )
-            return
-        if (
-            not frozen_subject_matches
-            or not current_subject_matches
-            or assignment is None
-            or assignment.assignment_origin
-            is not AssignmentOrigin.CHANNEL_ORGANIZATION
-        ):
+        if not frozen_subject_matches or not current_subject_matches:
             raise DomainError(
-                "EVIDENCE_ORGANIZATION_ASSIGNMENT_REQUIRED",
-                "organization evidence must remain channel assigned",
+                "EVIDENCE_SUBJECT_ASSIGNMENT_REQUIRED",
+                "personal evidence must remain assigned to the run subject",
             )
 
     def _current_segment(self, segment_id: int) -> TranscriptSegment:

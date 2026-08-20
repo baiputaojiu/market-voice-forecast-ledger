@@ -5,18 +5,32 @@ import re
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 
+from market_voice_forecast_ledger.api.models import (
+    JobResponse,
+    JobUnitResponse,
+    StageProgressResponse,
+    SubjectResponse,
+    YouTubeSyncStatusResponse,
+    YouTubeSyncUnitResponse,
+    parse_canonical_utc,
+)
 from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
-from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
+from market_voice_forecast_ledger.domain.common import utc_iso
+from market_voice_forecast_ledger.domain.discovery import (
+    CanonicalVideoMetadata,
+    DiscoverySourceKind,
+    LiveState,
+    YouTubeSyncKind,
+    build_youtube_sync_shape,
+    validate_canonical_video_metadata,
+)
 from market_voice_forecast_ledger.domain.enums import (
-    ConfigurationStatus,
     JobKind,
     JobStage,
     JobStatus,
-    PolicyKind,
-    SubjectKind,
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -26,18 +40,17 @@ from market_voice_forecast_ledger.domain.jobs import (
     ManifestUnit,
 )
 from market_voice_forecast_ledger.repositories.analysis import AnalysisRepository
+from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
 from market_voice_forecast_ledger.repositories.jobs import JobRepository
-from market_voice_forecast_ledger.api.models import (
-    JobResponse,
-    JobUnitResponse,
-    StageProgressResponse,
-    SubjectResponse,
+from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
+from market_voice_forecast_ledger.windows.task_scheduler import (
+    TaskSchedulerAdapter,
+    TaskWakeAdapter,
 )
 
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_ERROR = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
-_CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 
 
 def initialize_database(settings: Settings) -> None:
@@ -90,6 +103,25 @@ def settings_dependency(settings: Settings) -> Callable[[], Settings]:
     return request_settings
 
 
+def get_task_wake_adapter() -> TaskWakeAdapter:
+    return TaskSchedulerAdapter()
+
+
+def task_wake_dependency(
+    adapter: TaskWakeAdapter,
+) -> Callable[[], TaskWakeAdapter]:
+    if not callable(getattr(adapter, "request_start", None)):
+        raise DomainError(
+            "YOUTUBE_SYNC_DEPENDENCY_INVALID",
+            "YouTube sync wake dependency is invalid",
+        )
+
+    def request_adapter() -> TaskWakeAdapter:
+        return adapter
+
+    return request_adapter
+
+
 class PublicReadAdapter:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -101,16 +133,8 @@ class PublicReadAdapter:
                 SELECT
                     subject.id,
                     subject.canonical_name,
-                    subject.subject_kind,
-                    subject.is_active,
-                    policy.id AS policy_id,
-                    policy.policy_kind,
-                    policy.configuration_status,
-                    policy.youtube_channel_id,
-                    policy.policy_hash
+                    subject.is_active
                 FROM analysis_subjects AS subject
-                LEFT JOIN subject_channel_policies AS policy
-                    ON policy.subject_id=subject.id
                 ORDER BY subject.id
                 """
             )
@@ -119,47 +143,15 @@ class PublicReadAdapter:
         try:
             for row in rows:
                 subject_id = _positive_int(row["id"])
-                _positive_int(row["policy_id"])
                 display_name = _bounded_text(row["canonical_name"], 200)
-                kind = SubjectKind(row["subject_kind"])
-                policy_kind = PolicyKind(row["policy_kind"])
-                configuration = ConfigurationStatus(row["configuration_status"])
                 if type(row["is_active"]) is not int or row["is_active"] not in (0, 1):
                     raise ValueError("invalid active flag")
-                channel_id = row["youtube_channel_id"]
-                if channel_id is not None and (
-                    type(channel_id) is not str or not _CHANNEL_ID.fullmatch(channel_id)
-                ):
-                    raise ValueError("invalid channel id")
-                if policy_kind is PolicyKind.ALL_CHANNELS and channel_id is not None:
-                    raise ValueError("invalid public policy shape")
-                if (
-                    policy_kind is PolicyKind.FIXED_CHANNEL
-                    and configuration is ConfigurationStatus.CONFIGURED
-                    and channel_id is None
-                ):
-                    raise ValueError("invalid public policy shape")
-                expected_policy_hash = sha256_text(
-                    canonical_json(
-                        {
-                            "configuration_status": configuration.value,
-                            "policy_kind": policy_kind.value,
-                            "youtube_channel_id": channel_id,
-                        }
-                    )
-                )
-                if row["policy_hash"] != expected_policy_hash:
-                    raise ValueError("stored policy hash mismatch")
                 subjects.append(
                     SubjectResponse(
                         id=subject_id,
                         key=f"subject-{subject_id}",
                         display_name=display_name,
-                        subject_kind=kind.value,
                         is_active=bool(row["is_active"]),
-                        policy_kind=policy_kind.value,
-                        configuration_status=configuration.value,
-                        youtube_channel_id=channel_id,
                     )
                 )
         except (KeyError, TypeError, ValueError) as cause:
@@ -295,6 +287,221 @@ class PublicReadAdapter:
                 "JOB_STORED_INVALID", "stored job progress is invalid"
             ) from cause
 
+    def read_youtube_sync_status(self, job_id: int) -> YouTubeSyncStatusResponse:
+        if type(job_id) is not int or job_id <= 0:
+            raise DomainError("JOB_ID_INVALID", "job id is invalid")
+        try:
+            job = self.read_job(job_id)
+            if job.kind != JobKind.YOUTUBE_SYNC.value:
+                raise DomainError(
+                    "YOUTUBE_SYNC_NOT_FOUND", "YouTube sync job does not exist"
+                )
+            repository = DiscoveryRepository(self._conn)
+            manifest = YouTubeSyncService(self._conn).get_sync_manifest(job_id)
+            sync_kind = YouTubeSyncKind(manifest.sync_kind)
+            profiles = tuple(
+                repository.get_profile_version(profile.profile_version_id)
+                for profile in manifest.profiles
+            )
+            manual_video_id = None
+            if sync_kind is YouTubeSyncKind.MANUAL:
+                if manifest.manual_request_id is None or len(profiles) != 1:
+                    raise ValueError("invalid manual manifest")
+                profile_id, manual_video_id = repository.manual_request_binding(
+                    manifest.manual_request_id
+                )
+                if profiles[0].profile_id != profile_id:
+                    raise ValueError("invalid manual profile binding")
+            _, unit_specs = build_youtube_sync_shape(
+                sync_kind=sync_kind,
+                profiles=profiles,
+                upper_bound=manifest.upper_bound,
+                backfill_floor=manifest.backfill_floor,
+                quota_contract_version=manifest.quota_contract_version,
+                manual_request_id=manifest.manual_request_id,
+                manual_video_id=manual_video_id,
+            )
+            if len(unit_specs) != job.total or len(job.units) != job.total:
+                raise ValueError("invalid YouTube unit set")
+
+            verified_artifacts = repository.verified_youtube_artifact_hashes(
+                job_id
+            )
+            checkpoints = tuple(
+                repository.get_youtube_sync_checkpoint(job_id, spec.unit_key)
+                for spec in unit_specs
+            )
+            for spec, checkpoint, unit in zip(
+                unit_specs, checkpoints, job.units, strict=True
+            ):
+                if (
+                    checkpoint.job_id != job_id
+                    or checkpoint.unit_key != spec.unit_key
+                    or checkpoint.source_kind is not spec.source_kind
+                    or checkpoint.source_key != spec.source_key
+                    or unit.stage != spec.stage.value
+                    or (unit.status == UnitStatus.SUCCESS.value)
+                    != (checkpoint.completed_at is not None)
+                    or (unit.status == UnitStatus.SUCCESS.value)
+                    != (spec.unit_key in verified_artifacts)
+                    or not set(checkpoint.unavailable_video_ids).issubset(
+                        checkpoint.encountered_video_ids
+                    )
+                ):
+                    raise ValueError("invalid YouTube checkpoint provenance")
+                if spec.source_kind is DiscoverySourceKind.CROSS_CHANNEL_SEARCH:
+                    repository.next_search_window(job_id, spec.unit_key)
+
+            observed: dict[tuple[int, str, str], list[tuple[int, str]]] = {}
+            for row in self._conn.execute(
+                "SELECT observation.id, observation.profile_id, "
+                "observation.source_kind, observation.source_key, "
+                "observation.metadata_snapshot_id, video.id AS video_id, "
+                "video.youtube_video_id, video.current_metadata_snapshot_id, "
+                "current_snapshot.id AS current_snapshot_id, "
+                "current_snapshot.video_id AS current_snapshot_video_id, "
+                "current_snapshot.youtube_video_id "
+                "AS current_snapshot_youtube_video_id, "
+                "current_snapshot.channel_id AS current_snapshot_channel_id, "
+                "current_snapshot.channel_title "
+                "AS current_snapshot_channel_title, "
+                "current_snapshot.title AS current_snapshot_title, "
+                "current_snapshot.description AS current_snapshot_description, "
+                "current_snapshot.published_at "
+                "AS current_snapshot_published_at, "
+                "current_snapshot.duration_seconds "
+                "AS current_snapshot_duration_seconds, "
+                "current_snapshot.live_state AS current_snapshot_live_state, "
+                "current_snapshot.actual_start_time "
+                "AS current_snapshot_actual_start_time, "
+                "current_snapshot.schema_version "
+                "AS current_snapshot_schema_version, "
+                "current_snapshot.canonical_hash "
+                "AS current_snapshot_canonical_hash, "
+                "current_snapshot.fetched_at AS current_snapshot_fetched_at "
+                "FROM discovery_observations AS observation "
+                "LEFT JOIN videos AS video ON video.id=observation.video_id "
+                "LEFT JOIN video_metadata_snapshots AS current_snapshot "
+                "ON current_snapshot.id=video.current_metadata_snapshot_id "
+                "WHERE observation.job_id=? ORDER BY observation.id",
+                (job_id,),
+            ):
+                key = (row["profile_id"], row["source_kind"], row["source_key"])
+                observation_id = row["id"]
+                youtube_video_id = row["youtube_video_id"]
+                if (
+                    type(key[0]) is not int
+                    or type(key[1]) is not str
+                    or type(key[2]) is not str
+                    or type(observation_id) is not int
+                    or type(youtube_video_id) is not str
+                    or type(row["metadata_snapshot_id"]) is not int
+                ):
+                    raise ValueError("invalid YouTube observation provenance")
+                _validate_current_youtube_snapshot(row)
+                observed.setdefault(key, []).append(
+                    (observation_id, youtube_video_id)
+                )
+
+            expected_keys = {
+                (spec.profile_id, spec.source_kind.value, spec.source_key)
+                for spec in unit_specs
+            }
+            if any(key not in expected_keys for key in observed):
+                raise ValueError("invalid YouTube observation source")
+
+            units: list[YouTubeSyncUnitResponse] = []
+            for spec, checkpoint, unit in zip(
+                unit_specs, checkpoints, job.units, strict=True
+            ):
+                observed_rows = observed.get(
+                    (spec.profile_id, spec.source_kind.value, spec.source_key), []
+                )
+                observed_ids = tuple(row[0] for row in observed_rows)
+                if any(
+                    video_id not in checkpoint.encountered_video_ids
+                    for _, video_id in observed_rows
+                ):
+                    raise ValueError("invalid YouTube observation binding")
+                if spec.source_kind is DiscoverySourceKind.SEED_UPLOADS:
+                    _, canonical_ids = repository.seed_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                elif (
+                    spec.source_kind
+                    is DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+                ):
+                    _, canonical_ids = repository.search_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                elif (
+                    unit.status == UnitStatus.SUCCESS.value or observed_ids
+                ):
+                    if manifest.manual_request_id is None:
+                        raise ValueError("invalid manual observation binding")
+                    _, canonical_ids = repository.manual_unit_artifact(
+                        job_id=job_id,
+                        unit_key=spec.unit_key,
+                        manual_request_id=manifest.manual_request_id,
+                        profile_version_id=spec.profile_version_id,
+                        profile_id=spec.profile_id,
+                        source_key=spec.source_key,
+                    )
+                else:
+                    canonical_ids = ()
+                if canonical_ids != observed_ids:
+                    raise ValueError("invalid YouTube observation binding")
+                units.append(
+                    YouTubeSyncUnitResponse(
+                        stage=unit.stage,
+                        status=unit.status,
+                        discovered_count=len(checkpoint.encountered_video_ids),
+                        persisted_count=len(observed_ids),
+                        unavailable_count=len(checkpoint.unavailable_video_ids),
+                        error_code=unit.error_code,
+                    )
+                )
+            response_units = tuple(units)
+            return YouTubeSyncStatusResponse(
+                job_id=job.job_id,
+                status=job.status,
+                completed_units=job.completed,
+                total_units=job.total,
+                resume_not_before_utc=(
+                    None
+                    if manifest.resume_not_before_utc is None
+                    else utc_iso(manifest.resume_not_before_utc)
+                ),
+                discovered_total=sum(
+                    unit.discovered_count for unit in response_units
+                ),
+                persisted_total=sum(unit.persisted_count for unit in response_units),
+                unavailable_total=sum(
+                    unit.unavailable_count for unit in response_units
+                ),
+                units=response_units,
+            )
+        except DomainError as cause:
+            if cause.code in {"JOB_NOT_FOUND", "YOUTUBE_SYNC_NOT_FOUND"}:
+                raise
+            raise DomainError(
+                "YOUTUBE_SYNC_STORED_INVALID",
+                "stored YouTube sync progress is invalid",
+            ) from cause
+        except (KeyError, LookupError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "YOUTUBE_SYNC_STORED_INVALID",
+                "stored YouTube sync progress is invalid",
+            ) from cause
+
     def stale_scope_count_for_segment(
         self, segment_id: int, assigned_subject_id: int | None = None
     ) -> int:
@@ -306,6 +513,36 @@ class PublicReadAdapter:
             segment_id, assigned_subject_id
         )
         return len(scope_ids)
+
+
+def _validate_current_youtube_snapshot(row: sqlite3.Row) -> None:
+    if (
+        type(row["video_id"]) is not int
+        or type(row["current_metadata_snapshot_id"]) is not int
+        or row["current_snapshot_id"] != row["current_metadata_snapshot_id"]
+        or row["current_snapshot_video_id"] != row["video_id"]
+        or row["current_snapshot_youtube_video_id"] != row["youtube_video_id"]
+    ):
+        raise ValueError("invalid YouTube current metadata binding")
+    metadata = CanonicalVideoMetadata(
+        youtube_video_id=row["current_snapshot_youtube_video_id"],
+        channel_id=row["current_snapshot_channel_id"],
+        channel_title=row["current_snapshot_channel_title"],
+        title=row["current_snapshot_title"],
+        description=row["current_snapshot_description"],
+        published_at=parse_canonical_utc(row["current_snapshot_published_at"]),
+        duration_seconds=row["current_snapshot_duration_seconds"],
+        live_state=LiveState(row["current_snapshot_live_state"]),
+        actual_start_time=(
+            None
+            if row["current_snapshot_actual_start_time"] is None
+            else parse_canonical_utc(row["current_snapshot_actual_start_time"])
+        ),
+        schema_version=row["current_snapshot_schema_version"],
+        canonical_hash=row["current_snapshot_canonical_hash"],
+        fetched_at=parse_canonical_utc(row["current_snapshot_fetched_at"]),
+    )
+    validate_canonical_video_metadata(metadata)
 
 
 def _positive_int(value: object) -> int:
