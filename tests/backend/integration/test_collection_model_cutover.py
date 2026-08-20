@@ -449,6 +449,34 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[object, ...]:
     return schema, ledger
 
 
+def _database_fingerprint(conn: sqlite3.Connection) -> tuple[object, ...]:
+    schema = tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        )
+    )
+    table_rows = tuple(
+        (
+            table_name,
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    'SELECT * FROM "' + table_name.replace('"', '""') + '"'
+                )
+            ),
+        )
+        for table_name in (
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        )
+    )
+    return schema, table_rows
+
+
 def _schema_names(conn: sqlite3.Connection, kind: str) -> tuple[str, ...]:
     return tuple(
         row["name"]
@@ -505,6 +533,31 @@ def test_precreated_empty_migration_ledger_is_not_a_fresh_database(tmp_path):
         conn.close()
 
 
+def test_ledgerless_nonempty_database_is_rejected_without_any_change(tmp_path):
+    conn = open_database(tmp_path / "ledgerless-nonempty.sqlite3")
+    try:
+        conn.execute(
+            "CREATE TABLE preexisting_user_data("
+            "id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO preexisting_user_data(id, payload) VALUES (1, 'keep-me')"
+        )
+        before = _database_fingerprint(conn)
+
+        with pytest.raises(DomainError, match="COLLECTION_MODEL_RESET_REQUIRED") as caught:
+            apply_migrations(conn)
+
+        assert caught.value.code == "COLLECTION_MODEL_RESET_REQUIRED"
+        assert _database_fingerprint(conn) == before
+        assert not conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+
 def test_fresh_database_finishes_with_only_collection_model_schema(db):
     assert _schema_names(db, "table") == EXPECTED_TABLES
     assert {"subject_channel_policies", "subject_video_eligibility"}.isdisjoint(
@@ -545,6 +598,30 @@ def test_fresh_database_finishes_with_only_collection_model_schema(db):
         "candidate_id",
     )
     assert CUTOVER in _migration_names(db)
+
+
+def test_final_schema_rejects_legacy_organization_rule_evidence(db):
+    db.execute("PRAGMA foreign_keys = OFF")
+    db.execute("DROP TRIGGER analysis_asset_mappings_require_running_unit")
+    db.execute("DROP TRIGGER analysis_asset_mappings_require_statement_source")
+    legacy_evidence = (
+        '[{"segment_id":1,'
+        '"evidence_kind":"organization_assigned_statement",'
+        '"market_code":"japan","is_competing":false}]'
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError, match="ASSET_MAPPING_EVIDENCE_UNSAFE"
+    ):
+        db.execute(
+            "INSERT INTO analysis_asset_mappings("
+            "run_id, statement_id, original_expression, asset, mapping_kind, "
+            "conversion_reason, codex_confidence, rule_confidence, "
+            "final_confidence, confidence_disagrees, rule_evidence_json, "
+            "source_video_id) VALUES (1, 1, '日本株', 'nikkei_225', "
+            "'inferred', 'legacy_probe', 'high', 'high', 'high', 0, ?, 1)",
+            (legacy_evidence,),
+        )
 
 
 def test_final_schema_has_collection_pointer_and_append_only_guards(db):

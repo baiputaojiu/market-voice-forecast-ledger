@@ -6,8 +6,10 @@
 - 初回ユーザー承認日: 2026-08-18 JST
 - 対象: M2中核バックエンド後の最初の実YouTube収集subproject
 - 設計レビュー: 会話上の全5節をユーザー承認済み
-- 書面レビュー: ユーザーレビュー待ち
-- 次のゲート: 本書のユーザー承認後、`superpowers:writing-plans`で詳細実装計画を作成する
+- 書面レビュー: ユーザー承認済み。commit `9efba8f0e151841b3d10f460fff42dce69269961`へ保存済み
+- 実装状態: Task 1～12はcommit済み・独立review済み。Task 13初回reviewの7 Important findingを順次RED/GREEN修正し、完全合成E2Eとarchitecture/smoke境界は17 passed・明示opt-in skip 1件を観測済み
+- 検証状態: 全backend 1732件中1730 passed・既存Windows symlink capability skip 1件・real smoke opt-in skip 1件。compileall、work-state All 242 passed・0 failed、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功
+- 次のゲート: exact 19-path candidateの限定最終review、承認後の限定commit。実YouTube運用受入は明示opt-inがないためpending
 
 ## 目的
 
@@ -413,7 +415,7 @@ endpoint classごとに消費を分けて数える。
 
 quota exhaustedまたはproviderがquota errorを返した場合はbusy retryせず、jobをdeferred状態にして次の日次実行で同じcheckpointから再開する。quota仕様値はprovider変更の影響を受けるため、client定数と公式資料linkを一か所へ集約する。
 
-各network attemptは、call前にendpoint bucket、attempted_at、job/work item IDだけをdurable reservationとして記録する。call前crashで実際には消費しなかったreservationが残ることは許し、provider消費を過少記録する方向へ補正しない。provider quota errorを受けたjobは `resume_not_before_utc = observed_at + 24 hours`として `RETRYING`にし、それ以前のmanual startではclaimしない。公式quotaはPacific Timeの午前0時にresetされるため、24時間後の再開は必ず少なくとも1回のprovider resetをまたぐ。
+各network attemptは、call前にendpoint bucket、attempted_at、job/work item IDだけをdurable reservationとして記録する。同じUTC日のsearch bucketとread bucketを`BEGIN IMMEDIATE` transaction内でcountしてから予約し、exact limitを許可して次のreservationを拒否する。call前crashで実際には消費しなかったreservationが残ることは許し、provider消費を過少記録する方向へ補正しない。localまたはprovider quota exhaustedのjobは `resume_not_before_utc = observed_at + 24 hours`として `RETRYING`にし、それ以前のmanual startではclaimしない。公式quotaはPacific Timeの午前0時にresetされるため、24時間後の再開は必ず少なくとも1回のprovider resetをまたぐ。
 
 ### fail closed
 

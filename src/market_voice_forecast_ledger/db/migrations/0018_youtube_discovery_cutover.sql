@@ -1746,8 +1746,7 @@ WHEN EXISTS (
             'explicit_market_expression',
             'generic_expression',
             'surrounding_subject_statement',
-            'interviewer_context',
-            'organization_assigned_statement'
+            'interviewer_context'
         ), 1)
         OR json_type(evidence.value, '$.market_code') IS NOT 'text'
         OR COALESCE(json_extract(evidence.value, '$.market_code') NOT IN (

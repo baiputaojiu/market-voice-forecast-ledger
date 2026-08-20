@@ -787,7 +787,7 @@ def test_invalid_token_restarts_only_current_window_and_replay_is_idempotent(db)
     ).fetchone()[0] == 2
 
 
-def test_saturated_page_ten_retry_fails_before_provider_without_state_drift(db):
+def test_one_day_page_ten_checkpoint_resumes_from_durable_token(db):
     profile = _search_profile(db)
     lower = RUN_UPPER - timedelta(days=1)
     source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
@@ -798,89 +798,33 @@ def test_saturated_page_ten_retry_fails_before_provider_without_state_drift(db):
         source_key=source_key,
         completed_upper_bound=lower,
     )
-    client = FakeYouTubeClient()
+    before = tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors"))
+    client = FakeYouTubeClient(search_responses=(YouTubePage((), None),))
     service = YouTubeSyncService(
         db, clock=lambda: RUN_UPPER, youtube_client=client
     )
     job_id, unit_key = _start_search_unit(db, service, profile)
     _checkpoint_ten_search_pages(db, job_id, unit_key)
-    JobStateService(db, clock=lambda: RUN_UPPER).fail_unit(
-        job_id, unit_key, "YOUTUBE_SEARCH_WINDOW_SATURATED"
-    )
-    with transaction(db):
-        JobStateService(
-            db, clock=lambda: RUN_UPPER
-        ).retry_failed_in_transaction(job_id, {})
-    JobStateService(db, clock=lambda: RUN_UPPER).begin_unit(job_id, unit_key)
-    assert JobStateService(db).unit(job_id, unit_key).status is UnitStatus.RUNNING
-    private_before = (
-        tuple(
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM youtube_sync_checkpoints WHERE job_id=? "
-                "AND unit_key=?",
-                (job_id, unit_key),
-            )
-        ),
-        tuple(
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM youtube_search_windows WHERE job_id=? "
-                "AND unit_key=? ORDER BY ordinal",
-                (job_id, unit_key),
-            )
-        ),
-        tuple(
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=?",
-                (job_id,),
-            )
-        ),
-        tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")),
+    resumed_service = YouTubeSyncService(
+        db, clock=lambda: RUN_UPPER, youtube_client=client
     )
 
-    with pytest.raises(DomainError) as caught:
-        service.execute_search_unit(job_id, unit_key)
+    result = resumed_service.execute_search_unit(job_id, unit_key)
 
-    private_after = (
-        tuple(
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM youtube_sync_checkpoints WHERE job_id=? "
-                "AND unit_key=?",
-                (job_id, unit_key),
-            )
-        ),
-        tuple(
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM youtube_search_windows WHERE job_id=? "
-                "AND unit_key=? ORDER BY ordinal",
-                (job_id, unit_key),
-            )
-        ),
-        tuple(
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM youtube_sync_proposed_cursors WHERE job_id=?",
-                (job_id,),
-            )
-        ),
-        tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")),
-    )
-    assert caught.value.code == "YOUTUBE_SEARCH_WINDOW_SATURATED"
-    assert client.search_calls == []
-    assert private_after == private_before
-    assert JobStateService(db).status(job_id) is JobStatus.FAILED
-    failed_unit = db.execute(
-        "SELECT status, error_code FROM job_units WHERE job_id=? AND unit_key=?",
+    assert tuple(call[3] for call in client.search_calls) == ("durable_token_10",)
+    assert result.discovered_count == result.persisted_count == 0
+    window = db.execute(
+        "SELECT page_count, next_page_token, completed_at "
+        "FROM youtube_search_windows WHERE job_id=? AND unit_key=?",
         (job_id, unit_key),
     ).fetchone()
-    assert (failed_unit["status"], failed_unit["error_code"]) == (
-        UnitStatus.FAILED.value,
-        "YOUTUBE_SEARCH_WINDOW_SATURATED",
-    )
+    assert tuple(window) == (11, None, utc_iso(RUN_UPPER))
+    assert JobStateService(db).unit(job_id, unit_key).status is UnitStatus.SUCCESS
+    assert db.execute(
+        "SELECT COUNT(*) FROM youtube_sync_proposed_cursors WHERE job_id=?",
+        (job_id,),
+    ).fetchone()[0] == 1
+    assert tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")) == before
 
 
 def test_preexisting_splittable_page_ten_splits_before_provider_call(db):
@@ -925,7 +869,7 @@ def test_preexisting_splittable_page_ten_splits_before_provider_call(db):
     assert result.discovered_count == result.persisted_count == 0
 
 
-def test_one_day_saturation_fails_closed_without_proposal_or_cursor_movement(db):
+def test_one_day_leaf_continues_page_eleven_before_proposing_cursor(db):
     profile = _search_profile(db)
     source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
     lower = RUN_UPPER - timedelta(days=1)
@@ -939,22 +883,83 @@ def test_one_day_saturation_fails_closed_without_proposal_or_cursor_movement(db)
     before = tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors"))
     client = FakeYouTubeClient(
         search_responses=tuple(
-            YouTubePage((), f"saturated_token_{index}") for index in range(10)
+            YouTubePage((), f"saturated_token_{index}")
+            for index in range(1, 11)
         )
+        + (YouTubePage((), None),)
     )
     service = YouTubeSyncService(
         db, clock=lambda: RUN_UPPER, youtube_client=client
     )
     job_id, unit_key = _start_search_unit(db, service, profile)
 
-    with pytest.raises(DomainError) as caught:
-        service.execute_search_unit(job_id, unit_key)
+    result = service.execute_search_unit(job_id, unit_key)
 
-    assert caught.value.code == "YOUTUBE_SEARCH_WINDOW_SATURATED"
-    assert JobStateService(db).unit(job_id, unit_key).status is UnitStatus.FAILED
+    assert result.discovered_count == result.persisted_count == 0
+    assert JobStateService(db).unit(job_id, unit_key).status is UnitStatus.SUCCESS
     assert db.execute(
         "SELECT COUNT(*) FROM youtube_sync_proposed_cursors WHERE job_id=?",
         (job_id,),
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
     assert tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")) == before
-    assert len(client.search_calls) == 10
+    assert tuple(call[3] for call in client.search_calls) == (
+        None,
+        "saturated_token_1",
+        "saturated_token_2",
+        "saturated_token_3",
+        "saturated_token_4",
+        "saturated_token_5",
+        "saturated_token_6",
+        "saturated_token_7",
+        "saturated_token_8",
+        "saturated_token_9",
+        "saturated_token_10",
+    )
+
+
+def test_invalid_page_eleven_token_restarts_one_day_leaf_without_cursor_promotion(db):
+    profile = _search_profile(db)
+    lower = RUN_UPPER - timedelta(days=1)
+    source_key = discovery_domain.youtube_search_source_key(profile.search_terms)
+    _insert_cursor(
+        db,
+        profile_id=profile.profile_id,
+        source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+        source_key=source_key,
+        completed_upper_bound=lower,
+    )
+    before = tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors"))
+    client = FakeYouTubeClient(
+        search_responses=(
+            YouTubeProviderFailure(
+                "YOUTUBE_PAGE_TOKEN_INVALID", "invalid_page_token"
+            ),
+            YouTubePage((), None),
+        )
+    )
+    service = YouTubeSyncService(
+        db, clock=lambda: RUN_UPPER, youtube_client=client
+    )
+    job_id, unit_key = _start_search_unit(db, service, profile)
+    _checkpoint_ten_search_pages(db, job_id, unit_key)
+
+    result = service.execute_search_unit(job_id, unit_key)
+
+    assert tuple(call[3] for call in client.search_calls) == (
+        "durable_token_10",
+        None,
+    )
+    assert result.discovered_count == result.persisted_count == 0
+    window = db.execute(
+        "SELECT page_count, next_page_token, completed_at "
+        "FROM youtube_search_windows WHERE job_id=? AND unit_key=?",
+        (job_id, unit_key),
+    ).fetchone()
+    assert tuple(window) == (1, None, utc_iso(RUN_UPPER))
+    checkpoint = db.execute(
+        "SELECT batch_ordinal FROM youtube_sync_checkpoints "
+        "WHERE job_id=? AND unit_key=?",
+        (job_id, unit_key),
+    ).fetchone()
+    assert checkpoint["batch_ordinal"] == 11
+    assert tuple(dict(row) for row in db.execute("SELECT * FROM youtube_source_cursors")) == before

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Barrier
 
 import pytest
 
@@ -11,9 +13,12 @@ from market_voice_forecast_ledger.db.connection import open_database, transactio
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
+from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
 from market_voice_forecast_ledger.youtube.client import (
     EndpointClass,
+    READ_UNIT_DAILY_LIMIT,
     SafeTransportFailure,
+    SEARCH_CALL_DAILY_LIMIT,
     YouTubeClient,
     YouTubeProviderFailure,
 )
@@ -86,6 +91,8 @@ def _callback(
         job_id=job_id,
         unit_key=unit_key,
         request_ordinal=request_ordinal,
+        search_daily_limit=SEARCH_CALL_DAILY_LIMIT,
+        read_daily_limit=READ_UNIT_DAILY_LIMIT,
     )
 
 
@@ -97,6 +104,311 @@ def _rows(conn: sqlite3.Connection):
             "FROM youtube_quota_reservations ORDER BY id"
         )
     )
+
+
+def _seed_reservations(
+    conn: sqlite3.Connection,
+    job_id: int,
+    count: int,
+    *,
+    endpoint_classes: tuple[str, ...],
+    attempted_at: datetime = FIXED_NOW,
+    unit_key: str = UNIT_KEY,
+) -> None:
+    attempted_at_text = attempted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with transaction(conn):
+        conn.executemany(
+            "INSERT INTO youtube_quota_reservations("
+            "job_id, unit_key, request_ordinal, attempt_no, endpoint_class, "
+            "attempted_at) VALUES (?, ?, ?, 1, ?, ?)",
+            (
+                (
+                    job_id,
+                    unit_key,
+                    request_ordinal,
+                    endpoint_classes[(request_ordinal - 1) % len(endpoint_classes)],
+                    attempted_at_text,
+                )
+                for request_ordinal in range(1, count + 1)
+            ),
+        )
+
+
+def _quota_error(callback, endpoint_class, attempt_no, attempted_at) -> str:
+    try:
+        callback(endpoint_class, attempt_no, attempted_at)
+    except DomainError as cause:
+        return cause.code
+    return "accepted"
+
+
+def test_search_bucket_accepts_call_100_and_rejects_call_101(quota_db):
+    conn, _database_path, job_id = quota_db
+    _seed_reservations(
+        conn,
+        job_id,
+        99,
+        endpoint_classes=("search_list",),
+    )
+
+    _callback(conn, job_id, request_ordinal=100)(
+        EndpointClass.SEARCH_LIST, 1, FIXED_NOW
+    )
+    with pytest.raises(DomainError) as caught:
+        _callback(conn, job_id, request_ordinal=101)(
+            EndpointClass.SEARCH_LIST, 1, FIXED_NOW
+        )
+
+    assert caught.value.code == "YOUTUBE_QUOTA_EXHAUSTED"
+    assert str(caught.value) == "YouTube daily quota is exhausted"
+    assert len(_rows(conn)) == 100
+
+
+def test_combined_read_bucket_accepts_unit_10000_and_rejects_unit_10001(
+    quota_db,
+):
+    conn, _database_path, job_id = quota_db
+    read_endpoints = ("channels_list", "playlist_items_list", "videos_list")
+    _seed_reservations(
+        conn,
+        job_id,
+        9_999,
+        endpoint_classes=read_endpoints,
+    )
+
+    _callback(conn, job_id, request_ordinal=10_000)(
+        EndpointClass.VIDEOS_LIST, 1, FIXED_NOW
+    )
+    with pytest.raises(DomainError) as caught:
+        _callback(conn, job_id, request_ordinal=10_001)(
+            EndpointClass.CHANNELS_LIST, 1, FIXED_NOW
+        )
+
+    assert caught.value.code == "YOUTUBE_QUOTA_EXHAUSTED"
+    assert len(_rows(conn)) == 10_000
+
+
+def test_each_retry_attempt_charges_the_daily_bucket(quota_db):
+    conn, _database_path, job_id = quota_db
+    _seed_reservations(
+        conn,
+        job_id,
+        99,
+        endpoint_classes=("search_list",),
+    )
+    callback = _callback(conn, job_id, request_ordinal=100)
+    callback(EndpointClass.SEARCH_LIST, 1, FIXED_NOW)
+
+    with pytest.raises(DomainError) as caught:
+        callback(EndpointClass.SEARCH_LIST, 2, FIXED_NOW)
+
+    assert caught.value.code == "YOUTUBE_QUOTA_EXHAUSTED"
+    assert [row[3] for row in _rows(conn)[-1:]] == [1]
+    assert len(_rows(conn)) == 100
+
+
+def test_quota_bucket_rolls_over_at_the_next_utc_day(quota_db):
+    conn, _database_path, job_id = quota_db
+    _seed_reservations(
+        conn,
+        job_id,
+        100,
+        endpoint_classes=("search_list",),
+    )
+
+    _callback(conn, job_id, request_ordinal=101)(
+        EndpointClass.SEARCH_LIST, 1, FIXED_NOW + timedelta(days=1)
+    )
+
+    assert len(_rows(conn)) == 101
+
+
+def test_rolled_back_reservation_does_not_consume_the_last_daily_slot(quota_db):
+    conn, _database_path, job_id = quota_db
+    _seed_reservations(
+        conn,
+        job_id,
+        99,
+        endpoint_classes=("search_list",),
+    )
+
+    class SyntheticRollback(Exception):
+        pass
+
+    with pytest.raises(SyntheticRollback):
+        with transaction(conn):
+            DiscoveryRepository(conn).reserve_youtube_quota_attempt(
+                job_id=job_id,
+                unit_key=UNIT_KEY,
+                request_ordinal=100,
+                attempt_no=1,
+                endpoint_class="search_list",
+                attempted_at=FIXED_NOW,
+                search_daily_limit=SEARCH_CALL_DAILY_LIMIT,
+                read_daily_limit=READ_UNIT_DAILY_LIMIT,
+            )
+            raise SyntheticRollback()
+
+    _callback(conn, job_id, request_ordinal=100)(
+        EndpointClass.SEARCH_LIST, 1, FIXED_NOW
+    )
+    assert len(_rows(conn)) == 100
+
+
+def test_concurrent_reservations_cannot_overrun_the_last_daily_slot(quota_db):
+    conn, _database_path, job_id = quota_db
+    _seed_reservations(
+        conn,
+        job_id,
+        99,
+        endpoint_classes=("search_list",),
+    )
+    barrier = Barrier(2)
+    callbacks = (
+        _callback(conn, job_id, request_ordinal=100),
+        _callback(conn, job_id, request_ordinal=101),
+    )
+
+    def reserve(callback) -> str:
+        barrier.wait()
+        return _quota_error(
+            callback,
+            EndpointClass.SEARCH_LIST,
+            1,
+            FIXED_NOW,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(reserve, callbacks))
+
+    assert sorted(outcomes) == ["YOUTUBE_QUOTA_EXHAUSTED", "accepted"]
+    assert len(_rows(conn)) == 100
+
+
+def test_committed_crash_reservation_conservatively_consumes_daily_slot(
+    quota_db,
+):
+    conn, _database_path, job_id = quota_db
+    _seed_reservations(
+        conn,
+        job_id,
+        99,
+        endpoint_classes=("search_list",),
+    )
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    class CrashTransport:
+        def get_json(self, _endpoint, _params, _api_key):
+            raise SyntheticProcessCrash()
+
+    client = YouTubeClient(
+        transport=CrashTransport(),
+        credential_store=FakeCredentialStore(),
+        reserve_attempt=_callback(conn, job_id, request_ordinal=100),
+        sleeper=RecordingSleeper(),
+        clock=fixed_clock,
+    )
+    with pytest.raises(SyntheticProcessCrash):
+        client.search_videos(
+            "Synthetic analyst",
+            "2023-08-17T23:59:59.000000Z",
+            "2026-08-18T00:00:00.000000Z",
+            None,
+        )
+
+    with pytest.raises(DomainError) as caught:
+        _callback(conn, job_id, request_ordinal=101)(
+            EndpointClass.SEARCH_LIST, 1, FIXED_NOW
+        )
+
+    assert caught.value.code == "YOUTUBE_QUOTA_EXHAUSTED"
+    assert len(_rows(conn)) == 100
+
+
+def test_local_quota_exhaustion_defers_without_transport_or_cursor_progress(
+    tmp_path,
+):
+    conn = open_database(tmp_path / "defer.sqlite3")
+    apply_migrations(conn)
+    bootstrap_reference_data(conn)
+
+    class TransportMustNotRun:
+        calls = 0
+
+        def get_json(self, _endpoint, _params, _api_key):
+            self.calls += 1
+            raise AssertionError("transport must not run after local quota exhaustion")
+
+    transport = TransportMustNotRun()
+    service = YouTubeSyncService(
+        conn,
+        clock=fixed_clock,
+        credential_store=FakeCredentialStore(),
+        transport=transport,
+        sleeper=RecordingSleeper(),
+    )
+    profile = DiscoveryRepository(conn).list_active_profile_versions()[0]
+    request = service.request_manual_candidate(
+        profile.subject_id,
+        "https://youtu.be/quota000001",
+        FIXED_NOW,
+    )
+    unit_key = conn.execute(
+        "SELECT unit_key FROM job_units WHERE job_id=?",
+        (request.job_id,),
+    ).fetchone()["unit_key"]
+    _seed_reservations(
+        conn,
+        request.job_id,
+        10_000,
+        endpoint_classes=("channels_list", "playlist_items_list", "videos_list"),
+        unit_key=unit_key,
+    )
+    before_manual_rows = tuple(
+        conn.execute(
+            "SELECT * FROM manual_discovery_requests WHERE id=?",
+            (request.request_id,),
+        )
+    )
+
+    claimed = service.claim_next_runnable(FIXED_NOW)
+    assert claimed is not None
+    status = service.execute_claimed_job(claimed)
+
+    unit = conn.execute(
+        "SELECT status, error_code FROM job_units WHERE job_id=?",
+        (request.job_id,),
+    ).fetchone()
+    assert status.value == "retrying"
+    assert tuple(unit) == ("pending", None)
+    assert tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT result_status, error_code FROM job_unit_attempts "
+            "WHERE job_id=?",
+            (request.job_id,),
+        )
+    ) == (("failed", "YOUTUBE_QUOTA_EXHAUSTED"),)
+    assert service.get_sync_manifest(request.job_id).resume_not_before_utc == (
+        FIXED_NOW + timedelta(days=1)
+    )
+    assert transport.calls == 0
+    assert len(
+        tuple(
+            conn.execute(
+                "SELECT id FROM youtube_quota_reservations WHERE job_id=?",
+                (request.job_id,),
+            )
+        )
+    ) == 10_000
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM manual_discovery_requests WHERE id=?",
+            (request.request_id,),
+        )
+    ) == before_manual_rows
 
 
 def test_callback_commits_one_minimal_reservation_in_its_own_short_transaction(
@@ -507,6 +819,8 @@ def test_direct_insert_primitive_requires_a_caller_transaction(quota_db):
             attempt_no=1,
             endpoint_class="search_list",
             attempted_at=FIXED_NOW,
+            search_daily_limit=SEARCH_CALL_DAILY_LIMIT,
+            read_daily_limit=READ_UNIT_DAILY_LIMIT,
         )
 
     assert caught.value.code == "DISCOVERY_TRANSACTION_REQUIRED"

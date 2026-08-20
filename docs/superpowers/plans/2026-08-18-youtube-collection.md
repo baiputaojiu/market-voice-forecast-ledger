@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-18-youtube-collection-design.md`
 
-**Planning status:** 2026-08-18 JST。設計書はユーザー承認済みでcommit `9efba8f0e151841b3d10f460fff42dce69269961` に保存済み。この文書は実装計画であり、ユーザーの明示的な実装開始指示まではworktree作成、test作成、production変更、実API呼出しを行わない。
+**Planning status:** 2026-08-20 JST。設計書はユーザー承認済みでcommit `9efba8f0e151841b3d10f460fff42dce69269961` に保存済み。Task 1～12はcommit済み・独立review済みで、Task 13開始時のclean baseは`b6cfb5ae6e75cf073a083f5aa64b4a879039f765`。Task 13初回candidateは3 failed・7 passed・1 opt-in skipのRED後、10 passed・同skip 1件となった。初回独立reviewの7 Important findingを順次RED/GREEN修正した最終fix candidateはfocused 17 passed・同skip 1件、全backend 1732件中1730 passed・許可されたskip 2件、work-state All 242 passed・0 failedを観測した。exact 19-path candidateの限定最終review、stage、commitはこの記述時点では未実施であり、実YouTube smokeは明示承認がないため実行していない。
 
 ## Global Constraints
 
@@ -32,7 +32,7 @@
 - full syncのunitは開始時にprofile×discovererで固定し、adaptive windowやpage/batchのために後から `job_units`を追加しない。
 - 同時にactiveなYouTube sync jobは最大1。互換full requestは同じactive/queued/resumable jobへ収束し、manual requestはdurable queueへ追加する。
 - full syncだけがdurable source cursorをpromoteする。manual-only jobはglobal cursorを読み書きしない。
-- search windowは内部的に `[lower_bound, upper_bound)` とし、provider境界を1秒overlapして取得後にcanonical `published_at`で再filterする。10 pages後もtokenがあるwindowは日境界で二分し、1日windowをさらに分割できない場合は `YOUTUBE_SEARCH_WINDOW_SATURATED`でcursorを進めない。
+- search windowは内部的に `[lower_bound, upper_bound)` とし、provider境界を1秒overlapして取得後にcanonical `published_at`で再filterする。10 pages後もtokenがある複数日windowは日境界で二分し、分割不能な1日windowはdurable tokenでpage 11以降を継続する。完全消費前にはcursorを進めない。
 - retry対象は一時network、quota以外の429、5xxで、初回を含め最大4 attempts、待機1秒・4秒・16秒。safeな `Retry-After`は0～60秒だけ採用し、それを超える値はsleepせずdeferする。
 - quota errorはgeneric retryより先に分類する。call前にreservationをdurable保存し、provider quota error時は既存 `RETRYING`と `resume_not_before_utc = observed_at + 24 hours`を使う。
 - 実API smoke testは明示opt-inとし、API key未登録環境ではskipではなく「運用受入未実施」とdocumentする。通常testはfake transport、fake credential、fake schedulerのみを使う。
@@ -1104,7 +1104,7 @@ Add profile-version change with unchanged ordered term set (cursor reused), chan
 
 - [ ] **Step 2: Write adaptive-window RED tests**
 
-Create fake pages with a next token after page 10. Assert the original multi-day window is replaced by two nonoverlapping day-boundary children whose provider requests overlap the lower boundary by exactly one second and whose locally accepted metadata still satisfies `[lower, upper)`. Add invalid-page-token restart, replay deduplication, out-of-window search result rejection, and one-day saturation failure `YOUTUBE_SEARCH_WINDOW_SATURATED`.
+Create fake pages with a next token after page 10. Assert the original multi-day window is replaced by two nonoverlapping day-boundary children whose provider requests overlap the lower boundary by exactly one second and whose locally accepted metadata still satisfies `[lower, upper)`. Add invalid-page-token restart, replay deduplication, out-of-window search result rejection, and durable page 11+ continuation for an unsplittable one-day leaf without cursor promotion before exhaustion.
 
 - [ ] **Step 3: Write final-promotion RED tests**
 
@@ -1138,7 +1138,7 @@ Expected: missing window/cursor execution methods.
 
 - [ ] **Step 5: Implement exact window lifecycle**
 
-Store one root window per fixed search unit. A page commit updates only that window's private next token/page count and domain batch position. At page 10 with a remaining token, mark a splittable parent with immutable split proof and append two children ordered newer-first; never create job units. Invalid token clears only the current fixed window's token/page count and relies on observation idempotency. A one-day saturated window fails the unit and leaves both proposed/durable cursors unchanged.
+Store one root window per fixed search unit. A page commit updates only that window's private next token/page count and domain batch position. At page 10 with a remaining token, mark a splittable parent with immutable split proof and append two children ordered newer-first; never create job units. An unsplittable one-day leaf retains the token and continues page 11+ across defer/resume. Invalid token clears only the same fixed window's token/page count and relies on observation idempotency. Proposed/durable cursors remain unchanged until complete exhaustion.
 
 - [ ] **Step 6: Implement proposed and durable cursor hashes**
 

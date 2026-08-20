@@ -33,6 +33,8 @@ from market_voice_forecast_ledger.repositories.jobs import JobRepository
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from market_voice_forecast_ledger.youtube.client import (
     QUOTA_CONTRACT_VERSION,
+    READ_UNIT_DAILY_LIMIT,
+    SEARCH_CALL_DAILY_LIMIT,
     YouTubeClient,
     YouTubeProviderFailure,
 )
@@ -472,7 +474,10 @@ class YouTubeSyncService:
             transport=self._transport,
             credential_store=self._credential_store,
             reserve_attempt=self._discovery.youtube_attempt_reservation_chain(
-                job_id=claimed.job_id, unit_key=unit.unit_key
+                job_id=claimed.job_id,
+                unit_key=unit.unit_key,
+                search_daily_limit=SEARCH_CALL_DAILY_LIMIT,
+                read_daily_limit=READ_UNIT_DAILY_LIMIT,
             ),
             sleeper=self._sleeper,
             clock=self._clock,
@@ -521,6 +526,14 @@ class YouTubeSyncService:
             self._fail_unit_if_running(claimed.job_id, unit.unit_key, cause.code)
             return self._job_state.status(claimed.job_id)
         except DomainError as cause:
+            if cause.code == "YOUTUBE_QUOTA_EXHAUSTED":
+                self.defer_current_unit(
+                    claimed.job_id,
+                    unit.unit_key,
+                    cause.code,
+                    self._exact_clock_value() + timedelta(days=1),
+                )
+                return JobStatus.RETRYING
             self._fail_unit_if_running(
                 claimed.job_id, unit.unit_key, self._safe_failure_code(cause.code)
             )
@@ -889,25 +902,16 @@ class YouTubeSyncService:
                 break
             if window.page_count == 10 and window.next_page_token is not None:
                 boundary = self._search_split_boundary(window)
-                if boundary is None:
-                    self._job_state.fail_unit(
-                        job_id,
-                        unit_key,
-                        "YOUTUBE_SEARCH_WINDOW_SATURATED",
-                    )
-                    raise DomainError(
-                        "YOUTUBE_SEARCH_WINDOW_SATURATED",
-                        "YouTube search window cannot be split safely",
-                    )
-                with transaction(self._conn):
-                    self._discovery.split_search_window(
-                        job_id=job_id,
-                        unit_key=unit_key,
-                        window_id=window.id,
-                        boundary=boundary,
-                        completed_at=self._exact_clock_value(),
-                    )
-                continue
+                if boundary is not None:
+                    with transaction(self._conn):
+                        self._discovery.split_search_window(
+                            job_id=job_id,
+                            unit_key=unit_key,
+                            window_id=window.id,
+                            boundary=boundary,
+                            completed_at=self._exact_clock_value(),
+                        )
+                    continue
             provider_window = replace(
                 window,
                 lower_bound=window.lower_bound - timedelta(seconds=1),
@@ -964,7 +968,6 @@ class YouTubeSyncService:
                 <= item.published_at
                 < window.upper_bound
             )
-            saturated = False
             with transaction(self._conn):
                 self._discovery.persist_metadata_batch(
                     job_id,
@@ -1000,9 +1003,7 @@ class YouTubeSyncService:
                     )
                 elif committed_window.page_count == 10:
                     boundary = self._search_split_boundary(committed_window)
-                    if boundary is None:
-                        saturated = True
-                    else:
+                    if boundary is not None:
                         self._discovery.split_search_window(
                             job_id=job_id,
                             unit_key=unit_key,
@@ -1010,16 +1011,6 @@ class YouTubeSyncService:
                             boundary=boundary,
                             completed_at=self._exact_clock_value(),
                         )
-            if saturated:
-                self._job_state.fail_unit(
-                    job_id,
-                    unit_key,
-                    "YOUTUBE_SEARCH_WINDOW_SATURATED",
-                )
-                raise DomainError(
-                    "YOUTUBE_SEARCH_WINDOW_SATURATED",
-                    "YouTube search window cannot be split safely",
-                )
 
         with transaction(self._conn):
             output_hash, observation_ids = (

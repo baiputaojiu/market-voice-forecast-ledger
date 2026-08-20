@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### M2中核バックエンド: GitHub反映と次subproject選択
+### YouTube収集subproject: Task 13最終検証と運用handoff
 
-M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M2中核バックエンドはTask 1～19、whole-branch最終監査、Fix A～Gの監査修正を完了し、2026-08-16 JSTにユーザー受け入れを得てローカル`main`へfast-forward統合した。統合後の`main`でも一括検証は成功した。現在の判断事項はGitHubへのpushとlive remote照合、その後に着手する次subprojectの選択である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未受け入れのため、アプリ全体の完成とはしない。
+M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLIをTask 1～12で実装・独立review済みである。Task 13初回独立reviewの7件のImportant findingは順次RED/GREEN修正済みで、現在の作業はexact 19-path candidateの全verification、再凍結、限定最終review、承認後の限定commitである。明示opt-inの実YouTube smoke、音声・本人声確認・分析、live server、UIは受入済みとはしない。
 
 ## 完了済み（Completed）
 
@@ -62,26 +62,23 @@ M0の作業状態保存・再開基盤とM1のアプリ設計は完了した。M
 - ユーザーがM2中核バックエンドを受け入れ、統合方法1を選択した。`feature/m2-core-backend` はローカル`main`へfast-forward統合され、統合済みworktreeとbranchを通常削除した。
 - 統合後`main`で、無視対象のローカル`.venv`を既存のoffline `setuptools 83`から再構築した。最初に再現したwheel build backend不足を解消後、一括検証はbackend 907 passed・既存capability skip 1件、work-state 209 passed・0 failed、公開安全166ファイルで成功した。追跡ファイルの追加変更はない。
 - 実YouTube・音声・Codex adapter、実HTTP server/socket、UI、電源断・disk failure、hostileな同時junction差し替え、未bootstrap fresh machineへのoffline installation、remote publication、完成製品の受け入れはこの監査で証明していない。
+- YouTube収集Task 1～12でclean person-model cutover、versioned profile、Credential Manager、safe client、canonical metadata、seed/search/manual discoverer、sealed queue、crash/quota回復、strict loopback API、Task Scheduler/CLIを実装し、各taskの独立reviewを通過した。
+- Task 13初回candidateは3 failed・7 passed・1 opt-in skipのREDから、10 passed・同skip 1件のfocused GREENとなった。初回独立review後はledgerless DB非変更、legacy evidence除去、1日window page 11継続、日次quota原子強制、scope-complete architecture guard、E2E全decision/job inventory、constant/no-trace smoke failureを順次RED/GREENで追加した。歴史migration `0001`～`0017`は変更していない。
+- 最終fix candidateのfocused suiteは17 passed・real smoke opt-in skip 1件、全backendは1732件中1730 passed・既存Windows symlink capability skip 1件・同real smoke skip 1件、work-state Allは242 passed・0 failedだった。compileall、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功した。
 
 ## 作業中（In Progress）
 
-- ローカル`main`のGitHub反映とlive remote SHA照合。push実行前の最終承認待ち。
-- 次subprojectの選択。ユーザーの明示承認前には開始しない。
+- exact 19-path treeのSHA256再凍結と限定最終review。承認前にはstage・commitしない。
+- 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
 
 ## 未着手（Not Started）
-
-### M2中核バックエンドの公開反映
-
-1. 最終承認後、ローカル`main`を既存`origin/main`へ通常pushする。
-2. `verify-remote-head.ps1`でlive remote SHAとローカルHEADの一致を確認する。
-3. 次subprojectをユーザーが選択する。M2受け入れだけで自動的に次工程へ進めない。
 
 ### M2後続・M3以降
 
 次のsubprojectは未承認であり、以下の順序もユーザー判断前には確定しない。
 
-1. YouTube検索・網羅性評価・収集・音声取得の詳細specと実装。
-2. 固定音声モデル、閾値設定、分割文字起こし、参照声話者割当の詳細specと実装。
+1. 実YouTube read-only smokeと網羅性の運用受入。明示承認とCredential Manager設定を別途必要とする。
+2. 音声取得、固定音声モデル、閾値設定、分割文字起こし、参照声本人確認の詳細specと実装。
 3. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
 4. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
-5. Windows常駐worker、性能・回復性・セキュリティ検証。
+5. 実server/socket、UI、電源断・disk failure、性能・セキュリティの統合検証。

@@ -1,7 +1,7 @@
 import json
 import re
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from collections.abc import Callable
@@ -56,6 +56,12 @@ _YOUTUBE_ENDPOINT_CLASSES = frozenset({
     "playlist_items_list",
     "videos_list",
 })
+_YOUTUBE_SEARCH_ENDPOINT_CLASSES = ("search_list",)
+_YOUTUBE_READ_ENDPOINT_CLASSES = (
+    "channels_list",
+    "playlist_items_list",
+    "videos_list",
+)
 _YOUTUBE_UNIT_STAGES = frozenset({
     "youtube_seed_discovery",
     "youtube_search_discovery",
@@ -73,11 +79,17 @@ class DiscoveryRepository:
         job_id: int,
         unit_key: str,
         request_ordinal: int,
+        search_daily_limit: int,
+        read_daily_limit: int,
     ) -> Callable[[object, int, datetime], None]:
         self._validate_quota_reservation_identity(
             job_id=job_id,
             unit_key=unit_key,
             request_ordinal=request_ordinal,
+        )
+        self._validate_daily_quota_limits(
+            search_daily_limit=search_daily_limit,
+            read_daily_limit=read_daily_limit,
         )
         database_path = self._database_path()
 
@@ -108,6 +120,8 @@ class DiscoveryRepository:
                         attempt_no=attempt_no,
                         endpoint_class=endpoint_value,
                         attempted_at=attempted_at,
+                        search_daily_limit=search_daily_limit,
+                        read_daily_limit=read_daily_limit,
                     )
             except DomainError:
                 raise
@@ -126,12 +140,21 @@ class DiscoveryRepository:
         return reserve
 
     def youtube_attempt_reservation_chain(
-        self, *, job_id: int, unit_key: str
+        self,
+        *,
+        job_id: int,
+        unit_key: str,
+        search_daily_limit: int,
+        read_daily_limit: int,
     ) -> Callable[[object, int, datetime], None]:
         self._validate_quota_reservation_identity(
             job_id=job_id,
             unit_key=unit_key,
             request_ordinal=1,
+        )
+        self._validate_daily_quota_limits(
+            search_daily_limit=search_daily_limit,
+            read_daily_limit=read_daily_limit,
         )
         rows = tuple(
             self._conn.execute(
@@ -191,6 +214,8 @@ class DiscoveryRepository:
                 job_id=job_id,
                 unit_key=unit_key,
                 request_ordinal=current_ordinal,
+                search_daily_limit=search_daily_limit,
+                read_daily_limit=read_daily_limit,
             )(endpoint_class, attempt_no, attempted_at)
 
         return reserve
@@ -204,12 +229,18 @@ class DiscoveryRepository:
         attempt_no: int,
         endpoint_class: str,
         attempted_at: datetime,
+        search_daily_limit: int,
+        read_daily_limit: int,
     ) -> int:
         self._require_transaction()
         self._validate_quota_reservation_identity(
             job_id=job_id,
             unit_key=unit_key,
             request_ordinal=request_ordinal,
+        )
+        self._validate_daily_quota_limits(
+            search_daily_limit=search_daily_limit,
+            read_daily_limit=read_daily_limit,
         )
         if (
             type(attempt_no) is not int
@@ -263,6 +294,33 @@ class DiscoveryRepository:
                 "YOUTUBE_QUOTA_RESERVATION_INVALID",
                 "YouTube quota reservation is invalid",
             )
+        quota_day_start = attempted_at.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        quota_day_end = quota_day_start + timedelta(days=1)
+        if endpoint_class == "search_list":
+            quota_endpoints = _YOUTUBE_SEARCH_ENDPOINT_CLASSES
+            daily_limit = search_daily_limit
+        else:
+            quota_endpoints = _YOUTUBE_READ_ENDPOINT_CLASSES
+            daily_limit = read_daily_limit
+        quota_count = self._conn.execute(
+            "SELECT COUNT(*) AS reservation_count "
+            "FROM youtube_quota_reservations "
+            f"WHERE endpoint_class IN ({','.join('?' for _ in quota_endpoints)}) "
+            "AND attempted_at>=? AND attempted_at<?",
+            (*quota_endpoints, utc_iso(quota_day_start), utc_iso(quota_day_end)),
+        ).fetchone()["reservation_count"]
+        if type(quota_count) is not int or quota_count < 0:
+            raise DomainError(
+                "STORED_YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "stored YouTube quota reservation is invalid",
+            )
+        if quota_count >= daily_limit:
+            raise DomainError(
+                "YOUTUBE_QUOTA_EXHAUSTED",
+                "YouTube daily quota is exhausted",
+            )
         try:
             cursor = self._conn.execute(
                 "INSERT INTO youtube_quota_reservations("
@@ -307,6 +365,21 @@ class DiscoveryRepository:
                 "stored YouTube quota reservation is invalid",
             )
         return row["id"]
+
+    @staticmethod
+    def _validate_daily_quota_limits(
+        *, search_daily_limit: object, read_daily_limit: object
+    ) -> None:
+        if (
+            type(search_daily_limit) is not int
+            or search_daily_limit <= 0
+            or type(read_daily_limit) is not int
+            or read_daily_limit <= 0
+        ):
+            raise DomainError(
+                "YOUTUBE_QUOTA_RESERVATION_INVALID",
+                "YouTube quota reservation is invalid",
+            )
 
     def _validate_quota_reservation_identity(
         self,
@@ -1301,7 +1374,11 @@ class DiscoveryRepository:
             is not DiscoverySourceKind.CROSS_CHANNEL_SEARCH
             or window is None
             or window.id != window_id
-            or window.page_count >= 10
+            or (
+                window.page_count >= 10
+                and (window.upper_bound - window.lower_bound).total_seconds()
+                > 86_400
+            )
             or (
                 next_page_token is not None
                 and (
@@ -2750,7 +2827,10 @@ class DiscoveryRepository:
             )
             or type(row["page_count"]) is not int
             or row["page_count"] < 0
-            or row["page_count"] > 10
+            or (
+                row["page_count"] > 10
+                and (upper_bound - lower_bound).total_seconds() > 86_400
+            )
             or row["split_parent_id"] is not None
             and (
                 type(row["split_parent_id"]) is not int

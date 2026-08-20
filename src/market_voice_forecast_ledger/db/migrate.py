@@ -30,6 +30,12 @@ def _schema_migrations_exists(conn: sqlite3.Connection) -> bool:
     ).fetchone() is not None
 
 
+def _has_noninternal_schema_objects(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+    ).fetchone() is not None
+
+
 def _read_applied_migrations(conn: sqlite3.Connection) -> frozenset[str]:
     return frozenset(
         row["name"] for row in conn.execute("SELECT name FROM schema_migrations")
@@ -71,6 +77,12 @@ def _assert_collection_cutover_source_is_empty(
 def apply_migrations(conn: sqlite3.Connection) -> tuple[str, ...]:
     had_ledger = _schema_migrations_exists(conn)
     preexisting = _read_applied_migrations(conn) if had_ledger else frozenset()
+    if not had_ledger and _has_noninternal_schema_objects(conn):
+        raise DomainError(
+            "COLLECTION_MODEL_RESET_REQUIRED",
+            "COLLECTION_MODEL_RESET_REQUIRED: the local database must be archived and "
+            "recreated for the collection model",
+        )
     if had_ledger and COLLECTION_CUTOVER_MIGRATION not in preexisting:
         raise DomainError(
             "COLLECTION_MODEL_RESET_REQUIRED",

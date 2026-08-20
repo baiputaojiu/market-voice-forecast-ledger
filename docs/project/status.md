@@ -1,17 +1,18 @@
 # 作業状態
 
-最終更新: 2026-08-16 JST
+最終更新: 2026-08-20 JST
 
 この文書の状態は、このファイルを含むcommitに対応する。SHAは本文へ埋め込まず、Gitから取得する。
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計の完成」は完了。M2中核バックエンドはTask 1～19、whole-branch最終監査、Fix A～Gを完了し、2026-08-16 JSTにユーザー受け入れ済みとなった。実装branchはローカル`main`へfast-forward統合され、統合後検証も成功した。GitHubへのpushとlive remote照合、次subprojectの選択は未完了である。実YouTube・音声・Codex adapter、実HTTP server/socket、React UIは未実装・未検証のため、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～12の実装・独立reviewを完了した。Task 13の初回独立reviewで得た7件のImportant findingは、ledgerless DB非変更、legacy evidence除去、1日window継続、日次quota強制、architecture guard、E2E全inventory、smoke非開示として順次RED/GREEN修正済みである。現在はexact 19-path candidateの全verification、SHA256再凍結、限定再reviewを進めている。実YouTube smokeは明示承認がないため未実行で、音声・本人声確認・分析、実HTTP server/socket、React UIも未実装・未検証である。アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- 現在のローカルbranch: `main`
+- 現在の隔離worktree branch: `feature/youtube-collection`
+- Task 13開始時base: `b6cfb5ae6e75cf073a083f5aa64b4a879039f765` (`fix: validate YouTube schedule settings`)。Task 1～12はこのbaseまでにcommit・独立review済み。
 - Task 19 commit: `3267968d67a70ecee0b6f68e13d241a73e7b634f` (`test: verify synthetic core backend flow`)
 - whole-branch Fix A: `9ba560c4db1a795479d831198f04cc3aa5b496f4` (`fix: prevent superseded analysis promotion`)
 - whole-branch Fix B: `55ccd07c680bbdaa0e532194305f776e04102f0f` (`fix: harden append-only audit boundaries`)
@@ -21,7 +22,7 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix F: `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` (`fix: reject disguised binary public artifacts`)
 - whole-branch Fix G: `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`)。
 - M2統合: `feature/m2-core-backend`をローカル`main`へfast-forward統合後、統合済みworktreeとbranchを通常削除した。
-- upstream: `origin/main`。ローカル`main`はremoteより先行しているが、この状態文書commitを含むpushとlive remote照合は未実施。
+- upstream: `feature/youtube-collection`には設定なし。YouTube収集subprojectでpush・merge・rebase・PRは行っていない。
 - ローカル環境: main直下の`.venv`はGit除外対象で、既存offline `setuptools 83`から再構築した。収集データや秘密情報を含まず、push対象ではない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
@@ -89,20 +90,23 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - whole-branch Fix Eで、staged公開安全検査をNUL-safeなpath列挙と実index blobのbinary-safe読取へ変更し、lookup・read・decode失敗を内容非表示でfail-closedにした。公開方針と`.gitignore`の禁止sidecar・cache・editor/OS artifactもforce-stage時に拒否する。
 - whole-branch Fix Fで、明示的なbinary拡張子allowlist以外のdecoded fileがNULを含む場合、Staged・WorkingTree両modeで内容を表示せずfail-closedにした。許可済みbinaryと通常のUTF-8/UTF-16 textの境界は維持した。
 - whole-branch Fix Gで、SQLite3 sidecarの`*.sqlite3-*`と派生coverage fileの`.coverage.*`を`.gitignore`へ追加し、公開方針の第一防御を変更不要のscanner第二防御と整合させた。
+- YouTube収集Task 1～12は、旧organization/fixed-channel runtimeのclean cutover、4人のversioned DiscoveryProfile、Credential Manager、safe YouTube client、seed/search/manual発見、canonical metadata、sealed job/cursor、quota/crash回復、loopback API、Task Scheduler/CLIを実装し、各taskの独立reviewを通過した。
+- Task 13の完全合成worker flowは、4 person subjects、4 profile versions、seed/search設定、同一video 1行と人物別candidate、複数observation、各candidateに初期`presence_unverified` decisionがexact 1件だけ、7-source cursor map、全job/job-unit inventoryがYouTube sync 1 job・7 unitsだけ、collectionによるtranscript/speaker/analysis row 0件であることを一時SQLiteで確認する。
+- 最終fix candidateのfocused E2E・architecture・smoke境界は17 passed・real smoke opt-in skip 1件だった。全backendは1732件中1730 passed・既存Windows symlink capability skip 1件・同real smoke skip 1件、work-state Allは242 passed・0 failedだった。compileall、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功した。
 
 ## 作業中（In Progress）
 
-- ローカル`main`のGitHub反映とlive remote SHA照合。
-- 次subprojectの選択。
-- 実YouTube、実音声、実Codex/model/tool、実server/socket、UIの統合検証は行っていない。
+- exact 19-path treeをSHA256で再凍結後、限定最終reviewを受ける。承認前にはstage・commitしない。
+- 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
 
 ## 未着手（Not Started）
 
-- YouTube収集、音声処理、話者確認の詳細設計。重複判定は行わない。
+- 実YouTube read-only smokeと網羅性の運用受入。実行にはユーザーの明示承認とCredential Manager設定が必要。
+- 音声取得、音声処理、本人声確認の詳細設計。collectionはこれらのjobを自動生成しない。
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
 - MVPで固定する音声モデル名・バージョン、具体的な生スコア尺度・閾値値、閾値設定バージョンの初期値、保留話者の手動レビュー手順。
-- 次subproject。候補は収集・音声・Codex adapter・UI・常駐workerで、ユーザーの明示承認までは着手しない。
+- 次subproject。候補は音声・本人声確認、Codex adapter、UIで、ユーザーの明示承認までは着手しない。
 
 ## 検証結果（Verification Results）
 
@@ -144,6 +148,8 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - Fix GはFix F commit `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` のclean treeから開始した。実Gitの`check-ignore -v --no-index`を使うtestは変更前に106 passed・2 failedとなり、失敗は`ledger.sqlite3-wal`と`.coverage.synthetic`だけだった。既存の`*.sqlite3`、`*.sqlite-*`、`*.db-*`、`.coverage` controlはRED時点から成功した。
 - `.gitignore`へ上記2 patternだけを追加した後、PowerShell 5.1/7.6のScriptsは各108 passed・0 failed、work-state Allは209 passed・0 failedとなった。凍結2-path非文書treeの独立read-only reviewはAPPROVE（Critical 0、Important 0、Minor 0）だった。
 - Fix G treeのrepository一括検証はbackend 908件中907 passed・既存Windows symlink capability skip 1件、work-state All 209 passed・0 failed、working-tree公開安全166ファイル、compileall、`git diff --check`が成功した。dev bootstrap後のindex無効offline wheel回帰も1 passed・0 failedで、正確な18 migrationとaudit guardを再確認した。未bootstrap fresh machineへのoffline dependency導入は証明していない。
+- Task 13のexact three-module REDは11件を収集し、3 failed・7 passed・1 skippedだった。失敗は未実装のsynthetic worker fixtureと2つのarchitecture scannerだけで、smoke skipは`real YouTube operational acceptance not requested`だった。
+- 初回最小実装後の同focused suiteは10 passed・同じopt-in skip 1件でexit 0となった。最終review fix waveでは許可されたproduction 4 paths、reset-only `0018`、focused test 3 pathsを追加変更し、歴史migration `0001`～`0017`は変更していない。最新focused suiteは17 passed・同skip 1件で、全verification後の限定reviewは再凍結treeに対して実施する。
 
 ### ユーザー報告のスモールテスト結果
 
@@ -167,6 +173,8 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - 現在のFastAPI TestClient依存から、Starletteの`httpx`利用非推奨warningが1件出る。テスト失敗ではなく、後続のdependency更新時に追跡する。
 - 現在のWindows環境はsymlink作成権限がなく、symlink escapeのcapability test 1件を理由付きでskipした。
 - Task 19は完全合成・process内API試験であり、実YouTube、音声、Codex CLI/model/tool、HTTP server/socket、UIを検証していない。
+- Task 13のreal smokeは常時収集されるが、明示opt-inがない通常実行では`real YouTube operational acceptance not requested`としてskipする。実YouTube operational acceptanceはpendingである。
+- YouTube collectionは音声、字幕、全文文字起こし、本人声判定、speaker assignment、予想分析を実行しない。それらのcollection連動acceptanceは後続subprojectである。
 - 電源断・disk failure、hostileな同時junction差し替え、未bootstrap fresh machineへのoffline installation、remote publication、完成製品の受け入れは検証していない。
 
 ## 未解決事項（Open Questions）
@@ -178,9 +186,9 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. push対象を最終確認後、ローカル`main`を既存`origin/main`へ通常pushする。
-2. `verify-remote-head.ps1`でlive remote SHA一致を確認し、別PCから再開可能な保存完了状態にする。
-3. 次subprojectをユーザーが選択する。次工程は自動承認しない。
+1. exact 19 pathsをstageせずSHA256で再凍結し、限定最終reviewの承認を得る。
+2. 承認後だけstaged公開安全とcached diffを検査し、Task 13限定commitを作る。push・merge・rebase・PRは行わない。
+3. 実YouTube運用受入または音声・本人声確認subprojectは、別途ユーザーが明示承認した場合だけ開始する。
 
 ## 重要ファイル（Important Files）
 
@@ -194,6 +202,11 @@ M0「複数PC間の作業状態保存・再開基盤」とM1「アプリ設計�
 - `tests/backend/e2e/synthetic_fixture.py`: 4主体×4資産の完全合成public-service E2E fixture。
 - `tests/backend/README.md`: Windows setup、直接test、一括検証、artifact境界。
 - `scripts/test-backend.ps1`: backend・compile・work-state・公開安全性・diffの一括検証入口。
+- `docs/superpowers/specs/2026-08-18-youtube-collection-design.md`: 承認済みの4-person YouTube収集、credential、scheduler、durable orchestration設計。
+- `docs/superpowers/plans/2026-08-18-youtube-collection.md`: YouTube収集Tasks 1～13の承認済み詳細計画と観測済み実行状態。
+- `tests/backend/e2e/test_youtube_collection_flow.py`: real migration/repository/service/workerを注入fakeで通す4-profile collection E2E。
+- `tests/backend/integration/test_youtube_architecture.py`: final schema、legacy symbol、subject分岐、network/Windows/DB責務のarchitecture guard。
+- `tests/backend/integration/test_youtube_real_smoke.py`: 明示opt-inだけで実行するread-only real provider smoke境界。
 - `docs/superpowers/specs/2026-08-15-m2-feasibility-corrections-design.md`: UTC/JST、unit再実行、再接続、公開日時群の競合に関する承認済み差分設計。
 - `docs/superpowers/specs/2026-08-15-m2-core-feasibility-spike-design.md`: 書面までユーザー承認済みのM2事前フィージビリティ・スパイク設計。
 - `docs/superpowers/plans/2026-08-15-m2-core-feasibility-spike.md`: 実行済みの38 scenario・7 Task詳細計画。

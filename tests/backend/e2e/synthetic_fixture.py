@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from market_voice_forecast_ledger.api import dependencies
 from market_voice_forecast_ledger.api.app import create_app
+from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
@@ -101,6 +103,15 @@ from market_voice_forecast_ledger.services.speaker_assignment import (
     SpeakerAssignmentService,
 )
 from market_voice_forecast_ledger.services.statements import StatementService
+from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
+from market_voice_forecast_ledger.workers.scheduled_sync import (
+    WorkerDependencies,
+    WorkerSummary,
+    run_once,
+)
+from market_voice_forecast_ledger.windows.task_scheduler import (
+    ScheduledTaskStatus,
+)
 from tests.backend.synthetic_collection_fixture import (
     create_synthetic_collection_candidate,
 )
@@ -117,6 +128,29 @@ SYNTHETIC_THRESHOLD: Final = SpeakerThresholdConfig(
     model_version="1.0",
     subject_rule=ScoreRule("gte", 0.8),
     interviewer_rule=ScoreRule("lte", 0.2),
+)
+SYNTHETIC_YOUTUBE_SYNC_AT: Final = datetime(
+    2026, 8, 18, 3, 4, 5, tzinfo=UTC
+)
+SYNTHETIC_DISCOVERY: Final = MappingProxyType(
+    {
+        "木野内栄治": {
+            "seed": ("vidseed0001",),
+            "search": ("vidshared01",),
+        },
+        "大川智宏": {
+            "seed": (),
+            "search": ("vidsearch02",),
+        },
+        "江守哲": {
+            "seed": ("vidseed0003",),
+            "search": ("vidextern03",),
+        },
+        "千竈 鉄平": {
+            "seed": ("vidseed0004",),
+            "search": ("vidshared01",),
+        },
+    }
 )
 _SUBJECT_ROLES: Final = (
     "personal_japan",
@@ -466,6 +500,180 @@ class CrashPromotionFixture:
     @property
     def projection_batch_id(self) -> int:
         return self.pending_run.batch.id
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticYouTubeCollectionEvidence:
+    settings: Settings
+    job_id: int
+    worker_summary: WorkerSummary
+    safe_requests: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
+    credential_read_count: int
+    schedule_status_count: int
+    sleeper_delays: tuple[float, ...]
+
+
+class _SyntheticYouTubeCredentialStore:
+    def __init__(self) -> None:
+        self.read_count = 0
+
+    def set_api_key(self, _api_key: str) -> None:
+        raise AssertionError("synthetic collection must not write credentials")
+
+    def has_api_key(self) -> bool:
+        return True
+
+    def read_api_key(self) -> str:
+        self.read_count += 1
+        return "synthetic-youtube-key-000001"
+
+    def delete_api_key(self) -> bool:
+        raise AssertionError("synthetic collection must not delete credentials")
+
+
+class _SyntheticScheduleReader:
+    def __init__(self) -> None:
+        self.status_count = 0
+
+    def status(self) -> ScheduledTaskStatus:
+        self.status_count += 1
+        return ScheduledTaskStatus.unavailable()
+
+
+class _SyntheticYouTubeTransport:
+    _SEED_NAMES = {
+        "UCJ1DVBLVpe4FvBZZ94kreaQ": "木野内栄治",
+        "UCVXka7buS_WptsAzSE0LcKg": "江守哲",
+        "UCOfzLmXpI3qmZfV7_Cs1sYA": "千竈 鉄平",
+    }
+    _SEARCH_NAMES = {
+        "木野内栄治": "木野内栄治",
+        "大川智宏": "大川智宏",
+        "江守哲": "江守哲",
+        "千竈鉄平|千竃鉄平": "千竈 鉄平",
+    }
+
+    def __init__(self) -> None:
+        self.safe_requests: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+
+    def get_json(
+        self,
+        endpoint: str,
+        params: Mapping[str, str],
+        api_key: str,
+    ) -> dict[str, object]:
+        safe_params = dict(params)
+        if any(
+            type(key) is not str or type(value) is not str
+            for key, value in safe_params.items()
+        ):
+            raise AssertionError("synthetic transport received unsafe parameters")
+        if api_key != "synthetic-youtube-key-000001":
+            raise AssertionError("synthetic transport received an unexpected credential")
+        self.safe_requests.append((endpoint, tuple(sorted(safe_params.items()))))
+
+        if endpoint == "channels":
+            channel_ids = tuple(safe_params["id"].split(","))
+            if any(channel_id not in self._SEED_NAMES for channel_id in channel_ids):
+                raise AssertionError("synthetic transport received an unknown seed")
+            return {
+                "items": [
+                    {
+                        "id": channel_id,
+                        "contentDetails": {
+                            "relatedPlaylists": {
+                                "uploads": "UU" + channel_id[2:],
+                            }
+                        },
+                    }
+                    for channel_id in channel_ids
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint == "playlistItems":
+            playlist_id = safe_params["playlistId"]
+            channel_id = "UC" + playlist_id[2:]
+            name = self._SEED_NAMES.get(channel_id)
+            if name is None:
+                raise AssertionError("synthetic transport received an unknown playlist")
+            return {
+                "items": [
+                    {
+                        "kind": "youtube#playlistItem",
+                        "snippet": {
+                            "playlistId": playlist_id,
+                            "resourceId": {
+                                "kind": "youtube#video",
+                                "videoId": video_id,
+                            },
+                        },
+                        "contentDetails": {"videoId": video_id},
+                    }
+                    for video_id in SYNTHETIC_DISCOVERY[name]["seed"]
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint == "search":
+            name = self._SEARCH_NAMES.get(safe_params["q"])
+            if name is None:
+                raise AssertionError("synthetic transport received an unknown search")
+            return {
+                "items": [
+                    {
+                        "kind": "youtube#searchResult",
+                        "id": {
+                            "kind": "youtube#video",
+                            "videoId": video_id,
+                        },
+                    }
+                    for video_id in SYNTHETIC_DISCOVERY[name]["search"]
+                ],
+                "nextPageToken": None,
+            }
+        if endpoint == "videos":
+            video_ids = tuple(safe_params["id"].split(","))
+            known_ids = {
+                video_id
+                for sources in SYNTHETIC_DISCOVERY.values()
+                for discovered in sources.values()
+                for video_id in discovered
+            }
+            if any(video_id not in known_ids for video_id in video_ids):
+                raise AssertionError("synthetic transport received an unknown video")
+            return {
+                "items": [
+                    _synthetic_youtube_metadata_item(video_id)
+                    for video_id in video_ids
+                ],
+                "nextPageToken": None,
+            }
+        raise AssertionError("synthetic transport received an unknown endpoint")
+
+
+def _synthetic_youtube_metadata_item(video_id: str) -> dict[str, object]:
+    return {
+        "kind": "youtube#video",
+        "id": video_id,
+        "snippet": {
+            "publishedAt": "2026-08-10T01:02:03Z",
+            "channelId": "UCSyntheticChannel000001",
+            "channelTitle": "Synthetic Provider Channel",
+            "title": f"Synthetic collection item {video_id}",
+            "description": "Synthetic metadata for collection verification.",
+            "liveBroadcastContent": "none",
+            "tags": ["synthetic", "collection"],
+        },
+        "contentDetails": {
+            "duration": "PT12M34S",
+            "licensedContent": False,
+        },
+        "status": {
+            "privacyStatus": "public",
+            "uploadStatus": "processed",
+            "embeddable": True,
+            "publicStatsViewable": True,
+        },
+    }
 
 
 class DeterministicCodexAnalysisService:
@@ -1517,4 +1725,44 @@ def create_crash_promotion_fixture(
         old_run=old_run,
         pending_run=pending_run,
         artifact_hashes=tuple(artifact_hashes),
+    )
+
+
+def run_synthetic_youtube_collection(
+    tmp_path: Path,
+) -> SyntheticYouTubeCollectionEvidence:
+    settings = Settings.for_data_dir(Path(tmp_path) / "youtube-collection-runtime")
+    conn = open_database(settings.database_path)
+    try:
+        apply_migrations(conn)
+        bootstrap_reference_data(conn)
+        request = YouTubeSyncService(
+            conn,
+            clock=lambda: SYNTHETIC_YOUTUBE_SYNC_AT,
+        ).request_full_sync(SYNTHETIC_YOUTUBE_SYNC_AT)
+    finally:
+        conn.close()
+
+    credential_store = _SyntheticYouTubeCredentialStore()
+    transport = _SyntheticYouTubeTransport()
+    schedule_reader = _SyntheticScheduleReader()
+    sleeper_delays: list[float] = []
+    summary = run_once(
+        settings,
+        WorkerDependencies(
+            credential_store=credential_store,
+            transport=transport,
+            schedule_reader=schedule_reader,
+            clock=lambda: SYNTHETIC_YOUTUBE_SYNC_AT,
+            sleeper=sleeper_delays.append,
+        ),
+    )
+    return SyntheticYouTubeCollectionEvidence(
+        settings=settings,
+        job_id=request.job_id,
+        worker_summary=summary,
+        safe_requests=tuple(transport.safe_requests),
+        credential_read_count=credential_store.read_count,
+        schedule_status_count=schedule_reader.status_count,
+        sleeper_delays=tuple(sleeper_delays),
     )
