@@ -4,7 +4,7 @@
 
 ### YouTube収集subproject: scheduler統合と運用受入
 
-M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeは`95ff083`に続くscheduler XML正規化修正`5db7dbf`までで、この文書を含むlocal `main`はsmoke結果の状態文書commit 1件だけlive `origin/main`よりahead、runtime code差分なしである。Credentialはconfigured、日次Taskはinstalled 06:00であり、明示opt-inの実YouTube read-only smokeも成功した。source `9adef31`のlocal/remote feature branchとworktreeは統合・push確認後にcleanupした。複数日の収集運用、音声・本人声確認・分析、live server、UIは受入済みとはしない。
+M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeは`95ff083`に続くscheduler XML正規化修正`5db7dbf`までで、明示opt-inの実YouTube read-only smokeと状態文書も`origin/main`へ反映済みである。Credentialはconfigured、日次Taskはinstalled 06:00である。2026-08-22の最初のscheduled workerは起動したが、最初のseed unitが`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗した。DBは日次job、4 profile、7 unit、2 quota reservationを記録して安全に停止し、後続6 unitとcandidate/cursor昇格は未実行である。複数日の収集運用、音声・本人声確認・分析、live server、UIは受入済みとはしない。
 
 ## 完了済み（Completed）
 
@@ -72,7 +72,7 @@ M0、M1、M2中核バックエンドは完了済みである。YouTube収集subp
 
 ## 作業中（In Progress）
 
-- 最初の06:00 scheduled workerのdurable job・quota・checkpoint・cursor・candidate停止境界を観測する。
+- 最初の06:00 scheduled workerで発生した`YOUTUBE_PROVIDER_REQUEST_FAILED`を安全に診断し、明示承認後に既存のdurable jobを再試行する。再試行ではquota・checkpoint・cursor・candidate・`presence_unverified`停止境界を再監査する。
 
 ## 未着手（Not Started）
 
