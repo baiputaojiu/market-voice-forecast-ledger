@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### YouTube収集subproject: Task 13最終検証と運用handoff
+### YouTube収集subproject: scheduler統合と運用受入
 
-M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLIをTask 1～12で実装・独立review済みである。Task 13初回独立reviewの7件のImportant findingは順次RED/GREEN修正済みで、現在の作業はexact 19-path candidateの全verification、再凍結、限定最終review、承認後の限定commitである。明示opt-inの実YouTube smoke、音声・本人声確認・分析、live server、UIは受入済みとはしない。
+M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeは`95ff083`までで、local `main`はこの状態文書commitだけ`origin/main`より1 ahead、runtime code差分なしである。Credentialはconfigured、日次Taskはinstalled 06:00である。Windows照会XML互換修正`9adef31`はremote feature branchへpush済みだが`main`未統合である。明示opt-inの実YouTube smoke、音声・本人声確認・分析、live server、UIは受入済みとはしない。
 
 ## 完了済み（Completed）
 
@@ -65,10 +65,13 @@ M0、M1、M2中核バックエンドは完了済みである。YouTube収集subp
 - YouTube収集Task 1～12でclean person-model cutover、versioned profile、Credential Manager、safe client、canonical metadata、seed/search/manual discoverer、sealed queue、crash/quota回復、strict loopback API、Task Scheduler/CLIを実装し、各taskの独立reviewを通過した。
 - Task 13初回candidateは3 failed・7 passed・1 opt-in skipのREDから、10 passed・同skip 1件のfocused GREENとなった。初回独立review後はledgerless DB非変更、legacy evidence除去、1日window page 11継続、日次quota原子強制、scope-complete architecture guard、E2E全decision/job inventory、constant/no-trace smoke failureを順次RED/GREENで追加した。歴史migration `0001`～`0017`は変更していない。
 - 最終fix candidateのfocused suiteは17 passed・real smoke opt-in skip 1件、全backendは1732件中1730 passed・既存Windows symlink capability skip 1件・同real smoke skip 1件、work-state Allは242 passed・0 failedだった。compileall、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功した。
+- Task 13と全YouTube収集実装を`157f739`へsquashして`main`へ統合・pushし、Task Scheduler一覧互換修正`95ff083`も`main`へ反映した。
+- 開発端末でCredentialがconfigured、Task Schedulerがinstalled 06:00であることを秘密値を読み出さず確認した。
+- WindowsのTask Schedulerが登録XMLから終了期限のない定期task設定を正規化し、照会時にUTF-16宣言とnative code-page bytesを混在させる挙動を再現した。`9adef31`でrecurring XML、宣言、既定Enabled、LeastPrivilege、Unified Scheduling Engineをfail-closedに正規化し、関連216 testsと全backend 1747件を検証してremote feature branchへpushした。
 
 ## 作業中（In Progress）
 
-- exact 19-path treeのSHA256再凍結と限定最終review。承認前にはstage・commitしない。
+- `9adef31`を`main`へ統合し、統合後の全backend・公開安全性・実機statusを検証してから`main`をpushし、feature branch/worktreeを安全にcleanupする。
 - 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
 
 ## 未着手（Not Started）
@@ -77,7 +80,7 @@ M0、M1、M2中核バックエンドは完了済みである。YouTube収集subp
 
 次のsubprojectは未承認であり、以下の順序もユーザー判断前には確定しない。
 
-1. 実YouTube read-only smokeと網羅性の運用受入。明示承認とCredential Manager設定を別途必要とする。
+1. 実YouTube read-only smokeと網羅性の運用受入。Credentialは設定済みで、明示承認と確認対象の11文字video IDを別途必要とする。
 2. 音声取得、固定音声モデル、閾値設定、分割文字起こし、参照声本人確認の詳細specと実装。
 3. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
 4. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。

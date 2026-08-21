@@ -1,18 +1,21 @@
 # 作業状態
 
-最終更新: 2026-08-20 JST
+最終更新: 2026-08-22 JST
 
 この文書の状態は、このファイルを含むcommitに対応する。SHAは本文へ埋め込まず、Gitから取得する。
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～12の実装・独立reviewを完了した。Task 13の初回独立reviewで得た7件のImportant findingは、ledgerless DB非変更、legacy evidence除去、1日window継続、日次quota強制、architecture guard、E2E全inventory、smoke非開示として順次RED/GREEN修正済みである。現在はexact 19-path candidateの全verification、SHA256再凍結、限定再reviewを進めている。実YouTube smokeは明示承認がないため未実行で、音声・本人声確認・分析、実HTTP server/socket、React UIも未実装・未検証である。アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、7件のImportant findingのRED/GREEN修正、完全合成E2E、architecture guardを完了し、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeはTask Scheduler一覧互換修正`95ff083`までで、この文書を含むlocal `main`は状態文書3ファイルだけの1 commit分`origin/main`よりaheadである。開発端末ではCredentialがconfigured、日次Taskがinstalled 06:00であることを秘密値を読み出さず確認した。Windowsが照会XMLを正規化する挙動へ対応する`9adef31`はremote feature branchへpush済みだが`main`未統合である。実YouTube smoke、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- 現在の隔離worktree branch: `feature/youtube-collection`
-- Task 13開始時base: `b6cfb5ae6e75cf073a083f5aa64b4a879039f765` (`fix: validate YouTube schedule settings`)。Task 1～12はこのbaseまでにcommit・独立review済み。
+- `origin/main`の公開済みruntime base: `95ff083571bef5fb3b0e090332abedff9fb47f91` (`fix: accept duplicate scheduler rows`)
+- local `main`: この状態文書commitだけ`origin/main`より1 ahead。runtime code差分はない。現在SHAとahead/behindはGit検査scriptを正本とする。
+- YouTube収集squash統合: `157f739` (`feat: add durable YouTube collection pipeline (#1)`)
+- 現在の追加修正worktree branch: `fix/youtube-scheduler-xml`
+- 追加修正commit・upstream: `9adef31e3cde2000e9183a6b080a6d189c0b12a8` (`fix: normalize YouTube scheduler XML`)、`origin/fix/youtube-scheduler-xml`と一致し、PRなし、`main`未統合。
 - Task 19 commit: `3267968d67a70ecee0b6f68e13d241a73e7b634f` (`test: verify synthetic core backend flow`)
 - whole-branch Fix A: `9ba560c4db1a795479d831198f04cc3aa5b496f4` (`fix: prevent superseded analysis promotion`)
 - whole-branch Fix B: `55ccd07c680bbdaa0e532194305f776e04102f0f` (`fix: harden append-only audit boundaries`)
@@ -22,7 +25,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - whole-branch Fix F: `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` (`fix: reject disguised binary public artifacts`)
 - whole-branch Fix G: `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`)。
 - M2統合: `feature/m2-core-backend`をローカル`main`へfast-forward統合後、統合済みworktreeとbranchを通常削除した。
-- upstream: `feature/youtube-collection`には設定なし。YouTube収集subprojectでpush・merge・rebase・PRは行っていない。
+- YouTube収集subprojectはsquash統合済み。追加scheduler修正はfeature branchだけをpushし、PR・main merge・main pushはまだ行っていない。
 - ローカル環境: main直下の`.venv`はGit除外対象で、既存offline `setuptools 83`から再構築した。収集データや秘密情報を含まず、push対象ではない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
@@ -93,15 +96,17 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - YouTube収集Task 1～12は、旧organization/fixed-channel runtimeのclean cutover、4人のversioned DiscoveryProfile、Credential Manager、safe YouTube client、seed/search/manual発見、canonical metadata、sealed job/cursor、quota/crash回復、loopback API、Task Scheduler/CLIを実装し、各taskの独立reviewを通過した。
 - Task 13の完全合成worker flowは、4 person subjects、4 profile versions、seed/search設定、同一video 1行と人物別candidate、複数observation、各candidateに初期`presence_unverified` decisionがexact 1件だけ、7-source cursor map、全job/job-unit inventoryがYouTube sync 1 job・7 unitsだけ、collectionによるtranscript/speaker/analysis row 0件であることを一時SQLiteで確認する。
 - 最終fix candidateのfocused E2E・architecture・smoke境界は17 passed・real smoke opt-in skip 1件だった。全backendは1732件中1730 passed・既存Windows symlink capability skip 1件・同real smoke skip 1件、work-state Allは242 passed・0 failedだった。compileall、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功した。
+- Task 13最終commitを含むYouTube収集branchを`157f739`へsquashし、`main`へ統合・pushした。続く一覧互換修正`95ff083`も`main`と`origin/main`へ反映済みである。
+- 開発端末のWindows Credential Managerは`configured`、Task Schedulerは`installed 06:00`であることを2026-08-22 JSTに読み取り専用で再確認した。API key本文、task実行、実YouTube通信はこの確認で行っていない。
 
 ## 作業中（In Progress）
 
-- exact 19-path treeをSHA256で再凍結後、限定最終reviewを受ける。承認前にはstage・commitしない。
+- `fix/youtube-scheduler-xml`の`9adef31`を`main`へ統合し、統合後の全backend・公開安全性を検証してから`main`をpushし、安全にbranch/worktreeをcleanupする。
 - 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
 
 ## 未着手（Not Started）
 
-- 実YouTube read-only smokeと網羅性の運用受入。実行にはユーザーの明示承認とCredential Manager設定が必要。
+- 実YouTube read-only smokeと網羅性の運用受入。Credentialは設定済みで、実行にはユーザーの明示承認と確認対象の11文字video IDが必要。
 - 音声取得、音声処理、本人声確認の詳細設計。collectionはこれらのjobを自動生成しない。
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
@@ -110,6 +115,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 検証結果（Verification Results）
 
+- scheduler XML追加修正`9adef31`: 関連scheduler・CLI・API 216 passed。全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、明示opt-in real smoke skip 1件、failure 0。compileall、diff check、WorkingTree公開安全206ファイルが成功し、実機statusは`installed 06:00`だった。
 - 文書構造: 最初に必須文書欠落によるREDを確認し、追加後はGREEN。検証説明追加時も4件のREDを確認してから修正した。
 - 補助スクリプト: 未作成によるREDを確認後、Git状態・公開安全・状態文書・remote SHA検査18件がGREEN。
 - 公開安全の境界: `credentials/`強制stageの抜けをREDで再現し、禁止ディレクトリ追加後にGREEN。
@@ -186,9 +192,10 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. exact 19 pathsをstageせずSHA256で再凍結し、限定最終reviewの承認を得る。
-2. 承認後だけstaged公開安全とcached diffを検査し、Task 13限定commitを作る。push・merge・rebase・PRは行わない。
-3. 実YouTube運用受入または音声・本人声確認subprojectは、別途ユーザーが明示承認した場合だけ開始する。
+1. scheduler XML修正`9adef31`を`main`へ統合し、統合treeの全検証後に`main`をpushしてfeature branch/worktreeを安全にcleanupする。
+2. ユーザーが明示承認し、公開済みの確認対象video IDを指定した場合だけ、`channels.list`と`videos.list`のread-only smokeを実行する。
+3. 最初の06:00 workerについてjob、quota、checkpoint、cursor、candidate、`presence_unverified`停止境界を確認する。
+4. 音声・本人声確認、Codex adapter、UIのどのsubprojectを次に設計するか、ユーザー承認で決定する。
 
 ## 重要ファイル（Important Files）
 

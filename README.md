@@ -1,6 +1,6 @@
 # 相場見通し発言台帳
 
-YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドはユーザー受け入れ済みです。YouTube収集subprojectはTask 1～12の実装・独立reviewを終え、Task 13の完全合成E2E、architecture guard、全一括検証が成功しています。Task 13の最終独立review・限定commitと、明示opt-inの実YouTube運用受入は、この記述時点では未完了です。音声・本人声確認・予想分析・UIを含む完成版ではなく、投資判断には利用できません。
+YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドはユーザー受け入れ済みです。YouTube収集subprojectはTask 1～13の実装・独立review・完全合成E2E・architecture guardを完了し、`feat: add durable YouTube collection pipeline (#1)`として`main`へ統合済みです。明示opt-inの実YouTube運用受入、音声・本人声確認・予想分析・UIを含む完成版は未完了で、投資判断には利用できません。
 
 ## 現在の状態
 
@@ -10,22 +10,13 @@ YouTube上の対象者の発言を収集し、発言だけを根拠に日経平�
 - [現在の計画](docs/project/plan.md)
 - [公開データ方針](docs/project/public-data-policy.md)
 
-Fix D commit `a92bcaac9b592577d1a7f1efe7b1f70326853351` は組織主体の
-分析入力を個人話者修正から保護し、Fix E commit
-`cb2aaafe2c07fcf282d79a61fdf0e94c81be864f` は公開安全検査を実際の
-index blobへ固定しました。Fix F commit
-`25136c5048968eb4d81ba59c597b1bdcfd6f8f24` は、明示的に許可したbinary
-拡張子以外のNUL含有fileをStaged・WorkingTree両modeで内容非表示のまま
-fail-closedにします。Fix G commit
-`188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`) は、SQLite3 sidecarと派生coverage fileを
-`.gitignore`の第一防御にも追加し、scannerの第二防御と整合させます。Task 13の
-focused検証は17 passedで、実YouTube smoke 1件だけが
-`real YouTube operational acceptance not requested`としてskipされました。
-この検証はfake credential、transport、scheduler、clock、sleeperと一時SQLiteだけを
-使用しています。全backendは1732件中1730 passed、既存Windows symlink capability
-skip 1件、上記real smoke skip 1件でした。work-stateは242 passed・0 failed、
-WorkingTree公開安全は206ファイル、compileallとdiff checkも成功しました。最終独立reviewの
-結果は、凍結treeで観測した後だけ状態文書へ反映します。
+YouTube収集のsquash統合commitは`157f739`、公開済みruntime codeの最新commitは
+Task Scheduler一覧互換修正`95ff083`です。Windowsが登録XMLを再出力するときの宣言・既定値・
+設定正規化へ対応する追加修正`9adef31`はremote feature branchへpush済みですが、
+まだ`main`へ統合していません。この追加修正候補では関連216 testsが成功し、
+全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、
+明示opt-in real smoke skip 1件でした。通常testはfake credential、transport、
+scheduler、clock、sleeperと一時SQLiteだけを使用し、実YouTubeへ接続しません。
 
 ## WindowsでYouTube収集を運用する
 
@@ -44,6 +35,10 @@ python -m market_voice_forecast_ledger.cli youtube credential status
 python -m market_voice_forecast_ledger.cli youtube schedule install --time 06:00
 python -m market_voice_forecast_ledger.cli youtube schedule status
 ```
+
+2026-08-22 JST時点の開発端末ではCredentialが`configured`、Task Schedulerが
+`installed 06:00`であることを、秘密値を読み出さず確認しています。scheduler XML
+正規化修正`9adef31`の`main`統合と、実YouTube read-only smokeは別の未完了項目です。
 
 登録済みqueueを同じone-shot workerで処理します。`--once`はprocessを1回起動し、
 runnableなdurable jobをquota/defer境界まで順番にdrainする意味です。
