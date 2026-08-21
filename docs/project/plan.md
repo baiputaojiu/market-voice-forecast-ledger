@@ -4,7 +4,7 @@
 
 ### YouTube収集subproject: scheduler統合と運用受入
 
-M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeは`95ff083`までで、local `main`は状態文書2 commitとscheduler XML修正`5db7dbf`の計3 commit分`origin/main`よりaheadである。Credentialはconfigured、日次Taskはinstalled 06:00である。Windows照会XML互換修正はsource `9adef31`からlocal `main`へ取り込み済みだが、remote `main`には未反映である。明示opt-inの実YouTube smoke、音声・本人声確認・分析、live server、UIは受入済みとはしない。
+M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeは`95ff083`に続くscheduler XML正規化修正`5db7dbf`までで、local `main`とlive `origin/main`の一致を確認済みである。Credentialはconfigured、日次Taskはinstalled 06:00である。source `9adef31`のlocal/remote feature branchとworktreeは統合・push確認後にcleanupした。明示opt-inの実YouTube smoke、音声・本人声確認・分析、live server、UIは受入済みとはしない。
 
 ## 完了済み（Completed）
 
@@ -67,12 +67,12 @@ M0、M1、M2中核バックエンドは完了済みである。YouTube収集subp
 - 最終fix candidateのfocused suiteは17 passed・real smoke opt-in skip 1件、全backendは1732件中1730 passed・既存Windows symlink capability skip 1件・同real smoke skip 1件、work-state Allは242 passed・0 failedだった。compileall、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功した。
 - Task 13と全YouTube収集実装を`157f739`へsquashして`main`へ統合・pushし、Task Scheduler一覧互換修正`95ff083`も`main`へ反映した。
 - 開発端末でCredentialがconfigured、Task Schedulerがinstalled 06:00であることを秘密値を読み出さず確認した。
-- WindowsのTask Schedulerが登録XMLから終了期限のない定期task設定を正規化し、照会時にUTF-16宣言とnative code-page bytesを混在させる挙動を再現した。source `9adef31`でrecurring XML、宣言、既定Enabled、LeastPrivilege、Unified Scheduling Engineをfail-closedに正規化し、関連216 testsと全backend 1747件を検証した後、local `main`へ`5db7dbf`として取り込んだ。
+- WindowsのTask Schedulerが登録XMLから終了期限のない定期task設定を正規化し、照会時にUTF-16宣言とnative code-page bytesを混在させる挙動を再現した。source `9adef31`でrecurring XML、宣言、既定Enabled、LeastPrivilege、Unified Scheduling Engineをfail-closedに正規化し、関連216 testsと全backend 1747件を検証した後、local `main`へ`5db7dbf`として取り込んだ。通常pushとlive SHA一致確認後にlocal/remote feature branchとworktreeをcleanupした。
 
 ## 作業中（In Progress）
 
-- scheduler XML修正を含むlocal `main`をpushし、live SHA一致確認後にfeature branch/worktreeを安全にcleanupする。
 - 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
+- 最初の06:00 scheduled workerのdurable job・quota・checkpoint・cursor・candidate停止境界を観測する。
 
 ## 未着手（Not Started）
 

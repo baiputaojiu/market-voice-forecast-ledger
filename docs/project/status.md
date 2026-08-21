@@ -6,16 +6,15 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、7件のImportant findingのRED/GREEN修正、完全合成E2E、architecture guardを完了し、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeはTask Scheduler一覧互換修正`95ff083`までで、この文書を含むlocal `main`は状態文書2 commitとscheduler XML修正`5db7dbf`の計3 commit分`origin/main`よりaheadである。開発端末ではCredentialがconfigured、日次Taskがinstalled 06:00であることを秘密値を読み出さず確認した。Windowsが照会XMLを正規化する挙動への修正はsource commit `9adef31`からlocal `main`へ取り込み済みだが、`origin/main`には未反映である。実YouTube smoke、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、7件のImportant findingのRED/GREEN修正、完全合成E2E、architecture guardを完了し、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeはTask Scheduler一覧互換修正`95ff083`に続くscheduler XML正規化修正`5db7dbf`までで、local `main`とlive `origin/main`の一致を確認済みである。開発端末ではCredentialがconfigured、日次Taskがinstalled 06:00であることを秘密値を読み出さず確認した。source commit `9adef31`のlocal/remote feature branchとworktreeは統合・push確認後にcleanupした。実YouTube smoke、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- `origin/main`の公開済みruntime base: `95ff083571bef5fb3b0e090332abedff9fb47f91` (`fix: accept duplicate scheduler rows`)
-- local `main`: この状態文書を含む状態文書2 commitとscheduler XML修正1 commitの計3 commit分`origin/main`よりahead。runtime code差分は`5db7dbf`だけである。現在SHAとahead/behindはGit検査scriptを正本とする。
+- `origin/main`の公開済みruntime base: `5db7dbf580464674dbc6b11dc74cd055978d48d4` (`fix: normalize YouTube scheduler XML`)
+- local `main`: live `origin/main`と一致確認済み。現在SHAとahead/behindはGit検査scriptを正本とする。
 - YouTube収集squash統合: `157f739` (`feat: add durable YouTube collection pipeline (#1)`)
-- 現在の追加修正worktree branch: `fix/youtube-scheduler-xml`
-- 追加修正source commit・upstream: `9adef31e3cde2000e9183a6b080a6d189c0b12a8` (`fix: normalize YouTube scheduler XML`)、`origin/fix/youtube-scheduler-xml`と一致する。local `main`へは履歴追跡付きの`5db7dbf`として取り込み済みで、PR・`main` pushは行っていない。
+- 追加修正source commit: `9adef31e3cde2000e9183a6b080a6d189c0b12a8` (`fix: normalize YouTube scheduler XML`)。local `main`へ履歴追跡付きの`5db7dbf`として取り込み、pushとlive SHA確認後にlocal/remote feature branchとworktreeを削除した。
 - Task 19 commit: `3267968d67a70ecee0b6f68e13d241a73e7b634f` (`test: verify synthetic core backend flow`)
 - whole-branch Fix A: `9ba560c4db1a795479d831198f04cc3aa5b496f4` (`fix: prevent superseded analysis promotion`)
 - whole-branch Fix B: `55ccd07c680bbdaa0e532194305f776e04102f0f` (`fix: harden append-only audit boundaries`)
@@ -25,7 +24,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - whole-branch Fix F: `25136c5048968eb4d81ba59c597b1bdcfd6f8f24` (`fix: reject disguised binary public artifacts`)
 - whole-branch Fix G: `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`)。
 - M2統合: `feature/m2-core-backend`をローカル`main`へfast-forward統合後、統合済みworktreeとbranchを通常削除した。
-- YouTube収集subprojectはsquash統合済み。追加scheduler修正もlocal `main`へ統合済みだが、PR・main push・feature branch/worktree cleanupはまだ行っていない。
+- YouTube収集subprojectと追加scheduler修正は`main`へ統合・push済みで、PRを作らずlive remote SHA一致確認後にfeature branch/worktreeをcleanupした。
 - ローカル環境: main直下の`.venv`はGit除外対象で、既存offline `setuptools 83`から再構築した。収集データや秘密情報を含まず、push対象ではない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
@@ -98,11 +97,10 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 最終fix candidateのfocused E2E・architecture・smoke境界は17 passed・real smoke opt-in skip 1件だった。全backendは1732件中1730 passed・既存Windows symlink capability skip 1件・同real smoke skip 1件、work-state Allは242 passed・0 failedだった。compileall、state-doc、WorkingTree公開安全206ファイル、diff check、backend wrapperも成功した。
 - Task 13最終commitを含むYouTube収集branchを`157f739`へsquashし、`main`へ統合・pushした。続く一覧互換修正`95ff083`も`main`と`origin/main`へ反映済みである。
 - 開発端末のWindows Credential Managerは`configured`、Task Schedulerは`installed 06:00`であることを2026-08-22 JSTに読み取り専用で再確認した。API key本文、task実行、実YouTube通信はこの確認で行っていない。
-- scheduler XML正規化修正をsource commit `9adef31`からlocal `main`の`5db7dbf`へ履歴追跡付きで取り込んだ。remote `main`へのpushとfeature branch/worktree cleanupは行っていない。
+- scheduler XML正規化修正をsource commit `9adef31`からlocal `main`の`5db7dbf`へ履歴追跡付きで取り込み、`origin/main`へ通常pushした。live remote SHA一致を確認後、local/remote feature branchと`.worktrees/youtube-scheduler-xml`を削除した。
 
 ## 作業中（In Progress）
 
-- scheduler XML修正を含むlocal `main`をremoteへpushし、live SHA一致確認後に`fix/youtube-scheduler-xml` branch/worktreeを安全にcleanupする。
 - 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
 
 ## 未着手（Not Started）
@@ -116,7 +114,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 検証結果（Verification Results）
 
-- scheduler XML追加修正source `9adef31`・local統合`5db7dbf`: 関連scheduler・CLI・API 216 passed。全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、明示opt-in real smoke skip 1件、failure 0。compileall、diff check、WorkingTree公開安全206ファイルが成功し、実機statusは`installed 06:00`だった。
+- scheduler XML追加修正source `9adef31`・統合`5db7dbf`: 関連scheduler・CLI・API 216 passed。全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、明示opt-in real smoke skip 1件、failure 0。compileall、diff check、WorkingTree公開安全206ファイルが成功し、実機statusは`installed 06:00`だった。`main` push後のlive remote SHA一致とlocal/remote feature branch・worktree削除も確認した。
 - 文書構造: 最初に必須文書欠落によるREDを確認し、追加後はGREEN。検証説明追加時も4件のREDを確認してから修正した。
 - 補助スクリプト: 未作成によるREDを確認後、Git状態・公開安全・状態文書・remote SHA検査18件がGREEN。
 - 公開安全の境界: `credentials/`強制stageの抜けをREDで再現し、禁止ディレクトリ追加後にGREEN。
@@ -193,10 +191,9 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. scheduler XML修正`5db7dbf`を含むlocal `main`をpushし、live SHA一致確認後にfeature branch/worktreeを安全にcleanupする。
-2. ユーザーが明示承認し、公開済みの確認対象video IDを指定した場合だけ、`channels.list`と`videos.list`のread-only smokeを実行する。
-3. 最初の06:00 workerについてjob、quota、checkpoint、cursor、candidate、`presence_unverified`停止境界を確認する。
-4. 音声・本人声確認、Codex adapter、UIのどのsubprojectを次に設計するか、ユーザー承認で決定する。
+1. ユーザーが明示承認し、公開済みの確認対象video IDを指定した場合だけ、`channels.list`と`videos.list`のread-only smokeを実行する。
+2. 最初の06:00 workerについてjob、quota、checkpoint、cursor、candidate、`presence_unverified`停止境界を確認する。
+3. 音声・本人声確認、Codex adapter、UIのどのsubprojectを次に設計するか、ユーザー承認で決定する。
 
 ## 重要ファイル（Important Files）
 
