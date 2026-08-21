@@ -1,6 +1,6 @@
 # 相場見通し発言台帳
 
-YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドはユーザー受け入れ済みです。YouTube収集subprojectはTask 1～13の実装・独立review・完全合成E2E・architecture guardを完了し、`feat: add durable YouTube collection pipeline (#1)`として`main`へ統合済みです。明示opt-inの実YouTube運用受入、音声・本人声確認・予想分析・UIを含む完成版は未完了で、投資判断には利用できません。
+YouTube上の対象者の発言を収集し、発言だけを根拠に日経平均、TOPIX、S&P 500、XAU/USDの将来見通しを整理・比較するWindows向けローカルWebアプリです。M2中核バックエンドはユーザー受け入れ済みです。YouTube収集subprojectはTask 1～13の実装・独立review・完全合成E2E・architecture guard・明示opt-inの実YouTube read-only smokeを完了し、`feat: add durable YouTube collection pipeline (#1)`として`main`へ統合済みです。複数日の収集運用、音声・本人声確認・予想分析・UIを含む完成版は未完了で、投資判断には利用できません。
 
 ## 現在の状態
 
@@ -38,7 +38,8 @@ python -m market_voice_forecast_ledger.cli youtube schedule status
 
 2026-08-22 JST時点の開発端末ではCredentialが`configured`、Task Schedulerが
 `installed 06:00`であることを、秘密値を読み出さず確認しています。scheduler XML
-正規化修正`5db7dbf`はremote反映済みで、実YouTube read-only smokeは未完了です。
+正規化修正`5db7dbf`はremote反映済みです。実YouTube read-only smokeも、公開video IDを
+process環境だけに置いて成功し、終了後に環境変数を削除しています。
 
 登録済みqueueを同じone-shot workerで処理します。`--once`はprocessを1回起動し、
 runnableなdurable jobをquota/defer境界まで順番にdrainする意味です。
@@ -105,7 +106,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-backend.ps1
 - 予想分析は、保存された対象者の発言だけを根拠にします。Web検索、現在相場、Codexの一般知識では補強しません。
 - 実際の全文文字起こし、音声、埋め込み、SQLiteデータベース、runtime log、cache、資格情報はリポジトリ外に置き、commitしません。
 - 分析結果は投資助言ではありません。
-- 通常testは実YouTube、実Credential Manager、実Task Schedulerへ接続しません。実YouTube smokeは明示opt-inされておらず、運用受入はpendingです。
+- 通常testは実YouTube、実Credential Manager、実Task Schedulerへ接続しません。明示opt-inの実YouTube smokeは2026-08-22 JSTに成功しましたが、通常suiteでは引き続き理由付きでskipします。
 - 音声取得、字幕・全文文字起こし、本人声確認、予想分析のcollection連動、実HTTP server/socket、UI、電源断・disk failure、hostileな同時junction差し替え、未bootstrap fresh machineへのoffline導入、remote公開、完成製品の受け入れは未検証です。
 
 ## ローカルAPIのセキュリティ境界

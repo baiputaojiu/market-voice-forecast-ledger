@@ -6,13 +6,13 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、7件のImportant findingのRED/GREEN修正、完全合成E2E、architecture guardを完了し、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeはTask Scheduler一覧互換修正`95ff083`に続くscheduler XML正規化修正`5db7dbf`までで、local `main`とlive `origin/main`の一致を確認済みである。開発端末ではCredentialがconfigured、日次Taskがinstalled 06:00であることを秘密値を読み出さず確認した。source commit `9adef31`のlocal/remote feature branchとworktreeは統合・push確認後にcleanupした。実YouTube smoke、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、7件のImportant findingのRED/GREEN修正、完全合成E2E、architecture guardを完了し、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeはTask Scheduler一覧互換修正`95ff083`に続くscheduler XML正規化修正`5db7dbf`までである。この文書を含むlocal `main`はsmoke結果の状態文書commit 1件だけlive `origin/main`よりaheadで、runtime code差分はない。開発端末ではCredentialがconfigured、日次Taskがinstalled 06:00であることを秘密値を読み出さず確認した。source commit `9adef31`のlocal/remote feature branchとworktreeは統合・push確認後にcleanupした。明示opt-inの実YouTube read-only smokeも成功した。複数日の収集運用、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
 - `origin/main`の公開済みruntime base: `5db7dbf580464674dbc6b11dc74cd055978d48d4` (`fix: normalize YouTube scheduler XML`)
-- local `main`: live `origin/main`と一致確認済み。現在SHAとahead/behindはGit検査scriptを正本とする。
+- local `main`: この状態文書commit 1件だけlive `origin/main`よりahead。runtime code差分はない。現在SHAとahead/behindはGit検査scriptを正本とする。
 - YouTube収集squash統合: `157f739` (`feat: add durable YouTube collection pipeline (#1)`)
 - 追加修正source commit: `9adef31e3cde2000e9183a6b080a6d189c0b12a8` (`fix: normalize YouTube scheduler XML`)。local `main`へ履歴追跡付きの`5db7dbf`として取り込み、pushとlive SHA確認後にlocal/remote feature branchとworktreeを削除した。
 - Task 19 commit: `3267968d67a70ecee0b6f68e13d241a73e7b634f` (`test: verify synthetic core backend flow`)
@@ -98,14 +98,15 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - Task 13最終commitを含むYouTube収集branchを`157f739`へsquashし、`main`へ統合・pushした。続く一覧互換修正`95ff083`も`main`と`origin/main`へ反映済みである。
 - 開発端末のWindows Credential Managerは`configured`、Task Schedulerは`installed 06:00`であることを2026-08-22 JSTに読み取り専用で再確認した。API key本文、task実行、実YouTube通信はこの確認で行っていない。
 - scheduler XML正規化修正をsource commit `9adef31`からlocal `main`の`5db7dbf`へ履歴追跡付きで取り込み、`origin/main`へ通常pushした。live remote SHA一致を確認後、local/remote feature branchと`.worktrees/youtube-scheduler-xml`を削除した。
+- ユーザーの明示承認後、YouTube公開検索と公式oEmbedで確認した11文字video IDをprocess環境だけに設定し、Credential Managerと実YouTube Data APIを使うread-only smokeを実行した。`channels.list`・`videos.list`のschema検証を含む3 testsが成功し、API key・provider本文を表示せず、終了時に両環境変数を削除した。video IDはrepository file・DBへ保存していない。
 
 ## 作業中（In Progress）
 
-- 実YouTube smokeは明示承認されていないため実行せず、運用受入pendingとして維持する。
+- 最初の06:00 scheduled workerについて、durable job・quota・checkpoint・cursor・candidate・`presence_unverified`停止境界を観測する。
 
 ## 未着手（Not Started）
 
-- 実YouTube read-only smokeと網羅性の運用受入。Credentialは設定済みで、実行にはユーザーの明示承認と確認対象の11文字video IDが必要。
+- 複数日・複数profileでの実YouTube収集網羅性と長期運用受入。
 - 音声取得、音声処理、本人声確認の詳細設計。collectionはこれらのjobを自動生成しない。
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
@@ -115,6 +116,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 ## 検証結果（Verification Results）
 
 - scheduler XML追加修正source `9adef31`・統合`5db7dbf`: 関連scheduler・CLI・API 216 passed。全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、明示opt-in real smoke skip 1件、failure 0。compileall、diff check、WorkingTree公開安全206ファイルが成功し、実機statusは`installed 06:00`だった。`main` push後のlive remote SHA一致とlocal/remote feature branch・worktree削除も確認した。
+- 実YouTube read-only smoke: Credential statusは`configured`。公開video IDをprocess環境だけに設定したopt-in実行は3 passed、exit 0だった。`channels.list`と`videos.list`のresponse shapeを検証し、secret・provider値は出力されず、実行後にenv 2件が不存在であることを確認した。
 - 文書構造: 最初に必須文書欠落によるREDを確認し、追加後はGREEN。検証説明追加時も4件のREDを確認してから修正した。
 - 補助スクリプト: 未作成によるREDを確認後、Git状態・公開安全・状態文書・remote SHA検査18件がGREEN。
 - 公開安全の境界: `credentials/`強制stageの抜けをREDで再現し、禁止ディレクトリ追加後にGREEN。
@@ -178,7 +180,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 現在のFastAPI TestClient依存から、Starletteの`httpx`利用非推奨warningが1件出る。テスト失敗ではなく、後続のdependency更新時に追跡する。
 - 現在のWindows環境はsymlink作成権限がなく、symlink escapeのcapability test 1件を理由付きでskipした。
 - Task 19は完全合成・process内API試験であり、実YouTube、音声、Codex CLI/model/tool、HTTP server/socket、UIを検証していない。
-- Task 13のreal smokeは常時収集されるが、明示opt-inがない通常実行では`real YouTube operational acceptance not requested`としてskipする。実YouTube operational acceptanceはpendingである。
+- Task 13のreal smokeは常時収集され、明示opt-inがない通常実行では`real YouTube operational acceptance not requested`としてskipする。明示opt-inの単発read-only smokeは成功済みだが、複数日の収集運用受入は未完了である。
 - YouTube collectionは音声、字幕、全文文字起こし、本人声判定、speaker assignment、予想分析を実行しない。それらのcollection連動acceptanceは後続subprojectである。
 - 電源断・disk failure、hostileな同時junction差し替え、未bootstrap fresh machineへのoffline installation、remote publication、完成製品の受け入れは検証していない。
 
@@ -191,9 +193,8 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. ユーザーが明示承認し、公開済みの確認対象video IDを指定した場合だけ、`channels.list`と`videos.list`のread-only smokeを実行する。
-2. 最初の06:00 workerについてjob、quota、checkpoint、cursor、candidate、`presence_unverified`停止境界を確認する。
-3. 音声・本人声確認、Codex adapter、UIのどのsubprojectを次に設計するか、ユーザー承認で決定する。
+1. 最初の06:00 workerについてjob、quota、checkpoint、cursor、candidate、`presence_unverified`停止境界を確認する。
+2. 音声・本人声確認、Codex adapter、UIのどのsubprojectを次に設計するか、ユーザー承認で決定する。
 
 ## 重要ファイル（Important Files）
 
