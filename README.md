@@ -12,8 +12,8 @@ YouTube上の対象者の発言を収集し、発言だけを根拠に日経平�
 
 YouTube収集のsquash統合commitは`157f739`、公開済みruntime codeの最新commitは
 Task Scheduler一覧互換修正`95ff083`です。Windowsが登録XMLを再出力するときの宣言・既定値・
-設定正規化へ対応する追加修正`9adef31`はremote feature branchへpush済みですが、
-まだ`main`へ統合していません。この追加修正候補では関連216 testsが成功し、
+設定正規化へ対応する修正は、source commit `9adef31`からlocal `main`の`5db7dbf`へ
+取り込み済みですが、まだ`origin/main`へpushしていません。統合treeでは関連216 testsが成功し、
 全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、
 明示opt-in real smoke skip 1件でした。通常testはfake credential、transport、
 scheduler、clock、sleeperと一時SQLiteだけを使用し、実YouTubeへ接続しません。
@@ -38,7 +38,7 @@ python -m market_voice_forecast_ledger.cli youtube schedule status
 
 2026-08-22 JST時点の開発端末ではCredentialが`configured`、Task Schedulerが
 `installed 06:00`であることを、秘密値を読み出さず確認しています。scheduler XML
-正規化修正`9adef31`の`main`統合と、実YouTube read-only smokeは別の未完了項目です。
+正規化修正`5db7dbf`のremote反映と、実YouTube read-only smokeは別の未完了項目です。
 
 登録済みqueueを同じone-shot workerで処理します。`--once`はprocessを1回起動し、
 runnableなdurable jobをquota/defer境界まで順番にdrainする意味です。
