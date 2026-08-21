@@ -279,7 +279,6 @@ def test_registration_builds_exact_utf16_interactive_task_xml(
         "WakeToRun",
         "Enabled",
         "Hidden",
-        "DeleteExpiredTaskAfter",
         "IdleSettings",
         "ExecutionTimeLimit",
         "Priority",
@@ -343,6 +342,27 @@ def test_registration_builds_exact_utf16_interactive_task_xml(
             "/F",
         ),
     )
+
+
+def test_registration_does_not_expire_a_recurring_trigger_without_end_boundary():
+    runner, _calls, captured = _registration_runner()
+    adapter = TaskSchedulerAdapter(
+        runner=runner,
+        today=lambda: date(2026, 8, 19),
+    )
+
+    adapter.install(time(6, 0))
+
+    xml_bytes = captured["xml_bytes"]
+    assert isinstance(xml_bytes, bytes)
+    root = ElementTree.fromstring(xml_bytes)
+    ns = {"task": TASK_NAMESPACE}
+    trigger = root.find("./task:Triggers/task:CalendarTrigger", ns)
+    settings = root.find("./task:Settings", ns)
+    assert trigger is not None
+    assert settings is not None
+    assert trigger.find("task:EndBoundary", ns) is None
+    assert settings.find("task:DeleteExpiredTaskAfter", ns) is None
 
 
 @pytest.mark.parametrize(
@@ -496,6 +516,7 @@ MANAGED_TASK_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
     <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
     <StartWhenAvailable>true</StartWhenAvailable>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -595,6 +616,157 @@ class ReviewSchedulerRunner:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+def test_status_normalizes_native_pipe_bytes_with_utf16_declaration(monkeypatch):
+    monkeypatch.setattr(
+        "market_voice_forecast_ledger.windows.task_scheduler.locale.getpreferredencoding",
+        lambda _do_setlocale=False: "cp932",
+    )
+    native_xml = MANAGED_TASK_XML.replace(
+        b'encoding="UTF-8"',
+        b'encoding="UTF-16"',
+        1,
+    )
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=native_xml)
+    )
+
+    status = TaskSchedulerAdapter(runner=runner).status()
+
+    assert status == ScheduledTaskStatus(
+        installed=True,
+        local_time="06:00",
+        start_when_available=True,
+        multiple_instances="Queue",
+    )
+    assert [call[0] for call in runner.calls] == [QUERY_XML_ARGV, WHOAMI_ARGV]
+
+
+def test_status_accepts_omitted_default_enabled_in_native_calendar_trigger(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "market_voice_forecast_ledger.windows.task_scheduler.locale.getpreferredencoding",
+        lambda _do_setlocale=False: "cp932",
+    )
+    native_xml = MANAGED_TASK_XML.replace(
+        b'encoding="UTF-8"',
+        b'encoding="UTF-16"',
+        1,
+    ).replace(
+        b"      <Enabled>true</Enabled>\n",
+        b"",
+        1,
+    )
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=native_xml)
+    )
+
+    status = TaskSchedulerAdapter(runner=runner).status()
+
+    assert status == ScheduledTaskStatus(
+        installed=True,
+        local_time="06:00",
+        start_when_available=True,
+        multiple_instances="Queue",
+    )
+
+
+def test_status_accepts_omitted_default_least_privilege_in_native_principal(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "market_voice_forecast_ledger.windows.task_scheduler.locale.getpreferredencoding",
+        lambda _do_setlocale=False: "cp932",
+    )
+    native_xml = MANAGED_TASK_XML.replace(
+        b'encoding="UTF-8"',
+        b'encoding="UTF-16"',
+        1,
+    ).replace(
+        b"      <RunLevel>LeastPrivilege</RunLevel>\n",
+        b"",
+        1,
+    )
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=native_xml)
+    )
+
+    status = TaskSchedulerAdapter(runner=runner).status()
+
+    assert status == ScheduledTaskStatus(
+        installed=True,
+        local_time="06:00",
+        start_when_available=True,
+        multiple_instances="Queue",
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_enabled_xml",
+    (
+        MANAGED_TASK_XML.replace(
+            b"<Enabled>true</Enabled>",
+            b"<Enabled>false</Enabled>",
+            1,
+        ),
+        MANAGED_TASK_XML.replace(
+            b"<Enabled>true</Enabled>",
+            b"<Enabled>true</Enabled><Enabled>true</Enabled>",
+            1,
+        ),
+    ),
+    ids=("explicit-false", "duplicate"),
+)
+def test_status_rejects_unsafe_calendar_trigger_enabled_values(
+    unsafe_enabled_xml,
+):
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=unsafe_enabled_xml)
+    )
+
+    with pytest.raises(DomainError) as caught:
+        TaskSchedulerAdapter(runner=runner).status()
+
+    assert caught.value.code == "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE"
+
+
+def test_status_rejects_undecodable_native_pipe_xml(monkeypatch):
+    monkeypatch.setattr(
+        "market_voice_forecast_ledger.windows.task_scheduler.locale.getpreferredencoding",
+        lambda _do_setlocale=False: "cp932",
+    )
+    native_xml = MANAGED_TASK_XML.replace(
+        b'encoding="UTF-8"',
+        b'encoding="UTF-16"',
+        1,
+    ) + b"\x81"
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=native_xml)
+    )
+
+    with pytest.raises(DomainError) as caught:
+        TaskSchedulerAdapter(runner=runner).status()
+
+    assert caught.value.code == "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE"
+
+
+def test_status_keeps_genuine_utf16_task_xml_supported():
+    genuine_utf16_xml = MANAGED_TASK_XML.decode("utf-8").replace(
+        'encoding="UTF-8"',
+        'encoding="UTF-16"',
+        1,
+    ).encode("utf-16")
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(
+            stdout=genuine_utf16_xml
+        )
+    )
+
+    status = TaskSchedulerAdapter(runner=runner).status()
+
+    assert status.local_time == "06:00"
 
 
 def _invoke_review_operation(adapter, operation):
@@ -927,11 +1099,10 @@ EXPECTED_SCALAR_SETTINGS = {
     "WakeToRun": "false",
     "Enabled": "true",
     "Hidden": "false",
-    "DeleteExpiredTaskAfter": "PT0S",
     "ExecutionTimeLimit": "PT0S",
     "Priority": "7",
     "RunOnlyIfIdle": "false",
-    "UseUnifiedSchedulingEngine": "false",
+    "UseUnifiedSchedulingEngine": "true",
     "DisallowStartOnRemoteAppSession": "false",
 }
 EXPECTED_IDLE_SETTINGS = {
@@ -944,6 +1115,7 @@ REQUIRED_SETTINGS = (
     ("MultipleInstancesPolicy", "Queue"),
     ("StartWhenAvailable", "true"),
     ("ExecutionTimeLimit", "PT0S"),
+    ("UseUnifiedSchedulingEngine", "true"),
 )
 
 
@@ -979,12 +1151,15 @@ SETTINGS_MUTATIONS = (
     _task_xml_with_added_settings(("Hidden", "true")),
     _task_xml_with_added_settings(("Priority", "8")),
     _task_xml_with_added_settings(("RunOnlyIfIdle", "true")),
-    _task_xml_with_added_settings(("UseUnifiedSchedulingEngine", "true")),
+    _task_xml_with_settings(
+        *REQUIRED_SETTINGS[:-1],
+        ("UseUnifiedSchedulingEngine", "false"),
+    ),
     _task_xml_with_added_settings(
         ("DisallowStartOnRemoteAppSession", "true")
     ),
     _task_xml_with_added_settings(("WakeToRun", "true")),
-    _task_xml_with_added_settings(("DeleteExpiredTaskAfter", "PT1H")),
+    _task_xml_with_added_settings(("DeleteExpiredTaskAfter", "PT0S")),
     _task_xml_with_added_settings(
         (
             "IdleSettings",
@@ -1096,7 +1271,7 @@ def test_i3_changed_settings_block_status_run_delete_and_create(
     assert caught.code == expected_code
 
 
-FULL_DEFAULT_SETTINGS_ARBITRARY_ORDER = (
+FULL_MANAGED_SETTINGS_ARBITRARY_ORDER = (
     ("Priority", "7"),
     ("Enabled", "true"),
     ("ExecutionTimeLimit", "PT0S"),
@@ -1116,10 +1291,9 @@ FULL_DEFAULT_SETTINGS_ARBITRARY_ORDER = (
     ("StartWhenAvailable", "true"),
     ("AllowHardTerminate", "true"),
     ("Hidden", "false"),
-    ("UseUnifiedSchedulingEngine", "false"),
+    ("UseUnifiedSchedulingEngine", "true"),
     ("AllowStartOnDemand", "true"),
     ("StopIfGoingOnBatteries", "true"),
-    ("DeleteExpiredTaskAfter", "PT0S"),
     ("DisallowStartOnRemoteAppSession", "false"),
     ("RunOnlyIfNetworkAvailable", "false"),
 )
@@ -1132,12 +1306,12 @@ FULL_DEFAULT_SETTINGS_ARBITRARY_ORDER = (
         _task_xml_with_added_settings(
             ("IdleSettings", (("Duration", "PT10M"),))
         ),
-        _task_xml_with_settings(*FULL_DEFAULT_SETTINGS_ARBITRARY_ORDER),
+        _task_xml_with_settings(*FULL_MANAGED_SETTINGS_ARBITRARY_ORDER),
     ),
     ids=(
         "documented-defaults-omitted",
         "idle-defaults-partly-omitted",
-        "documented-defaults-explicit",
+        "managed-settings-explicit",
     ),
 )
 def test_i3_documented_settings_defaults_normalize_to_managed_task(xml):
@@ -1148,3 +1322,19 @@ def test_i3_documented_settings_defaults_normalize_to_managed_task(xml):
     status = TaskSchedulerAdapter(runner=runner).status()
 
     assert status == ScheduledTaskStatus(True, "06:00", True, "Queue")
+
+
+def test_status_rejects_omitted_unified_scheduler_engine():
+    omitted_engine_xml = MANAGED_TASK_XML.replace(
+        b"    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>\n",
+        b"",
+        1,
+    )
+    runner = ReviewSchedulerRunner(
+        query_response=FakeCompletedProcess(stdout=omitted_engine_xml)
+    )
+
+    with pytest.raises(DomainError) as caught:
+        TaskSchedulerAdapter(runner=runner).status()
+
+    assert caught.value.code == "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE"

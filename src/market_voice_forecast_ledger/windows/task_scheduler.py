@@ -36,6 +36,8 @@ _TASK_URI = f"\\{YOUTUBE_SYNC_TASK_NAME}"
 _TASK_DESCRIPTION = (
     "Managed by Market Voice Forecast Ledger for daily YouTube sync."
 )
+_NATIVE_PIPE_UTF16_DECLARATION = '<?xml version="1.0" encoding="UTF-16"?>'
+_UTF8_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>'
 _TASK_SETTINGS = (
     ("AllowStartOnDemand", "true"),
     ("MultipleInstancesPolicy", "Queue"),
@@ -47,12 +49,11 @@ _TASK_SETTINGS = (
     ("WakeToRun", "false"),
     ("Enabled", "true"),
     ("Hidden", "false"),
-    ("DeleteExpiredTaskAfter", "PT0S"),
     ("IdleSettings", None),
     ("ExecutionTimeLimit", "PT0S"),
     ("Priority", "7"),
     ("RunOnlyIfIdle", "false"),
-    ("UseUnifiedSchedulingEngine", "false"),
+    ("UseUnifiedSchedulingEngine", "true"),
     ("DisallowStartOnRemoteAppSession", "false"),
 )
 _TASK_IDLE_SETTINGS = (
@@ -62,7 +63,12 @@ _TASK_IDLE_SETTINGS = (
     ("RestartOnIdle", "false"),
 )
 _REQUIRED_TASK_SETTINGS = frozenset(
-    {"MultipleInstancesPolicy", "StartWhenAvailable", "ExecutionTimeLimit"}
+    {
+        "MultipleInstancesPolicy",
+        "StartWhenAvailable",
+        "ExecutionTimeLimit",
+        "UseUnifiedSchedulingEngine",
+    }
 )
 _MAX_WHOAMI_BYTES = 8_192
 _MAX_TASK_LIST_BYTES = 1_048_576
@@ -441,6 +447,9 @@ def _parse_task_status(
         or b"<!ENTITY" in xml_bytes.upper()
     ):
         raise ValueError("task XML is invalid")
+    xml_bytes = _normalize_native_task_xml(xml_bytes)
+    if len(xml_bytes) > _MAX_TASK_XML_BYTES:
+        raise ValueError("task XML is invalid")
     root = ElementTree.fromstring(xml_bytes)
     namespace = f"{{{_TASK_NAMESPACE}}}"
     if root.tag != f"{namespace}Task" or root.attrib.get("version") != "1.4":
@@ -464,20 +473,28 @@ def _parse_task_status(
     ):
         raise ValueError("daily trigger is invalid")
     trigger = trigger_containers[0][0]
-    if {
-        child.tag for child in trigger
-    } != {
-        f"{namespace}StartBoundary",
-        f"{namespace}Enabled",
-        f"{namespace}ScheduleByDay",
-    } or len(trigger) != 3:
+    trigger_children = tuple(child.tag for child in trigger)
+    if trigger_children not in {
+        (
+            f"{namespace}StartBoundary",
+            f"{namespace}Enabled",
+            f"{namespace}ScheduleByDay",
+        ),
+        (
+            f"{namespace}StartBoundary",
+            f"{namespace}ScheduleByDay",
+        ),
+    }:
         raise ValueError("daily trigger is invalid")
     boundary = _one_text(trigger, f"{namespace}StartBoundary")
     match = _START_BOUNDARY.fullmatch(boundary)
     if match is None:
         raise ValueError("start boundary is invalid")
     datetime.fromisoformat(boundary)
-    if _one_text(trigger, f"{namespace}Enabled") != "true":
+    if (
+        f"{namespace}Enabled" in trigger_children
+        and _one_text(trigger, f"{namespace}Enabled") != "true"
+    ):
         raise ValueError("daily trigger is disabled")
     interval = _one_text(
         trigger,
@@ -500,19 +517,29 @@ def _parse_task_status(
     ):
         raise ValueError("task principal is invalid")
     principal = principal_containers[0][0]
+    principal_children = tuple(child.tag for child in principal)
     if (
         principal.attrib != {"id": "Author"}
-        or tuple(child.tag for child in principal)
-        != (
-            f"{namespace}UserId",
-            f"{namespace}LogonType",
-            f"{namespace}RunLevel",
-        )
+        or principal_children
+        not in {
+            (
+                f"{namespace}UserId",
+                f"{namespace}LogonType",
+                f"{namespace}RunLevel",
+            ),
+            (
+                f"{namespace}UserId",
+                f"{namespace}LogonType",
+            ),
+        }
         or type(expected_sid) is not str
         or _CURRENT_USER_SID.fullmatch(expected_sid) is None
         or _one_text(principal, f"{namespace}UserId") != expected_sid
         or _one_text(principal, f"{namespace}LogonType") != "InteractiveToken"
-        or _one_text(principal, f"{namespace}RunLevel") != "LeastPrivilege"
+        or (
+            f"{namespace}RunLevel" in principal_children
+            and _one_text(principal, f"{namespace}RunLevel") != "LeastPrivilege"
+        )
     ):
         raise ValueError("task principal is invalid")
     settings_containers = root.findall(f"./{namespace}Settings")
@@ -538,6 +565,20 @@ def _parse_task_status(
     ):
         raise ValueError("task action is invalid")
     return ScheduledTaskStatus(True, match.group(2), True, "Queue")
+
+
+def _normalize_native_task_xml(xml_bytes: bytes) -> bytes:
+    native_declaration = _NATIVE_PIPE_UTF16_DECLARATION.encode("ascii")
+    if not xml_bytes.startswith(native_declaration):
+        return xml_bytes
+    encoding = locale.getpreferredencoding(False)
+    if type(encoding) is not str or not encoding:
+        raise ValueError("native task XML encoding is unavailable")
+    decoded = xml_bytes.decode(encoding, errors="strict")
+    if not decoded.startswith(_NATIVE_PIPE_UTF16_DECLARATION):
+        raise ValueError("native task XML declaration is invalid")
+    normalized = _UTF8_DECLARATION + decoded[len(_NATIVE_PIPE_UTF16_DECLARATION) :]
+    return normalized.encode("utf-8")
 
 
 def _validate_task_settings(
