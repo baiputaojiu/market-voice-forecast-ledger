@@ -492,6 +492,41 @@ def test_manual_manifest_never_reads_or_writes_source_cursors(db):
     ).fetchone()[0] == 0
 
 
+def test_search_metadata_requests_are_bounded_to_ten_video_ids(db):
+    profile = _search_profile(db)
+    video_ids = tuple(_video_id(100 + index) for index in range(23))
+    client = FakeYouTubeClient(
+        search_responses=(_search_item_page(video_ids),),
+        video_responses=tuple(
+            tuple(
+                synthetic_video_item(
+                    video_id=video_id,
+                    snippet_published_at="2025-12-01T00:00:00Z",
+                )
+                for video_id in video_ids[offset : offset + 10]
+            )
+            for offset in range(0, len(video_ids), 10)
+        ),
+    )
+    service = YouTubeSyncService(
+        db,
+        clock=lambda: RUN_UPPER,
+        youtube_client=client,
+    )
+    job_id, unit_key = _start_search_unit(db, service, profile)
+
+    result = service.execute_search_unit(job_id, unit_key)
+
+    assert result.discovered_count == 23
+    assert result.persisted_count == 23
+    assert result.unavailable_count == 0
+    assert client.video_calls == [
+        video_ids[:10],
+        video_ids[10:20],
+        video_ids[20:],
+    ]
+
+
 def test_search_uses_only_ordered_terms_provider_overlap_and_local_half_open_bounds(db):
     profile = _search_profile(db, terms=("千竈鉄平", "千竃鉄平"))
     below_id, lower_id, inside_id, upper_id = tuple(_video_id(i) for i in range(4))

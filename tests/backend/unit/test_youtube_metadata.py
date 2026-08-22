@@ -408,7 +408,7 @@ def test_title_rejects_control_characters(control: str):
     _assert_metadata_invalid(synthetic_video_item(title=f"before{control}after"))
 
 
-@pytest.mark.parametrize("control", ("\x00", "\r", "\x7f", "\x85"))
+@pytest.mark.parametrize("control", ("\x00", "\x7f", "\x85"))
 def test_description_rejects_unsafe_controls_but_preserves_linefeeds(control: str):
     _assert_metadata_invalid(
         synthetic_video_item(description=f"before{control}after")
@@ -418,6 +418,19 @@ def test_description_rejects_unsafe_controls_but_preserves_linefeeds(control: st
         fetched_at=FIXED_NOW,
     )
     assert accepted.description == "first line\nsecond line"
+
+
+def test_description_normalizes_provider_carriage_returns_to_linefeeds():
+    value = normalize_video_item(
+        synthetic_video_item(
+            description="first line\rsecond line\r\nthird line\nfourth line"
+        ),
+        fetched_at=FIXED_NOW,
+    )
+
+    assert value.description == (
+        "first line\nsecond line\nthird line\nfourth line"
+    )
 
 
 @pytest.mark.parametrize(

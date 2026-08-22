@@ -4,7 +4,7 @@
 
 ### YouTube収集subproject: scheduler統合と運用受入
 
-M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeは`95ff083`に続くscheduler XML正規化修正`5db7dbf`までで、明示opt-inの実YouTube read-only smokeと状態文書も`origin/main`へ反映済みである。Credentialはconfigured、日次Taskはinstalled 06:00である。2026-08-22の最初のscheduled workerは起動したが、最初のseed unitが`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗した。DBは日次job、4 profile、7 unit、2 quota reservationを記録して安全に停止し、後続6 unitとcandidate/cursor昇格は未実行である。複数日の収集運用、音声・本人声確認・分析、live server、UIは受入済みとはしない。
+M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、`main`へ統合済みである。Credentialはconfigured、日次Taskはinstalled 06:00である。2026-08-22の最初のscheduled workerで旧Market Masters seedの失効を検出した後、旧jobを再試行せず停止し、migration `0019`で現行seedの新profile versionを追記した。新規job 2は7/7 unitと7 source cursorを完了し、2,729 candidateを全件`presence_unverified`で停止した。複数日の収集運用、音声・本人声確認・分析、live server、UIは受入済みとはしない。
 
 ## 完了済み（Completed）
 
@@ -69,10 +69,11 @@ M0、M1、M2中核バックエンドは完了済みである。YouTube収集subp
 - 開発端末でCredentialがconfigured、Task Schedulerがinstalled 06:00であることを秘密値を読み出さず確認した。
 - WindowsのTask Schedulerが登録XMLから終了期限のない定期task設定を正規化し、照会時にUTF-16宣言とnative code-page bytesを混在させる挙動を再現した。source `9adef31`でrecurring XML、宣言、既定Enabled、LeastPrivilege、Unified Scheduling Engineをfail-closedに正規化し、関連216 testsと全backend 1747件を検証した後、local `main`へ`5db7dbf`として取り込んだ。通常pushとlive SHA一致確認後にlocal/remote feature branchとworktreeをcleanupした。
 - 公開動画をYouTube公開検索と公式oEmbedで確認し、11文字video IDをprocess環境だけに設定した明示opt-in real smokeを実行した。Credential Manager経由の`channels.list`・`videos.list`を含む3 testsが成功し、secret・provider本文を表示せず、envを終了時に削除した。
+- 旧Market Masters seedを監査付きprofile versionで現行channelへ置換し、旧failed jobを`stopped`へ移して新規jobを作成した。実provider応答から`videos.list`最大10 IDとdescription改行canonical化を追加し、新job 2の7/7 unit、7 cursor、2,729件の`presence_unverified` candidate、および下流artifact 0件を実DBで確認した。
 
 ## 作業中（In Progress）
 
-- 最初の06:00 scheduled workerで発生した`YOUTUBE_PROVIDER_REQUEST_FAILED`を安全に診断し、明示承認後に既存のdurable jobを再試行する。再試行ではquota・checkpoint・cursor・candidate・`presence_unverified`停止境界を再監査する。
+- なし。次のsubprojectはユーザー承認後に選択する。
 
 ## 未着手（Not Started）
 

@@ -10,7 +10,7 @@ from tests.backend.e2e.synthetic_fixture import (
 
 APPROVED_PROFILES = {
     "木野内栄治": (
-        ("UCJ1DVBLVpe4FvBZZ94kreaQ",),
+        ("UCXvjRTXoDa8tKwdkTaukGug",),
         ("木野内栄治",),
     ),
     "大川智宏": ((), ("大川智宏",)),
@@ -47,7 +47,7 @@ EXPECTED_CURSOR_MAP = {
             "cross_channel_search",
             "927860dce39e32b70d8ae77e19e294943e6bee7a649283466b9b6b528894d7fb",
         ),
-        ("seed_uploads", "UCJ1DVBLVpe4FvBZZ94kreaQ"),
+        ("seed_uploads", "UCXvjRTXoDa8tKwdkTaukGug"),
     },
     "大川智宏": {
         (
@@ -73,7 +73,7 @@ EXPECTED_CURSOR_MAP = {
 SYNC_UPPER_BOUND = "2026-08-18T03:04:05.000000Z"
 EXPECTED_JOB_UNITS = (
     (
-        "youtube:profile:1:seed:UCJ1DVBLVpe4FvBZZ94kreaQ",
+        "youtube:profile:1:seed:UCXvjRTXoDa8tKwdkTaukGug",
         "youtube_seed_discovery",
         1,
     ),

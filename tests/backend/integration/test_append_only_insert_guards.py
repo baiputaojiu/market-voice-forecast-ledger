@@ -27,17 +27,24 @@ def _video_manifest() -> JobManifest:
     )
 
 
-def test_migration_runner_records_0018_once_and_remains_idempotent(tmp_path):
+def test_migration_runner_records_current_migrations_once_and_remains_idempotent(
+    tmp_path,
+):
     conn = open_database(tmp_path / "runner.sqlite3")
     try:
         first = apply_migrations(conn)
         second = apply_migrations(conn)
-        assert first[-1] == "0018_youtube_discovery_cutover"
+        assert "0018_youtube_discovery_cutover" in first
+        assert first[-1] == "0019_market_masters_seed_channel"
         assert second == ()
-        assert conn.execute(
-            "SELECT COUNT(*) FROM schema_migrations "
-            "WHERE name='0018_youtube_discovery_cutover'"
-        ).fetchone()[0] == 1
+        for migration_name in (
+            "0018_youtube_discovery_cutover",
+            "0019_market_masters_seed_channel",
+        ):
+            assert conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name=?",
+                (migration_name,),
+            ).fetchone()[0] == 1
     finally:
         conn.close()
 

@@ -47,7 +47,7 @@ YouTube Data APIを使って対象者の動画候補を発見し、正規metadat
 
 | 個人主体 | seed channel IDs | 横断検索語 | 規則 |
 |---|---|---|---|
-| 木野内栄治 | `UCJ1DVBLVpe4FvBZZ94kreaQ`（マーケット マスターズ、旧公式マーケット・アナライズ） | `木野内栄治` | seed外も本人確認後に採用可能 |
+| 木野内栄治 | `UCXvjRTXoDa8tKwdkTaukGug`（マーケットマスターズ） | `木野内栄治` | seed外も本人確認後に採用可能。旧seed `UCJ1DVBLVpe4FvBZZ94kreaQ`は失効済みとして新規jobへ使用しない |
 | 大川智宏 | なし | `大川智宏` | 検索・手動登録から同じpipelineへ入れる |
 | 江守哲 | `UCVXka7buS_WptsAzSE0LcKg` | `江守哲` | 従来のfixed-only規則を廃止し、seed外も本人確認後に採用可能 |
 | 千竈 鉄平 | `UCOfzLmXpI3qmZfV7_Cs1sYA`（暁投資顧問公式） | `千竈鉄平` OR `千竃鉄平` | 公式・外部を問わず、千竈本人の確認済み区間だけを後続分析へ渡す |
@@ -198,7 +198,7 @@ final-schema testとarchitecture testで、旧table・trigger・symbol・import 
 
 live動画で `actualStartTime` が取得できる場合はそれを分析用 `published_at` とし、それ以外は正規の `snippet.publishedAt` を使う。canonical content hashはschema versionと正規化済みprovider fieldsだけから計算し、取得日時を含めない。同じvideoのcurrent snapshotとcanonical content hashが同じ場合は新しいsnapshotを増やさず、既存snapshotを再利用する。異なる場合だけsnapshotを追記し、同じtransaction内でcurrent pointerを移す。snapshot自体はUPDATE/DELETEしない。
 
-raw provider responseは保存しない。
+raw provider responseは保存しない。descriptionのCRLFと単独CRはLFへcanonical化し、その他のunsafe controlは拒否する。
 
 ### `discovery_observations`
 
@@ -253,7 +253,7 @@ run input snapshotは、旧policy ID/hashの代わりに、metadata snapshot ID/
 
 1. `channels.list`でchannelのuploads playlist IDを解決する。
 2. `playlistItems.list`で対象期間の動画IDを列挙する。
-3. 動画IDを最大50件ずつ `videos.list`へ渡す。
+3. 動画IDを最大10件ずつ `videos.list`へ渡し、1 MiB response境界を維持する。
 
 seed channelでは、対象期間内の全uploadsを候補として列挙する。titleまたはdescriptionに本人名がないことを除外条件にしない。文字列一致は後続処理のpriority hintに使えても、candidate作成を妨げてはならない。
 

@@ -30,7 +30,7 @@ def test_reference_people_and_profiles_are_seeded_exactly(db):
     )
     profiles = DiscoveryRepository(db)
     expected = {
-        "木野内栄治": (("UCJ1DVBLVpe4FvBZZ94kreaQ",), ("木野内栄治",)),
+        "木野内栄治": (("UCXvjRTXoDa8tKwdkTaukGug",), ("木野内栄治",)),
         "大川智宏": ((), ("大川智宏",)),
         "江守哲": (("UCVXka7buS_WptsAzSE0LcKg",), ("江守哲",)),
         "千竈 鉄平": (("UCOfzLmXpI3qmZfV7_Cs1sYA",), ("千竈鉄平", "千竃鉄平")),

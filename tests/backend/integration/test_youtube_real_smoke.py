@@ -17,7 +17,7 @@ from market_voice_forecast_ledger.youtube.client import (
 
 
 SMOKE_SKIP_REASON = "real YouTube operational acceptance not requested"
-APPROVED_SMOKE_CHANNEL_ID = "UCJ1DVBLVpe4FvBZZ94kreaQ"
+APPROVED_SMOKE_CHANNEL_ID = "UCXvjRTXoDa8tKwdkTaukGug"
 SMOKE_CONFIGURATION_FAILURE = "opt-in YouTube smoke configuration is incomplete"
 SMOKE_RESPONSE_FAILURE = "YouTube smoke response shape is invalid"
 SMOKE_PRIVACY_CONTROL_FAILURE = "YouTube smoke privacy control failed"

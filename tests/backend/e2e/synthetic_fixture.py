@@ -542,7 +542,7 @@ class _SyntheticScheduleReader:
 
 class _SyntheticYouTubeTransport:
     _SEED_NAMES = {
-        "UCJ1DVBLVpe4FvBZZ94kreaQ": "木野内栄治",
+        "UCXvjRTXoDa8tKwdkTaukGug": "木野内栄治",
         "UCVXka7buS_WptsAzSE0LcKg": "江守哲",
         "UCOfzLmXpI3qmZfV7_Cs1sYA": "千竈 鉄平",
     }

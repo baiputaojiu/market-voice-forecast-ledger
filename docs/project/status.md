@@ -6,7 +6,7 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、7件のImportant findingのRED/GREEN修正、完全合成E2E、architecture guardを完了し、squash commit `157f739`として`main`へ統合済みである。公開済みruntime codeはTask Scheduler一覧互換修正`95ff083`に続くscheduler XML正規化修正`5db7dbf`までである。明示opt-inの実YouTube read-only smokeと、その結果を記録した状態文書は`origin/main`へ反映済みである。2026-08-22 06:00 JSTの最初のscheduled workerは予定どおり起動したが、最初のseed unitが`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗し、後続unitは未実行だった。永続DBは失敗を記録して安全に停止し、candidate・presence decision・source cursorは作成または進行していない。複数日の収集運用、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンドは完了済みである。YouTube収集subprojectはTask 1～13の実装・独立review、完全合成E2E、architecture guardを完了し、`main`へ統合済みである。2026-08-22 06:00 JSTの最初のscheduled workerで旧Market Masters seedが失効していることを確認し、旧job 1を再試行せず`stopped`へ移した。migration `0019`で監査付きprofile version 5へ置換後、新規job 2を実行して7/7 unit、7 source cursor、2,718動画、3,364 observation、2,729 person candidateと同数の初期`presence_unverified` decisionを完了した。collectionはtranscript・speaker・analysis・video pipeline artifactを作成していない。複数日の収集運用、音声・本人声確認・分析、実HTTP server/socket、React UIは未実装または未検証であり、アプリ全体の完成や製品受け入れは主張しない。
 
 ## Git状態（Git State）
 
@@ -100,10 +100,13 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - scheduler XML正規化修正をsource commit `9adef31`からlocal `main`の`5db7dbf`へ履歴追跡付きで取り込み、`origin/main`へ通常pushした。live remote SHA一致を確認後、local/remote feature branchと`.worktrees/youtube-scheduler-xml`を削除した。
 - ユーザーの明示承認後、YouTube公開検索と公式oEmbedで確認した11文字video IDをprocess環境だけに設定し、Credential Managerと実YouTube Data APIを使うread-only smokeを実行した。`channels.list`・`videos.list`のschema検証を含む3 testsが成功し、API key・provider本文を表示せず、終了時に両環境変数を削除した。video IDはrepository file・DBへ保存していない。
 - 2026-08-22 06:00:01 JSTの最初のscheduled workerを読み取り専用で監査した。Task Schedulerは終了コード0、次回2026-08-23 06:00、missed run 0だった。JST日次requestと4 profile・7 unitのmanifestは作成されたが、最初のseed unitは`channels.list`と`playlistItems.list`のquota予約後に`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗した。jobは`failed`、後続6 unitは`pending`、全7 checkpointは未完了、observation・candidate・presence decision・proposed/current source cursorは0件であり、不完全な収集結果は昇格していない。
+- 旧Market Masters channelのuploads playlistがprovider側で失効し、現行公開channelが`UCXvjRTXoDa8tKwdkTaukGug`であることを安全診断した。migration `0019`は旧configに完全一致するprofileだけへ新versionを追記し、旧versionとjob manifestを保持したままcurrent pointerと監査eventを更新する。旧job 1は`failed`から`stopped`へ移し、再試行していない。
+- 現行profile version 5で新規full-discovery job 2を作成した。実応答で判明した1 MiB response境界は`videos.list`を最大10 IDへ分割し、provider descriptionのCR/CRLFはLFへcanonical化するRED/GREEN修正で解消した。job 2は7/7 unitが`success`、jobは`succeeded`、7 checkpointと7 source cursorが同じ固定upper boundまで完了した。
+- 初回実収集は2,718 video、2,718 metadata snapshot、3,364 observation、2,729 person candidate、2,729件すべて`collection_initial`/`presence_unverified` decisionとなった。共有動画はvideoを重複作成せず人物別candidateへ分岐する。transcript segment、speaker assignment、analysis run/statement/forecast、video-pipeline binding、local artifactはすべて0件で、collection停止境界を維持した。実DBの`PRAGMA integrity_check`は`ok`だった。
 
 ## 作業中（In Progress）
 
-- 最初の06:00 scheduled workerで発生した`YOUTUBE_PROVIDER_REQUEST_FAILED`を、secret・provider本文を露出させずに診断し、明示承認後に同じdurable jobを安全に再試行する。
+- なし。次のsubprojectはユーザー承認後に選択する。
 
 ## 未着手（Not Started）
 
@@ -119,6 +122,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - scheduler XML追加修正source `9adef31`・統合`5db7dbf`: 関連scheduler・CLI・API 216 passed。全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、明示opt-in real smoke skip 1件、failure 0。compileall、diff check、WorkingTree公開安全206ファイルが成功し、実機statusは`installed 06:00`だった。`main` push後のlive remote SHA一致とlocal/remote feature branch・worktree削除も確認した。
 - 実YouTube read-only smoke: Credential statusは`configured`。公開video IDをprocess環境だけに設定したopt-in実行は3 passed、exit 0だった。`channels.list`と`videos.list`のresponse shapeを検証し、secret・provider値は出力されず、実行後にenv 2件が不存在であることを確認した。
 - 最初の06:00 scheduled worker: Task Schedulerは2026-08-22 06:00:01 JSTに実行、終了コード0、次回06:00、missed run 0。DB更新は06:00:04 JSTで、日次job 1件・manifest profile 4件・unit 7件を確認した。quota reservationは`channels_list` 1件と`playlist_items_list` 1件、最初のseed unitだけが`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗し、残り6 unitは未実行だった。checkpoint完了0、search window完了0、observation/candidate/presence decision/cursorはいずれも0で、部分結果の昇格はなかった。
+- seed修正後の実収集: 旧job 1=`stopped`、新job 2=`succeeded`、7 unitすべて`success`、7 checkpoint完了、7 proposed/current cursor整合、DB integrity=`ok`。保存結果はvideo/snapshot各2,718、observation 3,364、candidate/presence decision各2,729で、presenceは全件`collection_initial`/`presence_unverified`。transcript/speaker/analysis/video-pipeline/local-artifactは全0件だった。
 - 文書構造: 最初に必須文書欠落によるREDを確認し、追加後はGREEN。検証説明追加時も4件のREDを確認してから修正した。
 - 補助スクリプト: 未作成によるREDを確認後、Git状態・公開安全・状態文書・remote SHA検査18件がGREEN。
 - 公開安全の境界: `credentials/`強制stageの抜けをREDで再現し、禁止ディレクトリ追加後にGREEN。
@@ -195,7 +199,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. 最初の06:00 workerについてjob、quota、checkpoint、cursor、candidate、`presence_unverified`停止境界を確認する。
+1. 2026-08-23以降の日次runで、incremental cursor、quota日bucket、重複観測、candidate不変性を複数日にわたり確認する。
 2. 音声・本人声確認、Codex adapter、UIのどのsubprojectを次に設計するか、ユーザー承認で決定する。
 
 ## 重要ファイル（Important Files）

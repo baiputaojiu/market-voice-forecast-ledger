@@ -1,15 +1,26 @@
+import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import resources
 
 import pytest
 
+from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
 from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.db.migrate import apply_migrations
+from market_voice_forecast_ledger.domain.enums import JobStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
+from market_voice_forecast_ledger.repositories.sources import SourceRepository
+from market_voice_forecast_ledger.services.job_state import JobStateService
+from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncService
 
 
 CUTOVER = "0018_youtube_discovery_cutover"
+SEED_CHANNEL_MIGRATION = "0019_market_masters_seed_channel"
+OLD_MARKET_MASTERS_CHANNEL_ID = "UCJ1DVBLVpe4FvBZZ94kreaQ"
+CURRENT_MARKET_MASTERS_CHANNEL_ID = "UCXvjRTXoDa8tKwdkTaukGug"
 
 EXPECTED_TABLES = (
     "analysis_asset_mappings",
@@ -529,6 +540,171 @@ def test_precreated_empty_migration_ledger_is_not_a_fresh_database(tmp_path):
 
         assert caught.value.code == "COLLECTION_MODEL_RESET_REQUIRED"
         assert _schema_fingerprint(conn) == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("stored_seed", "expected_seed", "expected_audits"),
+    (
+        (
+            OLD_MARKET_MASTERS_CHANNEL_ID,
+            CURRENT_MARKET_MASTERS_CHANNEL_ID,
+            1,
+        ),
+        (
+            "UCAAAAAAAAAAAAAAAAAAAAAA",
+            "UCAAAAAAAAAAAAAAAAAAAAAA",
+            0,
+        ),
+    ),
+)
+def test_seed_channel_migration_changes_only_exact_retired_configuration(
+    tmp_path, stored_seed, expected_seed, expected_audits
+):
+    conn = open_database(tmp_path / f"seed-{expected_audits}.sqlite3")
+    created_at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    try:
+        _apply_packaged_migrations_through(conn, CUTOVER)
+        with transaction(conn):
+            subject_id = SourceRepository(conn).create_subject(
+                "木野内栄治", created_at=created_at
+            )
+            old_version = DiscoveryRepository(conn).create_profile_version(
+                subject_id,
+                seed_channel_ids=(stored_seed,),
+                search_terms=("木野内栄治",),
+                created_at=created_at,
+            )
+
+        applied = apply_migrations(conn)
+        assert applied == (SEED_CHANNEL_MIGRATION,)
+        repository = DiscoveryRepository(conn)
+        current = repository.get_current_profile_version(subject_id)
+        assert current.seed_channel_ids == (expected_seed,)
+        assert repository.get_profile_version(old_version.id) == old_version
+        assert conn.execute(
+            "SELECT COUNT(*) FROM discovery_profile_versions WHERE profile_id=?",
+            (old_version.profile_id,),
+        ).fetchone()[0] == 1 + expected_audits
+
+        audits = tuple(
+            conn.execute(
+                "SELECT entity_type, entity_id, operation, actor_kind, "
+                "reason_code, before_json, after_json FROM audit_events "
+                "WHERE entity_type='discovery_profile' ORDER BY id"
+            )
+        )
+        assert len(audits) == expected_audits
+        if expected_audits:
+            audit = audits[0]
+            assert (
+                audit["entity_id"],
+                audit["operation"],
+                audit["actor_kind"],
+                audit["reason_code"],
+            ) == (
+                str(old_version.profile_id),
+                "replace_version",
+                "system",
+                "DISCOVERY_PROFILE_SEED_REPLACED",
+            )
+            assert json.loads(audit["before_json"])["profile_version_id"] == (
+                old_version.id
+            )
+            assert json.loads(audit["after_json"])["profile_version_id"] == (
+                current.id
+            )
+    finally:
+        conn.close()
+
+
+def test_retired_seed_failed_job_is_stopped_before_new_profile_job_is_created(
+    tmp_path,
+):
+    conn = open_database(tmp_path / "retired-seed-job.sqlite3")
+    created_at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    try:
+        _apply_packaged_migrations_through(conn, CUTOVER)
+        sources = SourceRepository(conn)
+        discovery = DiscoveryRepository(conn)
+        retired_profiles = (
+            (
+                "木野内栄治",
+                (OLD_MARKET_MASTERS_CHANNEL_ID,),
+                ("木野内栄治",),
+            ),
+            ("大川智宏", (), ("大川智宏",)),
+            ("江守哲", ("UCVXka7buS_WptsAzSE0LcKg",), ("江守哲",)),
+            (
+                "千竈 鉄平",
+                ("UCOfzLmXpI3qmZfV7_Cs1sYA",),
+                ("千竈鉄平", "千竃鉄平"),
+            ),
+        )
+        with transaction(conn):
+            for name, seed_channel_ids, search_terms in retired_profiles:
+                subject_id = sources.create_subject(name, created_at=created_at)
+                discovery.create_profile_version(
+                    subject_id,
+                    seed_channel_ids=seed_channel_ids,
+                    search_terms=search_terms,
+                    created_at=created_at,
+                )
+
+        old_request = YouTubeSyncService(
+            conn, clock=lambda: created_at
+        ).request_full_sync(created_at)
+        claimed = YouTubeSyncService(
+            conn, clock=lambda: created_at
+        ).claim_next_runnable(created_at)
+        assert claimed is not None and claimed.job_id == old_request.job_id
+        running = conn.execute(
+            "SELECT unit_key FROM job_units "
+            "WHERE job_id=? AND status='running'",
+            (old_request.job_id,),
+        ).fetchone()
+        assert running is not None
+        JobStateService(conn, clock=lambda: created_at).fail_unit(
+            old_request.job_id,
+            running["unit_key"],
+            "YOUTUBE_PROVIDER_REQUEST_FAILED",
+        )
+        old_manifest = discovery.get_youtube_sync_manifest(old_request.job_id)
+
+        assert apply_migrations(conn) == (SEED_CHANNEL_MIGRATION,)
+        bootstrap_reference_data(conn)
+        assert JobStateService(conn).request_stop(old_request.job_id) is (
+            JobStatus.STOPPED
+        )
+
+        replacement = YouTubeSyncService(
+            conn, clock=lambda: created_at
+        ).request_full_sync(created_at)
+        new_manifest = discovery.get_youtube_sync_manifest(replacement.job_id)
+        new_units = tuple(
+            conn.execute(
+                "SELECT unit_key, status FROM job_units "
+                "WHERE job_id=? ORDER BY ordinal",
+                (replacement.job_id,),
+            )
+        )
+
+        assert replacement.job_id != old_request.job_id
+        assert replacement.reused is False
+        assert replacement.status is JobStatus.QUEUED
+        assert JobStateService(conn).status(old_request.job_id) is JobStatus.STOPPED
+        assert old_manifest.profile_set_hash != new_manifest.profile_set_hash
+        assert len(new_units) == 7
+        assert {row["status"] for row in new_units} == {"pending"}
+        assert any(
+            row["unit_key"]
+            == "youtube:profile:1:seed:" + CURRENT_MARKET_MASTERS_CHANNEL_ID
+            for row in new_units
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='failed'"
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

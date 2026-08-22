@@ -354,7 +354,7 @@ class JobKind(StrEnum):
 
 ```python
 DEFAULT_DISCOVERY_PROFILES = (
-    ("木野内栄治", ("UCJ1DVBLVpe4FvBZZ94kreaQ",), ("木野内栄治",)),
+    ("木野内栄治", ("UCXvjRTXoDa8tKwdkTaukGug",), ("木野内栄治",)),
     ("大川智宏", (), ("大川智宏",)),
     ("江守哲", ("UCVXka7buS_WptsAzSE0LcKg",), ("江守哲",)),
     ("千竈 鉄平", ("UCOfzLmXpI3qmZfV7_Cs1sYA",), ("千竈鉄平", "千竃鉄平")),
@@ -936,7 +936,7 @@ def test_full_manifest_has_fixed_profile_discoverer_units(db):
     manifest = JobStateService(db).stored_manifest(result.job_id)
     assert manifest.kind is JobKind.YOUTUBE_SYNC
     assert tuple((unit.stage.value, unit.unit_key) for unit in manifest.units) == (
-        ("youtube_seed_discovery", "youtube:profile:1:seed:UCJ1DVBLVpe4FvBZZ94kreaQ"),
+        ("youtube_seed_discovery", "youtube:profile:1:seed:UCXvjRTXoDa8tKwdkTaukGug"),
         ("youtube_search_discovery", "youtube:profile:1:search"),
         ("youtube_search_discovery", "youtube:profile:2:search"),
         ("youtube_seed_discovery", "youtube:profile:3:seed:UCVXka7buS_WptsAzSE0LcKg"),
@@ -1015,7 +1015,7 @@ git commit -m "feat: seal durable YouTube sync jobs"
 
 - [ ] **Step 1: Write seed execution RED tests**
 
-Build a profile whose uploads playlist has 73 synthetic IDs over two pages, including a title without the person name, one unavailable ID, and one ID already observed through search. Assert `videos.list` calls are batches 50/23, all 72 available IDs are persisted, the existing video gets a second observation rather than a second video/candidate, and the unavailable ID creates no video/snapshot/observation/candidate.
+Build a profile whose uploads playlist has 73 synthetic IDs over two pages, including a title without the person name, one unavailable ID, and one ID already observed through search. Assert `videos.list` calls are bounded to at most 10 IDs, all 72 available IDs are persisted, the existing video gets a second observation rather than a second video/candidate, and the unavailable ID creates no video/snapshot/observation/candidate.
 
 - [ ] **Step 2: Write page/batch atomicity RED tests**
 
@@ -1029,7 +1029,7 @@ Expected: missing execution method/checkpoint failures.
 
 - [ ] **Step 4: Implement the seed checkpoint loop**
 
-For the bound profile version/channel source key: resolve or validate the stored uploads playlist ID, read the next committed page token, call playlist discovery, deduplicate IDs within the job, call canonical `videos.list` in groups of at most 50, and commit each metadata batch together with the domain checkpoint. Persist only canonical metadata satisfying the checkpoint's sealed `[effective_lower_bound, upper_bound)`; continue paging until a page is wholly older than the lower bound or no token remains. Never filter by title, description, or channel title. Store page token only in the private checkpoint table.
+For the bound profile version/channel source key: resolve or validate the stored uploads playlist ID, read the next committed page token, call playlist discovery, deduplicate IDs within the job, call canonical `videos.list` in groups of at most 10 to preserve the 1 MiB response boundary, and commit each metadata batch together with the domain checkpoint. Persist only canonical metadata satisfying the checkpoint's sealed `[effective_lower_bound, upper_bound)`; continue paging until a page is wholly older than the lower bound or no token remains. Never filter by title, description, or channel title. Store page token only in the private checkpoint table.
 
 - [ ] **Step 5: Complete the fixed unit with a deterministic output hash**
 

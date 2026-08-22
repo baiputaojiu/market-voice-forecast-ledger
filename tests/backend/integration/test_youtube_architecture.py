@@ -48,7 +48,7 @@ SUBJECT_LITERALS = frozenset(
         "大川智宏",
         "江守哲",
         "千竈 鉄平",
-        "UCJ1DVBLVpe4FvBZZ94kreaQ",
+        "UCXvjRTXoDa8tKwdkTaukGug",
         "UCVXka7buS_WptsAzSE0LcKg",
         "UCOfzLmXpI3qmZfV7_Cs1sYA",
     }

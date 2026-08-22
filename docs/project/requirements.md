@@ -37,13 +37,14 @@ YouTubeで公開されている分析主体の採用対象発言を可能な範�
 - YouTube Data APIは動画発見とメタデータ取得にだけ使用できる。
 - 公開検索可能な範囲で対象出演動画を最大限網羅する。
 - 手動URL登録も提供する。
-- profile設定は、木野内栄治=`UCJ1DVBLVpe4FvBZZ94kreaQ`＋`木野内栄治`、大川智宏=seedなし＋`大川智宏`、江守哲=`UCVXka7buS_WptsAzSE0LcKg`＋`江守哲`、千竈 鉄平=`UCOfzLmXpI3qmZfV7_Cs1sYA`＋`千竈鉄平` OR `千竃鉄平`とする。
+- profile設定は、木野内栄治=`UCXvjRTXoDa8tKwdkTaukGug`＋`木野内栄治`、大川智宏=seedなし＋`大川智宏`、江守哲=`UCVXka7buS_WptsAzSE0LcKg`＋`江守哲`、千竈 鉄平=`UCOfzLmXpI3qmZfV7_Cs1sYA`＋`千竈鉄平` OR `千竃鉄平`とする。木野内栄治の旧seed `UCJ1DVBLVpe4FvBZZ94kreaQ`はuploads playlistがprovider側で失効したため新規jobへ使用しない。
 - `subject_aliases`とYouTube検索語を別データとし、一方から他方を自動生成しない。
 - seed uploads、横断検索、手動URLは同じ正規metadata、発見履歴、人物別candidate pipelineへ収束する。入力URL、tracking query、provider raw responseは保存しない。
 - 初回candidateと同時に作れる出演判定は`presence_unverified`だけとする。収集は`presence_confirmed`または`presence_rejected`を公開経路から作らず、音声・文字起こし・speaker・分析jobを自動生成しない。
 - 日次同期と「今すぐ同期」は同じsealed full-discovery jobへ収束し、手動URLは独立したmanual-only jobとしてdurable queueへ入れる。full jobの全固定unit成功時だけ全source cursorを一括promoteする。
 - 横断検索の複数日windowは10 pageで日境界へ分割する。1日windowは10 pageで失敗させず、durable page tokenからpage 11以降を継続し、invalid token時は同じ固定windowの先頭から冪等再実行する。source cursorは固定windowの完全消費後だけ進める。
 - call前の各network attemptをUTC日bucketへ原子的に予約し、`search.list`は100 attempts/day、`channels.list`・`playlistItems.list`・`videos.list`は合計10,000 attempts/dayを上限とする。exact limitは許可し、次のreservationはprovider callなしで24時間deferする。call前crashの予約は安全側の過大計上として保持する。
+- `videos.list`は1 requestあたり最大10 video IDに分割して1 MiB response境界を維持する。provider descriptionのCRLFまたは単独CRはLFへcanonical化し、その他のunsafe controlは拒否する。
 - YouTube API keyはWindows Credential Managerだけに保存し、CLIの非表示promptから登録する。引数、環境変数、設定file、DB、HTTP API、UIへkeyを渡さない。
 - Windows Task Schedulerをschedule時刻の唯一の正本とし、既定06:00 JST、`StartWhenAvailable=true`、multiple-instance `Queue`、ログオン中のinteractive tokenでone-shot workerを起動する。
 - 元動画、Shorts、切り抜き、再投稿を重複判定・統合・除外しない。それぞれを独立した動画、発言、根拠として保存し、分析・集計する。後から公開された切り抜きが新しい発言として現在見解へ影響することと、同内容によって根拠数が増えることを許容する。

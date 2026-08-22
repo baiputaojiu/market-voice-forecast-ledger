@@ -194,6 +194,8 @@ def _provider_text(
 ) -> str:
     if type(value) is not str or len(value) > maximum:
         _raise_metadata_invalid()
+    if allow_linefeeds:
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
     if not allow_empty and not value.strip():
         _raise_metadata_invalid()
     for character in value:

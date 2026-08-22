@@ -125,31 +125,26 @@ def test_seed_unit_persists_73_ids_in_exact_batches_without_name_filter(db):
             None,
         ),
     )
-    first_items = tuple(
-        synthetic_video_item(
-            video_id=video_id,
-            title=(
-                "A title with no person name"
-                if video_id == video_ids[5]
-                else f"Synthetic upload {video_id}"
-            ),
-            snippet_published_at=WITHIN_WINDOW,
+    video_responses = tuple(
+        tuple(
+            synthetic_video_item(
+                video_id=video_id,
+                title=(
+                    "A title with no person name"
+                    if video_id == video_ids[5]
+                    else f"Synthetic upload {video_id}"
+                ),
+                snippet_published_at=WITHIN_WINDOW,
+            )
+            for video_id in video_ids[offset : offset + 10]
+            if video_id != unavailable_id
         )
-        for video_id in video_ids[:50]
-        if video_id != unavailable_id
-    )
-    second_items = tuple(
-        synthetic_video_item(
-            video_id=video_id,
-            title=f"Synthetic upload {video_id}",
-            snippet_published_at=WITHIN_WINDOW,
-        )
-        for video_id in video_ids[50:]
+        for offset in range(0, len(video_ids), 10)
     )
     service, client, profile, job_id, unit_key = _seed_fixture(
         db,
         playlist_pages=pages,
-        video_responses=(first_items, second_items),
+        video_responses=video_responses,
     )
 
     prior_metadata = normalize_video_item(
@@ -175,9 +170,17 @@ def test_seed_unit_persists_73_ids_in_exact_batches_without_name_filter(db):
     assert result.discovered_count == 73
     assert result.persisted_count == 72
     assert result.unavailable_count == 1
-    assert tuple(len(call) for call in client.video_calls) == (50, 23)
-    assert client.video_calls[0] == video_ids[:50]
-    assert client.video_calls[1] == video_ids[50:]
+    assert tuple(len(call) for call in client.video_calls) == (
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        3,
+    )
+    assert tuple(item for call in client.video_calls for item in call) == video_ids
     assert db.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 72
     assert db.execute(
         "SELECT COUNT(*) FROM subject_video_candidates"

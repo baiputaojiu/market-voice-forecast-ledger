@@ -67,6 +67,7 @@ _ACTIVE_STATUSES = frozenset(
         JobStatus.CANCEL_REQUESTED,
     }
 )
+_VIDEO_METADATA_BATCH_SIZE = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -655,8 +656,12 @@ class YouTubeSyncService:
                 new_video_ids.append(video_id)
 
             normalized_by_id = {}
-            for offset in range(0, len(new_video_ids), 50):
-                requested_ids = tuple(new_video_ids[offset : offset + 50])
+            for offset in range(
+                0, len(new_video_ids), _VIDEO_METADATA_BATCH_SIZE
+            ):
+                requested_ids = tuple(
+                    new_video_ids[offset : offset + _VIDEO_METADATA_BATCH_SIZE]
+                )
                 raw_items = self._youtube_client.videos(requested_ids)
                 normalized, unavailable = self._normalize_seed_response(
                     requested_ids, raw_items
@@ -945,8 +950,12 @@ class YouTubeSyncService:
                 new_video_ids.append(video_id)
 
             normalized_by_id = {}
-            for offset in range(0, len(new_video_ids), 50):
-                requested_ids = tuple(new_video_ids[offset : offset + 50])
+            for offset in range(
+                0, len(new_video_ids), _VIDEO_METADATA_BATCH_SIZE
+            ):
+                requested_ids = tuple(
+                    new_video_ids[offset : offset + _VIDEO_METADATA_BATCH_SIZE]
+                )
                 raw_items = self._youtube_client.videos(requested_ids)
                 normalized, unavailable = self._normalize_video_response(
                     requested_ids,

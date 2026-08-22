@@ -132,6 +132,16 @@ def _items(video_ids: tuple[str, ...], *, changed_first=False):
     )
 
 
+def _batched_items(video_ids: tuple[str, ...], *, changed_first=False):
+    return tuple(
+        _items(
+            video_ids[offset : offset + 10],
+            changed_first=changed_first and offset == 0,
+        )
+        for offset in range(0, len(video_ids), 10)
+    )
+
+
 @pytest.mark.parametrize(
     ("stored_playlist", "channel_response", "expected_code"),
     (
@@ -286,7 +296,10 @@ def test_item_37_failure_rolls_back_the_whole_batch_and_pointer(db):
             _page(playlist_id, video_ids),
             _page(playlist_id, video_ids),
         ),
-        video_responses=(_items(video_ids, changed_first=True),) * 2,
+        video_responses=_batched_items(
+            video_ids, changed_first=True
+        )
+        * 2,
     )
     job_id, unit_key = _create_and_claim(db, service)
     original = normalize_video_item(
@@ -366,7 +379,7 @@ def test_failure_after_persistence_before_checkpoint_rolls_back_and_replays(db):
             _page(playlist_id, video_ids),
             _page(playlist_id, video_ids),
         ),
-        video_responses=(_items(video_ids), _items(video_ids)),
+        video_responses=_batched_items(video_ids) * 2,
     )
     job_id, unit_key = _create_and_claim(db, service)
     original = service._discovery.persist_metadata_batch
@@ -411,7 +424,7 @@ def test_final_transaction_fault_replays_without_duplicate_observations(
     service, client, _, _ = _build_service(
         db,
         playlist_responses=(_page(playlist_id, video_ids),),
-        video_responses=(_items(video_ids),),
+        video_responses=_batched_items(video_ids),
     )
     job_id, unit_key = _create_and_claim(db, service)
     original = service._job_state.complete_unit_in_transaction
@@ -448,7 +461,13 @@ def test_final_transaction_fault_replays_without_duplicate_observations(
     assert completed["proposals"] == 1
     assert completed["durable_cursors"] == 0
     assert client.playlist_calls == [(playlist_id, None)]
-    assert client.video_calls == [video_ids]
+    assert client.video_calls == [
+        video_ids[:10],
+        video_ids[10:20],
+        video_ids[20:30],
+        video_ids[30:40],
+        video_ids[40:],
+    ]
 
 
 def test_private_page_token_is_checkpointed_only_and_resume_uses_it(db):
