@@ -201,7 +201,7 @@ git commit -m "feat: define presence verification records"
 
 **Interfaces:**
 - Consumes: Task 1 dataclasses and tables; caller-owned SQLite transactions for multi-row writes.
-- Produces: `VoiceVerificationRepository` methods `add_reference_clip`, `add_reference_feature`, `get_reference_bundle`, `add_manifest`, `get_manifest_for_job`, `add_run_with_segments`, `get_run`, `list_pending_reviews`, and `add_review_and_decision`.
+- Produces: `VoiceVerificationRepository` methods `add_reference_clip`, `add_reference_feature`, `get_reference_bundle`, `add_manifest`, `get_manifest_for_job`, `add_run_with_segments`, `get_run`, `list_pending_reviews`, `list_runnable_job_ids`, `require_job_artifacts`, and `add_review_and_decision`.
 
 - [ ] **Step 1: Write corruption-sensitive repository tests**
 
@@ -244,7 +244,7 @@ class VoiceVerificationRepository:
         return run_id
 ```
 
-Every read must recompute canonical hashes and verify: exact SQLite types, UTC timestamps, manifest owner binding, current and frozen decision identities, reference profile/feature hash, threshold/model/adapter identities, contiguous segment ordinals, ordered nonoverlapping bounds, finite score, run output hash, and review evidence linkage. Do not heal a missing or corrupt row.
+Every read must recompute canonical hashes and verify: exact SQLite types, UTC timestamps, manifest owner binding, current and frozen decision identities, reference profile/feature hash, threshold/model/adapter identities, contiguous segment ordinals, ordered nonoverlapping bounds, finite score, run output hash, and review evidence linkage. Do not heal a missing or corrupt row. `list_runnable_job_ids()` returns ordered presence-manifest job IDs whose existing job status is queued or retrying; `require_job_artifacts(job_id)` returns only canonically verified immutable artifacts and never infers success from a job/unit status alone.
 
 - [ ] **Step 4: Implement atomic review repository write**
 
@@ -481,12 +481,14 @@ git commit -m "feat: enroll calibrated voice references"
 
 **Files:**
 - Create: `src/market_voice_forecast_ledger/services/voice_verification.py`
+- Modify: `src/market_voice_forecast_ledger/services/job_state.py`
 - Test: `tests/backend/integration/test_presence_pilot.py`
 - Test: `tests/backend/integration/test_voice_verification_jobs.py`
 
 **Interfaces:**
-- Consumes: active discovery profiles, canonical candidates/observations, active reference/calibration, `JobStateService.create_video_pipeline(manifest, candidate_ids)`.
+- Consumes: active discovery profiles, canonical candidates/observations, active reference/calibration, and the existing video-pipeline binding validation.
 - Produces: `PresenceVerificationService.preview_pilot() -> PilotPreview`, `create_pilot(expected_preview_hash) -> PilotCreation`, `save_proposal(job_id, response) -> int`, `list_pending_reviews()`, `show_review(run_id)`, and `review(command)`; the preview hash is an internal same-process guard, not a separate CLI contract.
+- Produces: `JobStateService.create_video_pipeline_in_transaction(manifest, candidate_ids, created_at=None) -> int`, with the same manifest/binding/runnable checks as `create_video_pipeline()` and a caller-owned transaction.
 
 - [ ] **Step 1: Write exact selection and atomic job creation tests**
 
@@ -518,7 +520,7 @@ Candidate eligibility is: active profile, current `presence_unverified`, canonic
 
 - [ ] **Step 4: Implement preview hash and 20-job creation**
 
-Preview freezes every candidate/video/profile/current-decision/reference/config/model/contract identity. `create_pilot(expected_preview_hash)` runs `BEGIN IMMEDIATE`, recomputes preview, rejects drift, creates exactly one seven-unit `JobManifest` and one `video_pipeline` job per candidate, binds only that candidate, inserts one immutable voice manifest, and commits all 20 or none.
+Preview freezes every candidate/video/profile/current-decision/reference/config/model/contract identity. Add `create_video_pipeline_in_transaction()` by extracting the existing public method's validated insert/binding/runnable body without changing its behavior; the public method becomes a transaction wrapper. `create_pilot(expected_preview_hash)` runs `BEGIN IMMEDIATE`, recomputes preview, rejects drift, calls the transaction-owned method to create exactly one seven-unit `JobManifest` and one `video_pipeline` job per candidate, binds only that candidate, inserts one immutable voice manifest, and commits all 20 or none.
 
 - [ ] **Step 5: Run pilot/job and existing binding tests**
 
@@ -529,7 +531,7 @@ Expected: PASS for duplicate selection, active-job exclusion, source shortage ba
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add src/market_voice_forecast_ledger/services/voice_verification.py tests/backend/integration/test_presence_pilot.py tests/backend/integration/test_voice_verification_jobs.py
+git add src/market_voice_forecast_ledger/services/voice_verification.py src/market_voice_forecast_ledger/services/job_state.py tests/backend/integration/test_presence_pilot.py tests/backend/integration/test_voice_verification_jobs.py
 git commit -m "feat: create presence verification pilot"
 ```
 
@@ -572,7 +574,7 @@ Expected: FAIL because `PresenceVerificationWorker` is missing.
 
 - [ ] **Step 3: Implement one-wake FIFO execution**
 
-Claim the lowest queued/retrying presence job ID under `BEGIN IMMEDIATE`. For each unit, compute the external input hash from immutable manifest plus the actual acquired/normalized/model/reference artifact hashes. Complete each unit only after its concrete artifact is durable and canonically reread. For `voice:proposal`, insert run plus all segments and complete the unit in the same transaction. Unknown or private exception details map to `VOICE_PROCESSING_FAILED`.
+Under `BEGIN IMMEDIATE`, claim the lowest ID returned by `VoiceVerificationRepository.list_runnable_job_ids()` and re-read its canonical manifest before changing job state. For each unit, compute the external input hash from immutable manifest plus the actual acquired/normalized/model/reference artifact hashes. Complete each unit only after its concrete artifact is durable and canonically reread through `require_job_artifacts()`. For `voice:proposal`, insert run plus all segments and complete the unit in the same transaction. Unknown or private exception details map to `VOICE_PROCESSING_FAILED`.
 
 - [ ] **Step 4: Implement cleanup and recovery**
 
@@ -811,7 +813,7 @@ Expected: exactly one skip, `real presence voice smoke not requested`; no networ
 
 - [ ] **Step 3: Install and attest the private runtime only after user approval**
 
-Use the repository Python to create `Settings.voice_runtime_dir`, install the exact sherpa wheel with `--no-index --find-links <private-wheel-dir> --require-hashes`, place yt-dlp/Deno/FFmpeg/models under private roots, calculate every SHA-256, and write the private runtime lock. Run the opt-in smoke's `attest_runtime()` check only after the lock is complete; the check returns a fixed success line and does not print paths or hashes.
+Use the repository Python to create `Settings.voice_runtime_dir`, build the current project wheel, install that wheel with `--no-deps` into the isolated environment, then install the exact sherpa wheel with `--no-index --find-links <private-wheel-dir> --require-hashes`. Place yt-dlp/Deno/FFmpeg/models under private roots, calculate every SHA-256, and write the private runtime lock. Run the opt-in smoke's `attest_runtime()` check only after the lock is complete; the check returns a fixed success line and does not print paths or hashes.
 
 - [ ] **Step 4: Research and obtain user approval for reference clips**
 
