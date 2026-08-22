@@ -1,12 +1,17 @@
+import hashlib
 import json
 import math
 import sqlite3
-from dataclasses import dataclass
+import struct
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, cast
 
 import pytest
 
 from market_voice_forecast_ledger.db.connection import transaction
+from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.domain.common import (
     canonical_json,
     sha256_text,
@@ -33,6 +38,17 @@ from market_voice_forecast_ledger.repositories.voice_verification import (
     canonical_voice_segment_hash,
 )
 from market_voice_forecast_ledger.services.job_state import JobStateService
+from market_voice_forecast_ledger.services.retention import RetentionService
+from market_voice_forecast_ledger.voice import media as voice_media
+from market_voice_forecast_ledger.voice.media import AcquiredMedia, NormalizedAudio
+from market_voice_forecast_ledger.voice.protocol import (
+    AdapterRequest,
+    AdapterResponse,
+)
+from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
+from market_voice_forecast_ledger.workers.presence_verification import (
+    PresenceVerificationWorker,
+)
 from tests.backend.integration.test_voice_reference_enrollment import (
     FEATURE_BYTES,
     FEATURE_HASH,
@@ -42,6 +58,7 @@ from tests.backend.integration.test_voice_reference_enrollment import (
     db,
     seed_reference_profile,
 )
+from tests.backend.voice_fakes import fake_runtime_attestation
 
 
 REVIEWED_AT = datetime(2026, 8, 22, 5, 0, tzinfo=timezone.utc)
@@ -1097,6 +1114,583 @@ def test_review_write_requires_succeeded_job_before_any_write(
         db.execute("SELECT COUNT(*) FROM voice_verification_reviews").fetchone()[0]
         == 0
     )
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+def _synthetic_pcm_wav(*, duration_ms: int = 2_000) -> bytes:
+    frame_count = 16_000 * duration_ms // 1_000
+    pcm = b"\x00\x00" * frame_count
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + len(pcm), b"WAVE",
+        b"fmt ", 16, 1, 1, 16_000, 32_000, 2, 16, b"data", len(pcm),
+    ) + pcm
+
+
+class FakePresenceMediaAcquirer:
+    def __init__(self, db: sqlite3.Connection) -> None:
+        self._db = db
+        self.calls: list[tuple[str, Path, Path, Path]] = []
+
+    def acquire_registered(
+        self,
+        video_id: str,
+        target_dir: Path,
+        *,
+        source_path: Path,
+        part_path: Path,
+    ) -> AcquiredMedia:
+        for path in (source_path, part_path):
+            row = self._db.execute(
+                "SELECT status FROM local_artifacts WHERE local_path=? "
+                "ORDER BY id DESC LIMIT 1", (str(path),)
+            ).fetchone()
+            assert row is not None and row["status"] == "pending"
+        self.calls.append((video_id, target_dir, source_path, part_path))
+        payload = f"synthetic-media:{video_id}".encode("ascii")
+        source_path.write_bytes(payload)
+        return AcquiredMedia(
+            path=source_path,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            video_id=video_id,
+        )
+
+
+class FakePresenceMediaNormalizer:
+    def __init__(self, db: sqlite3.Connection) -> None:
+        self._db = db
+        self.calls: list[tuple[Path, Path]] = []
+
+    def normalize_registered(
+        self, source: Path, target: Path
+    ) -> NormalizedAudio:
+        row = self._db.execute(
+            "SELECT status FROM local_artifacts WHERE local_path=? "
+            "ORDER BY id DESC LIMIT 1", (str(target),)
+        ).fetchone()
+        assert row is not None and row["status"] == "pending"
+        self.calls.append((source, target))
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        payload = _synthetic_pcm_wav()
+        target.write_bytes(payload)
+        return NormalizedAudio(
+            path=target,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            source_sha256=source_hash,
+        )
+
+
+class FailingPresenceMediaNormalizer(FakePresenceMediaNormalizer):
+    def normalize_registered(
+        self, source: Path, target: Path
+    ) -> NormalizedAudio:
+        self.calls.append((source, target))
+        target.write_bytes(b"private-partial-normalized-audio")
+        raise DomainError(
+            "VOICE_MEDIA_NORMALIZATION_FAILED",
+            "private ffmpeg timeout",
+        )
+
+
+class FakePresenceAdapter:
+    def __init__(
+        self,
+        *,
+        segments: tuple[tuple[int, int, float], ...] = (
+            (0, 1_000, 0.9), (1_000, 1_900, 0.8)
+        ),
+        failure: Exception | None = None,
+    ) -> None:
+        self._segments = segments
+        self._failure = failure
+        self.calls: list[AdapterRequest] = []
+
+    def score(self, request: AdapterRequest) -> AdapterResponse:
+        self.calls.append(request)
+        if self._failure is not None:
+            raise self._failure
+        segment_values: list[dict[str, object]] = []
+        for ordinal, (start_ms, end_ms, score) in enumerate(
+            self._segments, start=1
+        ):
+            segment_values.append(
+                {
+                    "end_ms": end_ms,
+                    "evidence_hash": sha256_text(
+                        canonical_json(
+                            {
+                                "audio_sha256": request.audio_sha256,
+                                "end_ms": end_ms,
+                                "ordinal": ordinal,
+                                "raw_score": score,
+                                "start_ms": start_ms,
+                            }
+                        )
+                    ),
+                    "ordinal": ordinal,
+                    "raw_score": score,
+                    "start_ms": start_ms,
+                }
+            )
+        maximum = max(item[2] for item in self._segments)
+        if maximum >= request.subject_boundary:
+            proposal = VoiceProposal.LIKELY_PRESENT
+        elif maximum <= request.interviewer_boundary:
+            proposal = VoiceProposal.LIKELY_ABSENT
+        else:
+            proposal = VoiceProposal.NEEDS_REVIEW
+        values: dict[str, object] = {
+            "adapter_contract_version": request.adapter_contract_version,
+            "input_hash": request.input_hash,
+            "model_name": request.model_name,
+            "model_version": request.model_version,
+            "proposal": proposal.value,
+            "segments": segment_values,
+            "vad_contract_version": request.vad_contract_version,
+        }
+        values["output_hash"] = sha256_text(canonical_json(values))
+        return AdapterResponse.model_validate_json(
+            canonical_json(values), strict=True
+        )
+
+
+class PartialPresenceAdapter(FakePresenceAdapter):
+    def score(self, request: AdapterRequest) -> AdapterResponse:
+        self.calls.append(request)
+        return cast(AdapterResponse, object())
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceWorkerHarness:
+    worker: PresenceVerificationWorker
+    acquirer: FakePresenceMediaAcquirer
+    normalizer: FakePresenceMediaNormalizer
+    adapter: FakePresenceAdapter
+    runtime: RuntimeAttestation
+    work_root: Path
+
+
+_PRESENCE_RUNTIMES: dict[Path, RuntimeAttestation] = {}
+
+
+def presence_worker_harness(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+    job: JobSeed,
+    *,
+    adapter: FakePresenceAdapter | None = None,
+    normalizer: FakePresenceMediaNormalizer | None = None,
+    runtime: RuntimeAttestation | None = None,
+    after_unit_committed: Callable[[int, str], None] | None = None,
+) -> PresenceWorkerHarness:
+    work_root = tmp_path / "presence-audio"
+    work_root.mkdir(exist_ok=True)
+    effective_runtime = runtime
+    if effective_runtime is None:
+        effective_runtime = _PRESENCE_RUNTIMES.get(tmp_path)
+    if effective_runtime is None:
+        generated_runtime, _ = fake_runtime_attestation(tmp_path / "runtime")
+        effective_runtime = replace(
+            generated_runtime,
+            model_name=job.snapshot.model_name,
+            model_version=job.snapshot.model_version,
+            adapter_contract_version=job.snapshot.adapter_version,
+            vad_contract_version=job.snapshot.vad_contract_version,
+        )
+        _PRESENCE_RUNTIMES[tmp_path] = effective_runtime
+    acquirer = FakePresenceMediaAcquirer(db)
+    effective_normalizer = normalizer or FakePresenceMediaNormalizer(db)
+    effective_adapter = adapter or FakePresenceAdapter()
+    settings = Settings(
+        data_dir=work_root.parent,
+        database_path=tmp_path / "unused.sqlite3",
+        temp_audio_dir=work_root,
+    )
+    worker = PresenceVerificationWorker(
+        db,
+        media_acquirer=acquirer,
+        media_normalizer=effective_normalizer,
+        adapter=effective_adapter,
+        retention=RetentionService(db, settings, clock=lambda: NOW),
+        runtime=effective_runtime,
+        temp_audio_root=work_root,
+        clock=lambda: NOW,
+        after_unit_committed=after_unit_committed,
+    )
+    return PresenceWorkerHarness(
+        worker, acquirer, effective_normalizer, effective_adapter,
+        effective_runtime, work_root
+    )
+
+
+def _assert_current_presence_unverified(
+    db: sqlite3.Connection, candidate_id: int
+) -> None:
+    row = db.execute(
+        "SELECT decision.state FROM subject_video_candidates AS candidate "
+        "JOIN presence_decisions AS decision "
+        "ON decision.id=candidate.current_presence_decision_id "
+        "WHERE candidate.id=?", (candidate_id,)
+    ).fetchone()
+    assert row is not None and row["state"] == "presence_unverified"
+
+
+@pytest.mark.parametrize("crash_after", VOICE_UNIT_KEYS)
+def test_worker_restarts_only_unverified_suffix(
+    db, tmp_path: Path, crash_after: str
+) -> None:
+    job = seed_job(db)
+
+    def crash(_job_id: int, unit_key: str) -> None:
+        if unit_key == crash_after:
+            raise SimulatedCrash(unit_key)
+
+    first = presence_worker_harness(
+        db, tmp_path, job, after_unit_committed=crash
+    )
+    with pytest.raises(SimulatedCrash):
+        first.worker.run_once()
+
+    second = presence_worker_harness(db, tmp_path, job)
+    summary = second.worker.run_once()
+
+    assert summary.job_id == job.job_id
+    assert summary.succeeded_jobs == 1
+    assert summary.failed_code is None
+    rows = tuple(
+        db.execute(
+            "SELECT unit_key, status, attempt_count, output_hash "
+            "FROM job_units WHERE job_id=? ORDER BY ordinal", (job.job_id,)
+        )
+    )
+    assert tuple(row["unit_key"] for row in rows) == VOICE_UNIT_KEYS
+    assert all(row["status"] == "success" for row in rows)
+    assert all(row["attempt_count"] == 1 for row in rows)
+    assert all(row["output_hash"] is not None for row in rows)
+    assert JobStateService(db).status(job.job_id) is JobStatus.SUCCEEDED
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+def test_recovery_reuses_verified_prefix_and_resets_first_mismatch_suffix(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+
+    def crash(_job_id: int, unit_key: str) -> None:
+        if unit_key == "voice:score":
+            raise SimulatedCrash(unit_key)
+
+    first = presence_worker_harness(
+        db, tmp_path, job, after_unit_committed=crash
+    )
+    with pytest.raises(SimulatedCrash):
+        first.worker.run_once()
+    source_path = first.acquirer.calls[0][2]
+    source_path.write_bytes(b"corrupt-source")
+
+    second = presence_worker_harness(db, tmp_path, job)
+    plan = second.worker.recover_job(job.job_id)
+
+    assert plan.reused_unit_keys == ("video:validate",)
+    assert plan.next_unit_key == "audio:acquire"
+    assert plan.pending_unit_keys == VOICE_UNIT_KEYS[1:]
+    assert not source_path.exists()
+    assert second.worker.run_once().succeeded_jobs == 1
+
+
+def test_recovery_does_not_rebind_external_input_after_model_drift(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+
+    def crash(_job_id: int, unit_key: str) -> None:
+        if unit_key == "voice:score":
+            raise SimulatedCrash(unit_key)
+
+    first = presence_worker_harness(
+        db, tmp_path, job, after_unit_committed=crash
+    )
+    with pytest.raises(SimulatedCrash):
+        first.worker.run_once()
+    original = db.execute(
+        "SELECT external_input_hash FROM job_units "
+        "WHERE job_id=? AND unit_key='voice:score'", (job.job_id,)
+    ).fetchone()[0]
+    drifted = replace(first.runtime, model_sha256="f" * 64)
+
+    second = presence_worker_harness(db, tmp_path, job, runtime=drifted)
+    plan = second.worker.recover_job(job.job_id)
+    assert plan.reused_unit_keys == VOICE_UNIT_KEYS[:4]
+    assert plan.next_unit_key == "voice:score"
+    summary = second.worker.run_once()
+
+    assert summary.failed_code == "VOICE_PROCESSING_FAILED"
+    assert db.execute(
+        "SELECT external_input_hash FROM job_units "
+        "WHERE job_id=? AND unit_key='voice:score'", (job.job_id,)
+    ).fetchone()[0] == original
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+def test_adapter_response_is_not_adopted_before_proposal_transaction(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+
+    def crash(_job_id: int, unit_key: str) -> None:
+        if unit_key == "voice:score":
+            raise SimulatedCrash(unit_key)
+
+    harness = presence_worker_harness(
+        db, tmp_path, job, after_unit_committed=crash
+    )
+    with pytest.raises(SimulatedCrash):
+        harness.worker.run_once()
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_runs"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_segments"
+    ).fetchone()[0] == 0
+
+
+def test_proposal_run_segments_and_unit_success_are_atomic(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    db.execute(
+        "CREATE TEMP TRIGGER fail_second_worker_segment "
+        "BEFORE INSERT ON voice_verification_segments "
+        "WHEN NEW.ordinal=2 BEGIN SELECT RAISE(ABORT, 'synthetic'); END"
+    )
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    summary = harness.worker.run_once()
+
+    assert summary.failed_code == "VOICE_PROCESSING_FAILED"
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_runs"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_segments"
+    ).fetchone()[0] == 0
+    proposal = db.execute(
+        "SELECT status, output_hash FROM job_units "
+        "WHERE job_id=? AND unit_key='voice:proposal'", (job.job_id,)
+    ).fetchone()
+    assert tuple(proposal) == ("failed", None)
+    db.execute("DROP TRIGGER fail_second_worker_segment")
+
+    retry = presence_worker_harness(db, tmp_path, job).worker.run_once()
+    assert retry.succeeded_jobs == 1
+
+
+def test_cleanup_failure_keeps_job_failed_and_records_retry(
+    db, tmp_path: Path, monkeypatch
+) -> None:
+    job = seed_job(db)
+    calls = 0
+
+    def deny_first(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("private path must not escape")
+        path.unlink()
+
+    monkeypatch.setattr(
+        "market_voice_forecast_ledger.services.retention._unlink_retained_audio_path",
+        deny_first,
+    )
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    summary = harness.worker.run_once()
+
+    assert summary.failed_code == "AUDIO_DELETE_PERMISSION"
+    assert JobStateService(db).status(job.job_id) is JobStatus.FAILED
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+    failed = db.execute(
+        "SELECT retry_count, safe_error_code FROM local_artifacts "
+        "WHERE status='delete_failed'"
+    ).fetchone()
+    assert tuple(failed) == (1, "AUDIO_DELETE_PERMISSION")
+
+    monkeypatch.setattr(
+        "market_voice_forecast_ledger.services.retention._unlink_retained_audio_path",
+        Path.unlink,
+    )
+    retry = presence_worker_harness(db, tmp_path, job).worker.run_once()
+    assert retry.succeeded_jobs == 1
+    rows = tuple(db.execute("SELECT local_path, status FROM local_artifacts"))
+    assert rows and all(row["status"] == "deleted" for row in rows)
+    assert all(not Path(row["local_path"]).exists() for row in rows)
+
+
+def test_normalization_timeout_discards_partial_artifact_before_retry(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    failing = FailingPresenceMediaNormalizer(db)
+    first = presence_worker_harness(
+        db, tmp_path, job, normalizer=failing
+    )
+
+    summary = first.worker.run_once()
+
+    assert summary.failed_code == "VOICE_MEDIA_NORMALIZATION_FAILED"
+    partial_path = failing.calls[0][1]
+    assert partial_path.read_bytes() == b"private-partial-normalized-audio"
+    assert db.execute(
+        "SELECT status FROM local_artifacts WHERE local_path=?",
+        (str(partial_path),),
+    ).fetchone()[0] == "pending"
+
+    retry = presence_worker_harness(db, tmp_path, job).worker.run_once()
+
+    assert retry.succeeded_jobs == 1
+    normalized_attempt = db.execute(
+        "SELECT attempt_count FROM job_units "
+        "WHERE job_id=? AND unit_key='audio:normalize'",
+        (job.job_id,),
+    ).fetchone()[0]
+    assert normalized_attempt == 2
+    rows = tuple(
+        db.execute(
+            "SELECT status FROM local_artifacts WHERE local_path=? ORDER BY id",
+            (str(partial_path),),
+        )
+    )
+    assert tuple(row["status"] for row in rows) == ("deleted", "deleted")
+    assert not partial_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("boundary_action", "expected_status"),
+    (("pause", JobStatus.PAUSED), ("stop", JobStatus.STOPPED)),
+)
+def test_worker_honors_pause_and_stop_at_committed_unit_boundary(
+    db, tmp_path: Path, boundary_action: str, expected_status: JobStatus
+) -> None:
+    job = seed_job(db)
+
+    def request_boundary(job_id: int, unit_key: str) -> None:
+        if unit_key != "video:validate":
+            return
+        service = JobStateService(db, clock=lambda: NOW)
+        if boundary_action == "pause":
+            service.request_pause(job_id)
+        else:
+            service.request_stop(job_id)
+
+    harness = presence_worker_harness(
+        db, tmp_path, job, after_unit_committed=request_boundary
+    )
+    summary = harness.worker.run_once()
+
+    assert summary.succeeded_jobs == 0
+    assert summary.failed_code is None
+    assert JobStateService(db).status(job.job_id) is expected_status
+    assert harness.acquirer.calls == []
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    (
+        (
+            RuntimeError("C:/private/audio/secret.wav provider body"),
+            "VOICE_PROCESSING_FAILED",
+        ),
+        (
+            DomainError(
+                "VOICE_ADAPTER_PROCESS_FAILED",
+                "private child timeout at C:/private/audio.wav",
+            ),
+            "VOICE_ADAPTER_PROCESS_FAILED",
+        ),
+        (
+            DomainError(
+                "VOICE_ADAPTER_RESPONSE_INVALID",
+                "missing speech in private adapter response",
+            ),
+            "VOICE_ADAPTER_RESPONSE_INVALID",
+        ),
+    ),
+)
+def test_worker_maps_private_failures_to_constant_safe_codes(
+    db,
+    tmp_path: Path,
+    failure: Exception,
+    expected_code: str,
+) -> None:
+    job = seed_job(db)
+    adapter = FakePresenceAdapter(failure=failure)
+    harness = presence_worker_harness(db, tmp_path, job, adapter=adapter)
+
+    summary = harness.worker.run_once()
+
+    assert summary.failed_code == expected_code
+    error = db.execute(
+        "SELECT error_code FROM job_units WHERE job_id=? AND status='failed'",
+        (job.job_id,),
+    ).fetchone()[0]
+    assert error == expected_code
+    assert "private" not in repr(summary).lower()
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+def test_worker_rejects_partial_adapter_response_before_any_run_write(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    harness = presence_worker_harness(
+        db, tmp_path, job, adapter=PartialPresenceAdapter()
+    )
+
+    summary = harness.worker.run_once()
+
+    assert summary.failed_code == "VOICE_ADAPTER_RESPONSE_INVALID"
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_runs"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_segments"
+    ).fetchone()[0] == 0
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+def test_corrupt_stored_run_is_never_adopted_or_exposed(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    before_decisions = db.execute(
+        "SELECT COUNT(*) FROM presence_decisions"
+    ).fetchone()[0]
+
+    def crash(_job_id: int, unit_key: str) -> None:
+        if unit_key == "voice:proposal":
+            raise SimulatedCrash(unit_key)
+
+    first = presence_worker_harness(
+        db, tmp_path, job, after_unit_committed=crash
+    )
+    with pytest.raises(SimulatedCrash):
+        first.worker.run_once()
+    db.execute("DROP TRIGGER voice_verification_runs_no_update")
+    db.execute(
+        "UPDATE voice_verification_runs SET output_hash=? WHERE job_id=?",
+        ("f" * 64, job.job_id),
+    )
+
+    summary = presence_worker_harness(db, tmp_path, job).worker.run_once()
+
+    assert summary.failed_code == "VOICE_PROCESSING_FAILED"
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_reviews"
+    ).fetchone()[0] == 0
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
     assert (
         db.execute("SELECT COUNT(*) FROM presence_decisions").fetchone()[0]
         == before_decisions
