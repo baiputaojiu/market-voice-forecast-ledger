@@ -3,7 +3,8 @@ CREATE TABLE voice_reference_clips (
     reference_profile_id INTEGER NOT NULL REFERENCES voice_reference_profiles(id),
     ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal > 0),
     clip_kind TEXT NOT NULL CHECK (
-        clip_kind IN ('enrollment', 'held_out_positive', 'negative')
+        typeof(clip_kind) = 'text'
+        AND clip_kind IN ('enrollment', 'held_out_positive', 'negative')
     ),
     subject_id INTEGER NOT NULL REFERENCES analysis_subjects(id),
     video_id INTEGER NOT NULL REFERENCES videos(id),
@@ -12,14 +13,18 @@ CREATE TABLE voice_reference_clips (
     ),
     end_ms INTEGER NOT NULL CHECK (typeof(end_ms) = 'integer'),
     normalized_audio_sha256 TEXT NOT NULL CHECK (
-        length(normalized_audio_sha256) = 64
+        typeof(normalized_audio_sha256) = 'text'
+        AND length(CAST(normalized_audio_sha256 AS BLOB)) = 64
         AND normalized_audio_sha256 NOT GLOB '*[^0-9a-f]*'
     ),
-    approval_actor TEXT NOT NULL CHECK (approval_actor = 'local_user'),
+    approval_actor TEXT NOT NULL CHECK (
+        typeof(approval_actor) = 'text' AND approval_actor = 'local_user'
+    ),
     approval_reason TEXT NOT NULL CHECK (length(approval_reason) BETWEEN 1 AND 240),
     approved_at TEXT NOT NULL,
     clip_hash TEXT NOT NULL CHECK (
-        length(clip_hash) = 64
+        typeof(clip_hash) = 'text'
+        AND length(CAST(clip_hash AS BLOB)) = 64
         AND clip_hash NOT GLOB '*[^0-9a-f]*'
     ),
     CHECK (start_ms < end_ms),
@@ -31,11 +36,13 @@ CREATE TABLE voice_reference_features (
     reference_profile_id INTEGER NOT NULL UNIQUE
         REFERENCES voice_reference_profiles(id),
     encoding_version TEXT NOT NULL CHECK (
-        length(encoding_version) BETWEEN 1 AND 256
+        typeof(encoding_version) = 'text'
+        AND length(CAST(encoding_version AS BLOB)) BETWEEN 1 AND 256
         AND encoding_version NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     float_dtype TEXT NOT NULL CHECK (
-        length(float_dtype) BETWEEN 1 AND 256
+        typeof(float_dtype) = 'text'
+        AND length(CAST(float_dtype AS BLOB)) BETWEEN 1 AND 256
         AND float_dtype NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     dimension INTEGER NOT NULL CHECK (
@@ -45,7 +52,8 @@ CREATE TABLE voice_reference_features (
         typeof(embedding_blob) = 'blob' AND length(embedding_blob) > 0
     ),
     feature_sha256 TEXT NOT NULL CHECK (
-        length(feature_sha256) = 64
+        typeof(feature_sha256) = 'text'
+        AND length(CAST(feature_sha256 AS BLOB)) = 64
         AND feature_sha256 NOT GLOB '*[^0-9a-f]*'
     ),
     created_at TEXT NOT NULL
@@ -59,40 +67,49 @@ CREATE TABLE voice_verification_manifests (
     profile_id INTEGER NOT NULL REFERENCES discovery_profiles(id),
     presence_decision_id INTEGER NOT NULL REFERENCES presence_decisions(id),
     presence_decision_hash TEXT NOT NULL CHECK (
-        length(presence_decision_hash) = 64
+        typeof(presence_decision_hash) = 'text'
+        AND length(CAST(presence_decision_hash AS BLOB)) = 64
         AND presence_decision_hash NOT GLOB '*[^0-9a-f]*'
     ),
     reference_profile_id INTEGER NOT NULL REFERENCES voice_reference_profiles(id),
     reference_feature_hash TEXT NOT NULL CHECK (
-        length(reference_feature_hash) = 64
+        typeof(reference_feature_hash) = 'text'
+        AND length(CAST(reference_feature_hash AS BLOB)) = 64
         AND reference_feature_hash NOT GLOB '*[^0-9a-f]*'
     ),
     threshold_config_version TEXT NOT NULL CHECK (
-        length(threshold_config_version) BETWEEN 1 AND 256
+        typeof(threshold_config_version) = 'text'
+        AND length(CAST(threshold_config_version AS BLOB)) BETWEEN 1 AND 256
         AND threshold_config_version NOT GLOB '*[^A-Za-z0-9._:-]*'
     ) REFERENCES speaker_threshold_configs(version),
     model_name TEXT NOT NULL CHECK (
-        length(model_name) BETWEEN 1 AND 256
+        typeof(model_name) = 'text'
+        AND length(CAST(model_name AS BLOB)) BETWEEN 1 AND 256
         AND model_name NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     model_version TEXT NOT NULL CHECK (
-        length(model_version) BETWEEN 1 AND 256
+        typeof(model_version) = 'text'
+        AND length(CAST(model_version AS BLOB)) BETWEEN 1 AND 256
         AND model_version NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     adapter_version TEXT NOT NULL CHECK (
-        length(adapter_version) BETWEEN 1 AND 256
+        typeof(adapter_version) = 'text'
+        AND length(CAST(adapter_version AS BLOB)) BETWEEN 1 AND 256
         AND adapter_version NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     vad_contract_version TEXT NOT NULL CHECK (
-        length(vad_contract_version) BETWEEN 1 AND 256
+        typeof(vad_contract_version) = 'text'
+        AND length(CAST(vad_contract_version AS BLOB)) BETWEEN 1 AND 256
         AND vad_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     selection_contract_version TEXT NOT NULL CHECK (
-        length(selection_contract_version) BETWEEN 1 AND 256
+        typeof(selection_contract_version) = 'text'
+        AND length(CAST(selection_contract_version AS BLOB)) BETWEEN 1 AND 256
         AND selection_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     manifest_hash TEXT NOT NULL CHECK (
-        length(manifest_hash) = 64
+        typeof(manifest_hash) = 'text'
+        AND length(CAST(manifest_hash AS BLOB)) = 64
         AND manifest_hash NOT GLOB '*[^0-9a-f]*'
     ),
     created_at TEXT NOT NULL,
@@ -104,18 +121,22 @@ CREATE TABLE voice_verification_runs (
     job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id),
     candidate_id INTEGER NOT NULL REFERENCES subject_video_candidates(id),
     input_hash TEXT NOT NULL CHECK (
-        length(input_hash) = 64
+        typeof(input_hash) = 'text'
+        AND length(CAST(input_hash AS BLOB)) = 64
         AND input_hash NOT GLOB '*[^0-9a-f]*'
     ),
     output_hash TEXT NOT NULL CHECK (
-        length(output_hash) = 64
+        typeof(output_hash) = 'text'
+        AND length(CAST(output_hash AS BLOB)) = 64
         AND output_hash NOT GLOB '*[^0-9a-f]*'
     ),
     proposal TEXT NOT NULL CHECK (
-        proposal IN ('likely_present', 'likely_absent', 'needs_review')
+        typeof(proposal) = 'text'
+        AND proposal IN ('likely_present', 'likely_absent', 'needs_review')
     ),
     result_code TEXT NOT NULL CHECK (
-        length(result_code) BETWEEN 1 AND 64
+        typeof(result_code) = 'text'
+        AND length(CAST(result_code AS BLOB)) BETWEEN 1 AND 64
         AND result_code NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     completed_at TEXT NOT NULL,
@@ -131,11 +152,13 @@ CREATE TABLE voice_verification_segments (
     ),
     end_ms INTEGER NOT NULL CHECK (typeof(end_ms) = 'integer'),
     raw_match_score REAL NOT NULL CHECK (
-        raw_match_score = raw_match_score
+        typeof(raw_match_score) IN ('integer', 'real')
+        AND raw_match_score = raw_match_score
         AND abs(raw_match_score) <= 1.0e6
     ),
     evidence_hash TEXT NOT NULL CHECK (
-        length(evidence_hash) = 64
+        typeof(evidence_hash) = 'text'
+        AND length(CAST(evidence_hash AS BLOB)) = 64
         AND evidence_hash NOT GLOB '*[^0-9a-f]*'
     ),
     CHECK (start_ms < end_ms),
@@ -145,16 +168,22 @@ CREATE TABLE voice_verification_segments (
 CREATE TABLE voice_verification_reviews (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL UNIQUE REFERENCES voice_verification_runs(id),
-    action TEXT NOT NULL CHECK (action IN ('confirm', 'reject', 'hold')),
-    actor TEXT NOT NULL CHECK (actor = 'local_user'),
+    action TEXT NOT NULL CHECK (
+        typeof(action) = 'text' AND action IN ('confirm', 'reject', 'hold')
+    ),
+    actor TEXT NOT NULL CHECK (
+        typeof(actor) = 'text' AND actor = 'local_user'
+    ),
     reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 240),
     prior_presence_decision_id INTEGER NOT NULL REFERENCES presence_decisions(id),
     prior_presence_decision_hash TEXT NOT NULL CHECK (
-        length(prior_presence_decision_hash) = 64
+        typeof(prior_presence_decision_hash) = 'text'
+        AND length(CAST(prior_presence_decision_hash AS BLOB)) = 64
         AND prior_presence_decision_hash NOT GLOB '*[^0-9a-f]*'
     ),
     review_hash TEXT NOT NULL CHECK (
-        length(review_hash) = 64
+        typeof(review_hash) = 'text'
+        AND length(CAST(review_hash AS BLOB)) = 64
         AND review_hash NOT GLOB '*[^0-9a-f]*'
     ),
     reviewed_at TEXT NOT NULL

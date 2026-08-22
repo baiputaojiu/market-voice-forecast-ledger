@@ -955,10 +955,7 @@ def test_historical_migrations_remain_byte_identical() -> None:
     } == HISTORICAL_MIGRATION_HASHES
 
 
-def test_presence_schema_rejects_invalid_enums_ordinals_ranges_scores_and_tokens(
-    db,
-) -> None:
-    db.execute("PRAGMA foreign_keys=OFF")
+def _drop_voice_check_isolation_triggers(conn: sqlite3.Connection) -> None:
     for trigger in (
         "voice_reference_clips_require_contiguous_ordinal",
         "voice_reference_clips_require_owner",
@@ -969,7 +966,14 @@ def test_presence_schema_rejects_invalid_enums_ordinals_ranges_scores_and_tokens
         "voice_verification_segments_require_owner",
         "voice_verification_reviews_require_owner",
     ):
-        db.execute(f"DROP TRIGGER {trigger}")
+        conn.execute(f"DROP TRIGGER {trigger}")
+
+
+def test_presence_schema_rejects_invalid_enums_ordinals_ranges_scores_and_tokens(
+    db,
+) -> None:
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
 
     valid_hash = "a" * 64
     clip_sql = """
@@ -1039,6 +1043,7 @@ def test_presence_schema_rejects_invalid_enums_ordinals_ranges_scores_and_tokens
         (2, 1, 1, 1, 0.1, valid_hash),
         (3, 1, 0, 1, 1_000_000.1, valid_hash),
         (4, 1, 0, 1, 0.1, "short"),
+        (5, 1, 0, 1, "not-a-number", valid_hash),
     ):
         with pytest.raises(sqlite3.IntegrityError):
             db.execute(segment_sql, values)
@@ -1062,6 +1067,240 @@ def test_presence_schema_rejects_invalid_enums_ordinals_ranges_scores_and_tokens
     ):
         with pytest.raises(sqlite3.IntegrityError):
             db.execute(review_sql, values)
+
+
+def _blob(value: str) -> sqlite3.Binary:
+    return sqlite3.Binary(value.encode("ascii"))
+
+
+def _assert_blob_storage_rejected(
+    conn: sqlite3.Connection,
+    sql: str,
+    values: dict[str, object],
+    column: str,
+) -> None:
+    mutated = dict(values)
+    mutated[column] = _blob(str(mutated[column]))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(sql, mutated)
+
+
+@pytest.mark.parametrize(
+    "column",
+    ("clip_kind", "normalized_audio_sha256", "approval_actor", "clip_hash"),
+)
+def test_voice_reference_clip_tokens_and_hashes_require_text_storage(db, column):
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
+    valid_hash = "a" * 64
+    values = {
+        "reference_profile_id": 1,
+        "ordinal": 1,
+        "clip_kind": "enrollment",
+        "subject_id": 1,
+        "video_id": 1,
+        "start_ms": 0,
+        "end_ms": 1,
+        "normalized_audio_sha256": valid_hash,
+        "approval_actor": "local_user",
+        "approval_reason": "clear speech",
+        "approved_at": "2026-08-22T00:00:00.000000Z",
+        "clip_hash": valid_hash,
+    }
+    _assert_blob_storage_rejected(
+        db,
+        """
+        INSERT INTO voice_reference_clips(
+            reference_profile_id, ordinal, clip_kind, subject_id, video_id,
+            start_ms, end_ms, normalized_audio_sha256, approval_actor,
+            approval_reason, approved_at, clip_hash
+        ) VALUES (
+            :reference_profile_id, :ordinal, :clip_kind, :subject_id, :video_id,
+            :start_ms, :end_ms, :normalized_audio_sha256, :approval_actor,
+            :approval_reason, :approved_at, :clip_hash
+        )
+        """,
+        values,
+        column,
+    )
+
+
+@pytest.mark.parametrize(
+    "column", ("encoding_version", "float_dtype", "feature_sha256")
+)
+def test_voice_reference_feature_tokens_and_hash_require_text_storage(db, column):
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
+    values = {
+        "reference_profile_id": 1,
+        "encoding_version": "embedding-v1",
+        "float_dtype": "float32",
+        "dimension": 4,
+        "embedding_blob": sqlite3.Binary(b"\x00" * 16),
+        "feature_sha256": "b" * 64,
+        "created_at": "2026-08-22T00:00:00.000000Z",
+    }
+    _assert_blob_storage_rejected(
+        db,
+        """
+        INSERT INTO voice_reference_features(
+            reference_profile_id, encoding_version, float_dtype, dimension,
+            embedding_blob, feature_sha256, created_at
+        ) VALUES (
+            :reference_profile_id, :encoding_version, :float_dtype, :dimension,
+            :embedding_blob, :feature_sha256, :created_at
+        )
+        """,
+        values,
+        column,
+    )
+
+
+@pytest.mark.parametrize(
+    "column",
+    (
+        "presence_decision_hash",
+        "reference_feature_hash",
+        "threshold_config_version",
+        "model_name",
+        "model_version",
+        "adapter_version",
+        "vad_contract_version",
+        "selection_contract_version",
+        "manifest_hash",
+    ),
+)
+def test_voice_manifest_tokens_and_hashes_require_text_storage(db, column):
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
+    values = {
+        "job_id": 1,
+        "candidate_id": 1,
+        "video_id": 1,
+        "profile_id": 1,
+        "presence_decision_id": 1,
+        "presence_decision_hash": "a" * 64,
+        "reference_profile_id": 1,
+        "reference_feature_hash": "b" * 64,
+        "threshold_config_version": "threshold-v1",
+        "model_name": "speaker-model",
+        "model_version": "model-v1",
+        "adapter_version": "adapter-v1",
+        "vad_contract_version": "vad-v1",
+        "selection_contract_version": "selection-v1",
+        "manifest_hash": "c" * 64,
+        "created_at": "2026-08-22T00:00:00.000000Z",
+    }
+    _assert_blob_storage_rejected(
+        db,
+        """
+        INSERT INTO voice_verification_manifests(
+            job_id, candidate_id, video_id, profile_id, presence_decision_id,
+            presence_decision_hash, reference_profile_id, reference_feature_hash,
+            threshold_config_version, model_name, model_version, adapter_version,
+            vad_contract_version, selection_contract_version, manifest_hash,
+            created_at
+        ) VALUES (
+            :job_id, :candidate_id, :video_id, :profile_id,
+            :presence_decision_id, :presence_decision_hash,
+            :reference_profile_id, :reference_feature_hash,
+            :threshold_config_version, :model_name, :model_version,
+            :adapter_version, :vad_contract_version,
+            :selection_contract_version, :manifest_hash, :created_at
+        )
+        """,
+        values,
+        column,
+    )
+
+
+@pytest.mark.parametrize(
+    "column", ("input_hash", "output_hash", "proposal", "result_code")
+)
+def test_voice_run_tokens_and_hashes_require_text_storage(db, column):
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
+    values = {
+        "job_id": 1,
+        "candidate_id": 1,
+        "input_hash": "d" * 64,
+        "output_hash": "e" * 64,
+        "proposal": "needs_review",
+        "result_code": "VOICE_PROPOSAL_READY",
+        "completed_at": "2026-08-22T00:00:00.000000Z",
+    }
+    _assert_blob_storage_rejected(
+        db,
+        """
+        INSERT INTO voice_verification_runs(
+            job_id, candidate_id, input_hash, output_hash, proposal,
+            result_code, completed_at
+        ) VALUES (
+            :job_id, :candidate_id, :input_hash, :output_hash, :proposal,
+            :result_code, :completed_at
+        )
+        """,
+        values,
+        column,
+    )
+
+
+def test_voice_segment_hash_requires_text_storage(db):
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
+    _assert_blob_storage_rejected(
+        db,
+        """
+        INSERT INTO voice_verification_segments(
+            run_id, ordinal, start_ms, end_ms, raw_match_score, evidence_hash
+        ) VALUES (
+            :run_id, :ordinal, :start_ms, :end_ms, :raw_match_score,
+            :evidence_hash
+        )
+        """,
+        {
+            "run_id": 1,
+            "ordinal": 1,
+            "start_ms": 0,
+            "end_ms": 1,
+            "raw_match_score": 0.5,
+            "evidence_hash": "f" * 64,
+        },
+        "evidence_hash",
+    )
+
+
+@pytest.mark.parametrize(
+    "column",
+    ("action", "actor", "prior_presence_decision_hash", "review_hash"),
+)
+def test_voice_review_tokens_and_hashes_require_text_storage(db, column):
+    db.execute("PRAGMA foreign_keys=OFF")
+    _drop_voice_check_isolation_triggers(db)
+    values = {
+        "run_id": 1,
+        "action": "hold",
+        "actor": "local_user",
+        "reason": "needs another listen",
+        "prior_presence_decision_id": 1,
+        "prior_presence_decision_hash": "a" * 64,
+        "review_hash": "b" * 64,
+        "reviewed_at": "2026-08-22T00:00:00.000000Z",
+    }
+    _assert_blob_storage_rejected(
+        db,
+        """
+        INSERT INTO voice_verification_reviews(
+            run_id, action, actor, reason, prior_presence_decision_id,
+            prior_presence_decision_hash, review_hash, reviewed_at
+        ) VALUES (
+            :run_id, :action, :actor, :reason, :prior_presence_decision_id,
+            :prior_presence_decision_hash, :review_hash, :reviewed_at
+        )
+        """,
+        values,
+        column,
+    )
 
 
 def test_final_schema_rejects_legacy_organization_rule_evidence(db):

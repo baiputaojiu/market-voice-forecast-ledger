@@ -1,3 +1,4 @@
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from market_voice_forecast_ledger.services.job_state import JobStateService
 from tests.backend.e2e.synthetic_fixture import SyntheticLedgerFixture
 
 
-def _video_manifest() -> JobManifest:
+def _video_manifest(input_hash: str = "synthetic-video-input") -> JobManifest:
     return JobManifest.build(
         JobKind.VIDEO_PIPELINE,
         (
@@ -19,7 +20,7 @@ def _video_manifest() -> JobManifest:
                 "video:metadata",
                 JobStage.VIDEO_METADATA,
                 1,
-                "synthetic-video-input",
+                input_hash,
                 (),
                 "synthetic-video-contract-v1",
             ),
@@ -259,6 +260,137 @@ def populated_database(tmp_path_factory) -> Path:
         )
         database_path = fixture.settings.database_path
     return database_path
+
+
+def _clone_insert(
+    conn: sqlite3.Connection,
+    table: str,
+    overrides: dict[str, object],
+) -> tuple[str, dict[str, object]]:
+    row = conn.execute(f"SELECT * FROM {table} ORDER BY id LIMIT 1").fetchone()
+    assert row is not None, table
+    values = dict(row)
+    values.pop("id")
+    values.update(overrides)
+    columns = tuple(values)
+    sql = (
+        f"INSERT INTO {table} ({', '.join(columns)}) "
+        f"VALUES ({', '.join(':' + column for column in columns)})"
+    )
+    return sql, values
+
+
+def _unpersisted_manifest_values(
+    conn: sqlite3.Connection, case_name: str
+) -> tuple[int, dict[str, object]]:
+    baseline = conn.execute(
+        "SELECT * FROM voice_verification_manifests ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert baseline is not None
+    manifest = _video_manifest(f"synthetic-video-input-{case_name}")
+    job_id = JobStateService(conn).create_video_pipeline(
+        manifest, (baseline["candidate_id"],)
+    )
+    values = dict(baseline)
+    values.pop("id")
+    values["job_id"] = job_id
+    values["manifest_hash"] = manifest.manifest_hash
+    return job_id, values
+
+
+def _owner_mutation_insert(
+    conn: sqlite3.Connection, trigger_name: str
+) -> tuple[str, dict[str, object]]:
+    if trigger_name == "voice_reference_clips_require_owner":
+        return _clone_insert(
+            conn, "voice_reference_clips", {"reference_profile_id": -1}
+        )
+    if trigger_name == "voice_reference_features_require_owner":
+        return _clone_insert(
+            conn, "voice_reference_features", {"reference_profile_id": -1}
+        )
+    if trigger_name == "voice_verification_manifests_require_owner":
+        _, values = _unpersisted_manifest_values(conn, trigger_name)
+        values["presence_decision_hash"] = "9" * 64
+        columns = tuple(values)
+        return (
+            "INSERT INTO voice_verification_manifests "
+            f"({', '.join(columns)}) VALUES "
+            f"({', '.join(':' + column for column in columns)})",
+            values,
+        )
+    if trigger_name == "voice_verification_runs_require_owner":
+        job_id, manifest_values = _unpersisted_manifest_values(conn, trigger_name)
+        manifest_columns = tuple(manifest_values)
+        conn.execute(
+            "INSERT INTO voice_verification_manifests "
+            f"({', '.join(manifest_columns)}) VALUES "
+            f"({', '.join(':' + column for column in manifest_columns)})",
+            manifest_values,
+        )
+        return _clone_insert(
+            conn,
+            "voice_verification_runs",
+            {"job_id": job_id, "candidate_id": -1},
+        )
+    if trigger_name == "voice_verification_segments_require_owner":
+        return _clone_insert(
+            conn, "voice_verification_segments", {"run_id": -1}
+        )
+    if trigger_name == "voice_verification_reviews_require_owner":
+        return _clone_insert(conn, "voice_verification_reviews", {"run_id": -1})
+    raise AssertionError(f"unhandled owner trigger: {trigger_name}")
+
+
+@pytest.mark.parametrize(
+    ("trigger_name", "error_code"),
+    (
+        (
+            "voice_reference_clips_require_owner",
+            "VOICE_REFERENCE_OWNER_MISMATCH",
+        ),
+        (
+            "voice_reference_features_require_owner",
+            "VOICE_REFERENCE_OWNER_MISMATCH",
+        ),
+        (
+            "voice_verification_manifests_require_owner",
+            "VOICE_MANIFEST_OWNER_MISMATCH",
+        ),
+        (
+            "voice_verification_runs_require_owner",
+            "VOICE_RUN_OWNER_MISMATCH",
+        ),
+        (
+            "voice_verification_segments_require_owner",
+            "VOICE_RUN_OWNER_MISMATCH",
+        ),
+        (
+            "voice_verification_reviews_require_owner",
+            "VOICE_REVIEW_OWNER_MISMATCH",
+        ),
+    ),
+)
+def test_voice_owner_guards_reject_linked_identity_mutations(
+    populated_database, tmp_path, trigger_name, error_code
+):
+    database_path = tmp_path / f"{trigger_name}.sqlite3"
+    shutil.copyfile(populated_database, database_path)
+    conn = open_database(database_path)
+    try:
+        sql, values = _owner_mutation_insert(conn, trigger_name)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN")
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match=error_code):
+                conn.execute(sql, values)
+
+            conn.execute(f"DROP TRIGGER {trigger_name}")
+            conn.execute(sql, values)
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()
 
 
 _COLLISION_TABLES = (
