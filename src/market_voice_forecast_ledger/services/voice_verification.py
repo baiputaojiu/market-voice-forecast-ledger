@@ -3,6 +3,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from typing import Final
 
 from market_voice_forecast_ledger.db.connection import transaction
@@ -16,7 +17,7 @@ from market_voice_forecast_ledger.domain.discovery import (
     DiscoverySourceKind,
     PresenceState,
 )
-from market_voice_forecast_ledger.domain.enums import JobKind, JobStatus
+from market_voice_forecast_ledger.domain.enums import JobStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import (
     VoiceManifestSnapshot,
@@ -67,8 +68,35 @@ class PilotCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class PilotReferenceIdentity:
+    subject_id: int
+    reference_profile_id: int
+    bundle_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class PilotCalibrationSnapshot:
+    calibration_hash: str
+    expected_prior_fingerprint: str
+    threshold_config_version: str
+    subject_operator: str
+    subject_boundary: float
+    interviewer_operator: str
+    interviewer_boundary: float
+    model_name: str
+    model_version: str
+    adapter_version: str
+    model_sha256: str
+    feature_contract_hash: str
+    activated_at: datetime
+    references: tuple[PilotReferenceIdentity, ...]
+    snapshot_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class PilotPreview:
     candidates: tuple[PilotCandidate, ...]
+    calibration_snapshot: PilotCalibrationSnapshot
     preview_hash: str
 
 
@@ -186,7 +214,9 @@ class PresenceVerificationService:
             or len({item.subject_id for item in profiles}) != 4
         ):
             _raise_insufficient()
-        references, calibration = self._active_references()
+        references, calibration, calibration_snapshot = (
+            self._active_references()
+        )
         profile_subjects = {item.subject_id for item in profiles}
         if set(references) != profile_subjects:
             raise DomainError(
@@ -218,6 +248,9 @@ class PresenceVerificationService:
         preview_hash = sha256_text(
             canonical_json(
                 {
+                    "calibration": _calibration_preview_payload(
+                        calibration_snapshot
+                    ),
                     "candidates": [
                         _candidate_preview_payload(item) for item in candidates
                     ],
@@ -225,11 +258,19 @@ class PresenceVerificationService:
                 }
             )
         )
-        return PilotPreview(candidates=candidates, preview_hash=preview_hash)
+        return PilotPreview(
+            candidates=candidates,
+            calibration_snapshot=calibration_snapshot,
+            preview_hash=preview_hash,
+        )
 
     def _active_references(
         self,
-    ) -> tuple[dict[int, ReferenceBundle], StoredCalibrationIdentity]:
+    ) -> tuple[
+        dict[int, ReferenceBundle],
+        StoredCalibrationIdentity,
+        PilotCalibrationSnapshot,
+    ]:
         reference_ids = self._voice.list_active_reference_profile_ids()
         if len(reference_ids) != 4:
             raise DomainError(
@@ -245,6 +286,7 @@ class PresenceVerificationService:
             or len({item.threshold_config_version for item in bundles}) != 1
             or len({(item.model_name, item.model_version) for item in bundles})
             != 1
+            or len({item.adapter_version for item in bundles}) != 1
             or any(not item.is_active for item in bundles)
         ):
             raise DomainError(
@@ -271,7 +313,105 @@ class PresenceVerificationService:
                 "PRESENCE_PILOT_REFERENCE_INVALID",
                 "presence pilot active calibration identity is invalid",
             )
-        return ({item.subject_id: item for item in bundles}, calibration)
+        threshold_rows = tuple(
+            self._conn.execute(
+                """
+                SELECT *, typeof(version) AS type_version,
+                       typeof(model_name) AS type_model_name,
+                       typeof(model_version) AS type_model_version,
+                       typeof(subject_operator) AS type_subject_operator,
+                       typeof(subject_boundary) AS type_subject_boundary,
+                       typeof(interviewer_operator) AS type_interviewer_operator,
+                       typeof(interviewer_boundary) AS type_interviewer_boundary,
+                       typeof(created_at) AS type_created_at,
+                       typeof(is_active) AS type_is_active
+                FROM speaker_threshold_configs
+                WHERE is_active=1
+                ORDER BY version
+                """
+            )
+        )
+        if len(threshold_rows) != 1:
+            _raise_reference_invalid()
+        threshold = threshold_rows[0]
+        if (
+            any(
+                threshold[key] != expected
+                for key, expected in (
+                    ("type_version", "text"),
+                    ("type_model_name", "text"),
+                    ("type_model_version", "text"),
+                    ("type_subject_operator", "text"),
+                    ("type_subject_boundary", "real"),
+                    ("type_interviewer_operator", "text"),
+                    ("type_interviewer_boundary", "real"),
+                    ("type_created_at", "text"),
+                    ("type_is_active", "integer"),
+                )
+            )
+            or threshold["version"] != threshold_version
+            or threshold["model_name"] != bundles[0].model_name
+            or threshold["model_version"] != bundles[0].model_version
+            or threshold["subject_operator"] != "gte"
+            or threshold["interviewer_operator"] != "lte"
+            or not isfinite(threshold["subject_boundary"])
+            or not isfinite(threshold["interviewer_boundary"])
+            or threshold["subject_boundary"]
+            <= threshold["interviewer_boundary"]
+            or threshold["created_at"] != utc_iso(calibration.activated_at)
+            or threshold["is_active"] != 1
+            or any(item.created_at != calibration.activated_at for item in bundles)
+        ):
+            _raise_reference_invalid()
+        reference_identities = tuple(
+            PilotReferenceIdentity(
+                subject_id=item.subject_id,
+                reference_profile_id=item.reference_profile_id,
+                bundle_hash=_reference_bundle_hash(item),
+            )
+            for item in bundles
+        )
+        snapshot_values = {
+            "activated_at": utc_iso(calibration.activated_at),
+            "adapter_version": bundles[0].adapter_version,
+            "calibration_hash": calibration.calibration_hash,
+            "expected_prior_fingerprint": (
+                calibration.expected_prior_fingerprint
+            ),
+            "feature_contract_hash": calibration.feature_contract_hash,
+            "interviewer_boundary": threshold["interviewer_boundary"],
+            "interviewer_operator": threshold["interviewer_operator"],
+            "model_name": bundles[0].model_name,
+            "model_sha256": calibration.model_sha256,
+            "model_version": bundles[0].model_version,
+            "references": [asdict(item) for item in reference_identities],
+            "schema": "presence-pilot-active-calibration.v1",
+            "subject_boundary": threshold["subject_boundary"],
+            "subject_operator": threshold["subject_operator"],
+            "threshold_config_version": threshold_version,
+        }
+        snapshot = PilotCalibrationSnapshot(
+            calibration_hash=calibration.calibration_hash,
+            expected_prior_fingerprint=calibration.expected_prior_fingerprint,
+            threshold_config_version=threshold_version,
+            subject_operator=threshold["subject_operator"],
+            subject_boundary=threshold["subject_boundary"],
+            interviewer_operator=threshold["interviewer_operator"],
+            interviewer_boundary=threshold["interviewer_boundary"],
+            model_name=bundles[0].model_name,
+            model_version=bundles[0].model_version,
+            adapter_version=bundles[0].adapter_version,
+            model_sha256=calibration.model_sha256,
+            feature_contract_hash=calibration.feature_contract_hash,
+            activated_at=calibration.activated_at,
+            references=reference_identities,
+            snapshot_hash=sha256_text(canonical_json(snapshot_values)),
+        )
+        return (
+            {item.subject_id: item for item in bundles},
+            calibration,
+            snapshot,
+        )
 
     def _eligible_candidates(
         self,
@@ -431,23 +571,20 @@ class PresenceVerificationService:
                     "VIDEO_PIPELINE_BINDINGS_INVALID",
                     "video-pipeline binding inventory is invalid",
                 )
+            try:
+                job = self._job_state.require_canonical_video_pipeline_job(
+                    job_id
+                )
+            except (DomainError, TypeError, ValueError) as cause:
+                raise DomainError(
+                    "VIDEO_PIPELINE_BINDINGS_INVALID",
+                    "video-pipeline binding inventory is invalid",
+                ) from cause
             if self._conn.execute(
                 "SELECT 1 FROM voice_verification_manifests WHERE job_id=?",
                 (job_id,),
             ).fetchone() is not None:
                 self._voice.get_manifest_for_job(job_id)
-            try:
-                job = self._jobs.get(job_id)
-            except (TypeError, ValueError) as cause:
-                raise DomainError(
-                    "VIDEO_PIPELINE_BINDINGS_INVALID",
-                    "video-pipeline binding inventory is invalid",
-                ) from cause
-            if job.kind is not JobKind.VIDEO_PIPELINE:
-                raise DomainError(
-                    "VIDEO_PIPELINE_BINDINGS_INVALID",
-                    "video-pipeline binding inventory is invalid",
-                )
             if job.status not in _INACTIVE_BOUND_JOB_STATUSES:
                 active = True
         return active
@@ -478,11 +615,29 @@ class PresenceVerificationService:
                 ):
                     selected.append(candidate)
 
+        if not has_seed:
+            searches = tuple(
+                item
+                for item in newest
+                if item.source_kind
+                is DiscoverySourceKind.CROSS_CHANNEL_SEARCH
+            )
+            selected.extend(searches[:4])
+            if len(searches) >= 5:
+                selected.append(_oldest(searches[4:])[0])
+                return tuple(selected)
+            selected_ids = {item.candidate_id for item in selected}
+            for candidate in newest:
+                if len(selected) >= 5:
+                    break
+                if candidate.candidate_id not in selected_ids:
+                    selected.append(candidate)
+                    selected_ids.add(candidate.candidate_id)
+            return tuple(selected)
+
         if has_seed:
             take_source(DiscoverySourceKind.SEED_UPLOADS, 2)
             take_source(DiscoverySourceKind.CROSS_CHANNEL_SEARCH, 2)
-        else:
-            take_source(DiscoverySourceKind.CROSS_CHANNEL_SEARCH, 4)
         selected_ids = {item.candidate_id for item in selected}
         for candidate in newest:
             if len(selected) >= 4:
@@ -538,6 +693,62 @@ def _candidate_preview_payload(candidate: PilotCandidate) -> dict[str, object]:
         "video_id": candidate.video_id,
         "youtube_video_id": candidate.youtube_video_id,
     }
+
+
+def _calibration_preview_payload(
+    snapshot: PilotCalibrationSnapshot,
+) -> dict[str, object]:
+    return {
+        "activated_at": utc_iso(snapshot.activated_at),
+        "adapter_version": snapshot.adapter_version,
+        "calibration_hash": snapshot.calibration_hash,
+        "expected_prior_fingerprint": snapshot.expected_prior_fingerprint,
+        "feature_contract_hash": snapshot.feature_contract_hash,
+        "interviewer_boundary": snapshot.interviewer_boundary,
+        "interviewer_operator": snapshot.interviewer_operator,
+        "model_name": snapshot.model_name,
+        "model_sha256": snapshot.model_sha256,
+        "model_version": snapshot.model_version,
+        "references": [asdict(item) for item in snapshot.references],
+        "snapshot_hash": snapshot.snapshot_hash,
+        "subject_boundary": snapshot.subject_boundary,
+        "subject_operator": snapshot.subject_operator,
+        "threshold_config_version": snapshot.threshold_config_version,
+    }
+
+
+def _reference_bundle_hash(reference: ReferenceBundle) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "adapter_version": reference.adapter_version,
+                "clips": [item.clip_hash for item in reference.clips],
+                "created_at": utc_iso(reference.created_at),
+                "feature": {
+                    "created_at": utc_iso(reference.feature.created_at),
+                    "dimension": reference.feature.dimension,
+                    "encoding_version": reference.feature.encoding_version,
+                    "feature_sha256": reference.feature.feature_sha256,
+                    "float_dtype": reference.feature.float_dtype,
+                },
+                "feature_hash": reference.feature_hash,
+                "is_active": reference.is_active,
+                "model_name": reference.model_name,
+                "model_version": reference.model_version,
+                "reference_profile_id": reference.reference_profile_id,
+                "schema": "presence-pilot-reference-bundle.v1",
+                "subject_id": reference.subject_id,
+                "threshold_config_version": reference.threshold_config_version,
+            }
+        )
+    )
+
+
+def _raise_reference_invalid() -> None:
+    raise DomainError(
+        "PRESENCE_PILOT_REFERENCE_INVALID",
+        "presence pilot active calibration state is invalid",
+    )
 
 
 def _parse_exact_utc(value: object) -> datetime:

@@ -90,10 +90,26 @@ def _channel_id(ordinal: int) -> str:
     return f"UC{ordinal:022d}"
 
 
-def _candidate_sources(*, has_seed: bool, seed_shortage: bool) -> tuple[
+def _candidate_sources(
+    *,
+    has_seed: bool,
+    seed_shortage: bool,
+    seedless_source_mode: str,
+) -> tuple[
     DiscoverySourceKind, ...
 ]:
     if not has_seed:
+        if seedless_source_mode == "manual_oldest":
+            return (
+                *(DiscoverySourceKind.CROSS_CHANNEL_SEARCH,) * 5,
+                DiscoverySourceKind.MANUAL_URL,
+            )
+        if seedless_source_mode == "search_shortage":
+            return (
+                *(DiscoverySourceKind.CROSS_CHANNEL_SEARCH,) * 4,
+                DiscoverySourceKind.MANUAL_URL,
+                DiscoverySourceKind.MANUAL_URL,
+            )
         return (DiscoverySourceKind.CROSS_CHANNEL_SEARCH,) * 6
     if seed_shortage:
         return (
@@ -111,6 +127,7 @@ def seed_pilot_environment(
     db: sqlite3.Connection,
     *,
     seed_shortage: bool = False,
+    seedless_source_mode: str = "search_only",
 ) -> PilotSeed:
     discovery = DiscoveryRepository(db)
     profiles = discovery.list_active_profile_versions()
@@ -132,8 +149,17 @@ def seed_pilot_environment(
             source_kinds = _candidate_sources(
                 has_seed=bool(profile.seed_channel_ids),
                 seed_shortage=seed_shortage,
+                seedless_source_mode=seedless_source_mode,
             )
-            for source_kind, age in zip(source_kinds, ages, strict=True):
+            profile_ages = ages
+            if not profile.seed_channel_ids:
+                if seedless_source_mode == "manual_oldest":
+                    profile_ages = (0, 0, 1, 2, 5, 10)
+                elif seedless_source_mode == "search_shortage":
+                    profile_ages = (0, 1, 2, 5, 0, 10)
+            for source_kind, age in zip(
+                source_kinds, profile_ages, strict=True
+            ):
                 metadata = CanonicalVideoMetadata.build(
                     youtube_video_id=_youtube_video_id(next_video),
                     channel_id=_channel_id(next_video),
@@ -333,6 +359,34 @@ def _video_pipeline_count(db: sqlite3.Connection) -> int:
     ).fetchone()[0]
 
 
+def _assert_no_pilot_writes(db: sqlite3.Connection) -> None:
+    assert _video_pipeline_count(db) == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM video_pipeline_job_binding_sets"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM video_pipeline_job_bindings"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_manifests"
+    ).fetchone()[0] == 0
+
+
+def _pilot_write_counts(db: sqlite3.Connection) -> tuple[int, ...]:
+    return tuple(
+        db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "jobs",
+            "job_units",
+            "job_unit_attempts",
+            "job_events",
+            "video_pipeline_job_binding_sets",
+            "video_pipeline_job_bindings",
+            "voice_verification_manifests",
+        )
+    )
+
+
 def test_pilot_selects_exact_five_per_active_profile_in_contract_order(db) -> None:
     seed = seed_pilot_environment(db)
 
@@ -342,6 +396,23 @@ def test_pilot_selects_exact_five_per_active_profile_in_contract_order(db) -> No
     assert len(preview.candidates) == 20
     assert counts == {profile_id: 5 for profile_id in seed.candidates_by_profile}
     assert len({item.candidate_id for item in preview.candidates}) == 20
+    calibration = preview.calibration_snapshot
+    assert calibration.calibration_hash == CALIBRATION_HASH
+    assert calibration.threshold_config_version == THRESHOLD_VERSION
+    assert calibration.subject_operator == "gte"
+    assert calibration.subject_boundary == 0.75
+    assert calibration.interviewer_operator == "lte"
+    assert calibration.interviewer_boundary == 0.20
+    assert calibration.model_name == MODEL_NAME
+    assert calibration.model_version == MODEL_VERSION
+    assert calibration.adapter_version == ADAPTER_VERSION
+    assert calibration.activated_at == NOW
+    assert len(calibration.references) == 4
+    assert tuple(item.subject_id for item in calibration.references) == tuple(
+        sorted(seed.reference_profile_by_subject)
+    )
+    assert all(len(item.bundle_hash) == 64 for item in calibration.references)
+    assert len(calibration.snapshot_hash) == 64
     for profile_id, candidates in seed.candidates_by_profile.items():
         selected = tuple(
             item for item in preview.candidates if item.profile_id == profile_id
@@ -385,6 +456,43 @@ def test_pilot_backfills_seed_shortage_by_newest_then_keeps_oldest_slot(db) -> N
             "cross_channel_search",
             "cross_channel_search",
         )
+
+
+@pytest.mark.parametrize(
+    ("seedless_source_mode", "expected_sources"),
+    (
+        ("manual_oldest", ("cross_channel_search",) * 5),
+        (
+            "search_shortage",
+            ("cross_channel_search",) * 4 + ("manual_url",),
+        ),
+    ),
+)
+def test_seedless_selection_prefers_search_before_source_backfill(
+    db, seedless_source_mode: str, expected_sources: tuple[str, ...]
+) -> None:
+    seed = seed_pilot_environment(
+        db, seedless_source_mode=seedless_source_mode
+    )
+
+    preview = pilot_service(db).preview_pilot()
+
+    seedless = next(
+        candidates
+        for candidates in seed.candidates_by_profile.values()
+        if not DiscoveryRepository(db)
+        .get_profile_version(candidates[0].profile_version_id)
+        .seed_channel_ids
+    )
+    selected = tuple(
+        item
+        for item in preview.candidates
+        if item.profile_id == seedless[0].profile_id
+    )
+    assert tuple(item.candidate_id for item in selected) == tuple(
+        item.candidate_id for item in seedless[:5]
+    )
+    assert tuple(item.source_kind.value for item in selected) == expected_sources
 
 
 def test_preview_uses_canonical_first_observation_not_later_source(db) -> None:
@@ -442,6 +550,41 @@ def test_preview_excludes_rejected_and_active_bound_candidates(db) -> None:
     assert len(preview.candidates) == 20
     assert first.candidate_id not in selected_ids
     assert second.candidate_id not in selected_ids
+
+
+@pytest.mark.parametrize(
+    "mutation", ("succeeded_with_pending", "stopped_with_running")
+)
+def test_create_fails_closed_on_corrupt_terminal_bound_job_state(
+    db, mutation: str
+) -> None:
+    seed_pilot_environment(db)
+    service = pilot_service(db)
+    preview = service.preview_pilot()
+    candidate = preview.candidates[0]
+    manifest = build_presence_job_manifest(candidate.manifest_snapshot)
+    jobs = JobStateService(db, clock=lambda: NOW)
+    job_id = jobs.create_video_pipeline(
+        manifest,
+        (candidate.candidate_id,),
+    )
+    if mutation == "succeeded_with_pending":
+        db.execute(
+            "UPDATE jobs SET status='succeeded', updated_at=? WHERE id=?",
+            (utc_iso(NOW + timedelta(minutes=1)), job_id),
+        )
+    else:
+        jobs.begin_unit(job_id, manifest.units[0].unit_key)
+        db.execute(
+            "UPDATE jobs SET status='stopped', updated_at=? WHERE id=?",
+            (utc_iso(NOW + timedelta(minutes=1)), job_id),
+        )
+    before = _pilot_write_counts(db)
+
+    with pytest.raises(DomainError) as caught:
+        service.create_pilot(preview.preview_hash)
+    assert caught.value.code == "VIDEO_PIPELINE_BINDINGS_INVALID"
+    assert _pilot_write_counts(db) == before
 
 
 def test_preview_pairs_each_profile_with_its_same_subject_reference(db) -> None:
@@ -601,6 +744,50 @@ def test_create_rejects_model_identity_drift_before_writes(db) -> None:
     assert db.execute(
         "SELECT COUNT(*) FROM voice_verification_manifests"
     ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("subject_boundary", "inactive_threshold", "mismatched_adapter"),
+)
+def test_create_fails_closed_on_active_calibration_state_drift(
+    db, mutation: str
+) -> None:
+    seed_pilot_environment(db)
+    service = pilot_service(db)
+    preview = service.preview_pilot()
+    if mutation in {"subject_boundary", "inactive_threshold"}:
+        db.execute("DROP TRIGGER speaker_threshold_configs_limited_update")
+        if mutation == "subject_boundary":
+            db.execute(
+                "UPDATE speaker_threshold_configs SET subject_boundary=0.74 "
+                "WHERE version=?",
+                (THRESHOLD_VERSION,),
+            )
+        else:
+            db.execute(
+                "UPDATE speaker_threshold_configs SET is_active=0 WHERE version=?",
+                (THRESHOLD_VERSION,),
+            )
+    else:
+        db.execute("DROP TRIGGER voice_reference_profiles_limited_update")
+        reference_id = db.execute(
+            "SELECT id FROM voice_reference_profiles "
+            "WHERE is_active=1 ORDER BY subject_id LIMIT 1"
+        ).fetchone()[0]
+        db.execute(
+            "UPDATE voice_reference_profiles SET adapter_version=? WHERE id=?",
+            ("mismatched-adapter-v2", reference_id),
+        )
+
+    with pytest.raises(DomainError) as caught:
+        service.create_pilot(preview.preview_hash)
+    assert caught.value.code == (
+        "PRESENCE_PILOT_CHANGED"
+        if mutation == "subject_boundary"
+        else "PRESENCE_PILOT_REFERENCE_INVALID"
+    )
+    _assert_no_pilot_writes(db)
 
 
 def test_pilot_insufficiency_is_detected_before_any_write(db) -> None:

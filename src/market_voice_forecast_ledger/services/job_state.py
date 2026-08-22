@@ -26,6 +26,9 @@ from market_voice_forecast_ledger.repositories.jobs import (
     JobRepository,
     StoredJob,
 )
+from market_voice_forecast_ledger.repositories.voice_verification import (
+    VoiceVerificationRepository,
+)
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
@@ -430,6 +433,22 @@ class JobStateService:
 
     def stored_manifest(self, job_id: int) -> JobManifest:
         return self._stored_manifest(self._jobs.get(job_id))
+
+    def require_canonical_video_pipeline_job(self, job_id: int) -> StoredJob:
+        try:
+            job = self._jobs.get(job_id)
+            if job.kind is not JobKind.VIDEO_PIPELINE:
+                raise ValueError("video pipeline job kind")
+            manifest = self._stored_manifest(job)
+            VoiceVerificationRepository(self._conn)._validate_job_manifest(
+                job_id, manifest
+            )
+        except (DomainError, LookupError, TypeError, ValueError) as cause:
+            raise DomainError(
+                "STORED_JOB_STATE_INVALID",
+                "stored video-pipeline job state is invalid",
+            ) from cause
+        return job
 
     def unit(self, job_id: int, unit_key: str) -> JobUnit:
         return self._jobs.get_unit(job_id, unit_key)
