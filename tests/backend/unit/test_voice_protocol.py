@@ -35,6 +35,7 @@ def _request() -> AdapterRequest:
     feature = b"reference-feature"
     values = {
         "adapter_contract_version": "voice-adapter-v1",
+        "audio_duration_ms": 2_000,
         "audio_path": "C:/private/work/audio.wav",
         "audio_sha256": "a" * 64,
         "interviewer_boundary": 0.2,
@@ -64,14 +65,34 @@ def _response_payload(request: AdapterRequest) -> bytes:
         "segments": [
             {
                 "end_ms": 1000,
-                "evidence_hash": "d" * 64,
+                "evidence_hash": sha256_text(
+                    canonical_json(
+                        {
+                            "audio_sha256": request.audio_sha256,
+                            "end_ms": 1000,
+                            "ordinal": 1,
+                            "raw_score": 0.9,
+                            "start_ms": 0,
+                        }
+                    )
+                ),
                 "ordinal": 1,
                 "raw_score": 0.9,
                 "start_ms": 0,
             },
             {
                 "end_ms": 2000,
-                "evidence_hash": "e" * 64,
+                "evidence_hash": sha256_text(
+                    canonical_json(
+                        {
+                            "audio_sha256": request.audio_sha256,
+                            "end_ms": 2000,
+                            "ordinal": 2,
+                            "raw_score": 0.85,
+                            "start_ms": 1000,
+                        }
+                    )
+                ),
                 "ordinal": 2,
                 "raw_score": 0.85,
                 "start_ms": 1000,
@@ -103,8 +124,43 @@ def _mutated_response(request: AdapterRequest, mutation: str) -> bytes:
         values["model_name"] = "other-model.onnx"
     elif mutation == "wrong_identity":
         values["input_hash"] = "f" * 64
+    elif mutation == "empty_segments":
+        values["segments"] = []
+    elif mutation == "evidence_drift":
+        values["segments"][0]["evidence_hash"] = "0" * 64
+    elif mutation == "inconsistent_proposal":
+        values["proposal"] = VoiceProposal.LIKELY_ABSENT.value
+    elif mutation == "out_of_audio":
+        values["segments"][1]["end_ms"] = 2_001
+        segment = values["segments"][1]
+        segment["evidence_hash"] = sha256_text(
+            canonical_json(
+                {
+                    "audio_sha256": request.audio_sha256,
+                    "end_ms": 2_001,
+                    "ordinal": 2,
+                    "raw_score": 0.85,
+                    "start_ms": 1_000,
+                }
+            )
+        )
     else:
         raise AssertionError(f"unknown mutation {mutation}")
+    if mutation in {
+        "empty_segments",
+        "evidence_drift",
+        "inconsistent_proposal",
+        "out_of_audio",
+    }:
+        values["output_hash"] = sha256_text(
+            canonical_json(
+                {
+                    key: value
+                    for key, value in values.items()
+                    if key != "output_hash"
+                }
+            )
+        )
     return json.dumps(values, allow_nan=True).encode("utf-8")
 
 
@@ -130,6 +186,10 @@ def test_encode_request_is_canonical_and_keeps_the_private_feature_on_stdin_only
         "wrong_hash",
         "wrong_model",
         "wrong_identity",
+        "empty_segments",
+        "evidence_drift",
+        "inconsistent_proposal",
+        "out_of_audio",
     ),
 )
 def test_adapter_response_fails_closed_for_contract_mutations(mutation: str) -> None:
@@ -140,6 +200,71 @@ def test_adapter_response_fails_closed_for_contract_mutations(mutation: str) -> 
 
     assert caught.value.code == "VOICE_ADAPTER_RESPONSE_INVALID"
     assert caught.value.message == "adapter response is invalid"
+
+
+def test_request_binds_audio_duration_into_its_canonical_input_hash() -> None:
+    values = _request().model_dump(mode="python")
+    values["audio_duration_ms"] = 2_000
+
+    request = AdapterRequest.with_canonical_hash(**values)
+
+    assert request.audio_duration_ms == 2_000
+    changed_duration = dict(values)
+    changed_duration["audio_duration_ms"] = 2_001
+    assert request.input_hash != AdapterRequest.with_canonical_hash(
+        **changed_duration
+    ).input_hash
+    without_duration = dict(values)
+    without_duration.pop("audio_duration_ms")
+    with pytest.raises(DomainError, match="adapter request is invalid"):
+        AdapterRequest.with_canonical_hash(**without_duration)
+
+
+@pytest.mark.parametrize(
+    ("raw_score", "proposal"),
+    (
+        (0.1, VoiceProposal.LIKELY_ABSENT),
+        (0.5, VoiceProposal.NEEDS_REVIEW),
+        (0.8, VoiceProposal.LIKELY_PRESENT),
+    ),
+)
+def test_adapter_response_accepts_each_canonical_threshold_classification(
+    raw_score: float, proposal: VoiceProposal
+) -> None:
+    request = _request()
+    segment = {
+        "end_ms": 1_000,
+        "evidence_hash": sha256_text(
+            canonical_json(
+                {
+                    "audio_sha256": request.audio_sha256,
+                    "end_ms": 1_000,
+                    "ordinal": 1,
+                    "raw_score": raw_score,
+                    "start_ms": 0,
+                }
+            )
+        ),
+        "ordinal": 1,
+        "raw_score": raw_score,
+        "start_ms": 0,
+    }
+    values: dict[str, object] = {
+        "adapter_contract_version": request.adapter_contract_version,
+        "input_hash": request.input_hash,
+        "model_name": request.model_name,
+        "model_version": request.model_version,
+        "proposal": proposal.value,
+        "segments": [segment],
+        "vad_contract_version": request.vad_contract_version,
+    }
+    values["output_hash"] = sha256_text(canonical_json(values))
+
+    response = decode_response(
+        canonical_json(values).encode("utf-8"), expected_request=request
+    )
+
+    assert response.proposal is proposal
 
 
 @pytest.mark.parametrize(
@@ -323,20 +448,35 @@ def test_adapter_entrypoint_denies_socket_before_backend_and_wipes_feature(
         received: AdapterRequest, feature: bytearray
     ) -> FakeBackend:
         assert received == request
-        with pytest.raises(OSError, match="network disabled"):
-            socket_module.socket()
+        for factory in (
+            socket_module.socket,
+            socket_module.SocketType,
+            socket_module.create_connection,
+            socket_module.getaddrinfo,
+            socket_module.socketpair,
+            low_level_socket_module.socket,
+            low_level_socket_module.socketpair,
+        ):
+            with pytest.raises(OSError, match="network disabled"):
+                factory()
         captured["feature"] = feature
         return FakeBackend()
 
     socket_module = SimpleNamespace(
         socket=lambda: "unsafe",
+        SocketType=lambda: "unsafe",
         create_connection=lambda: "unsafe",
         getaddrinfo=lambda: "unsafe",
+        socketpair=lambda: "unsafe",
+    )
+    low_level_socket_module = SimpleNamespace(
+        socket=lambda: "unsafe", socketpair=lambda: "unsafe"
     )
     output = adapter_main.process_payload(
         encode_request(request),
         backend_factory=backend_factory,
         socket_module=socket_module,
+        low_level_socket_module=low_level_socket_module,
     )
 
     assert (
@@ -369,6 +509,10 @@ def test_adapter_entrypoint_wipes_feature_when_initialization_fails(
                 create_connection=lambda: None,
                 getaddrinfo=lambda: None,
             ),
+            low_level_socket_module=SimpleNamespace(
+                socket=lambda: None,
+                socketpair=lambda: None,
+            ),
         )
 
     assert caught.value.code == "VOICE_ADAPTER_PROCESS_FAILED"
@@ -385,36 +529,74 @@ def _adapter_forbidden_imports(source: str) -> tuple[str, ...]:
         "db",
         "repositories",
         "services",
+        "socket",
+        "sqlite3",
         "subprocess",
+        "sherpa_onnx",
         "youtube",
     }
     found: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
-        names: tuple[str, ...] = ()
+    tree = ast.parse(source)
+    importlib_modules = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "importlib"
+    }
+    import_functions = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module == "importlib"
+        for alias in node.names
+        if alias.name == "import_module"
+    }
+    for node in ast.walk(tree):
+        names: tuple[tuple[str, str], ...] = ()
         if isinstance(node, ast.Import):
-            names = tuple(alias.name for alias in node.names)
+            names = tuple((alias.name, "direct") for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            names = (node.module or "",) + tuple(
-                alias.name for alias in node.names
+            module = node.module or ""
+            names = tuple(
+                (
+                    f"{module}.{alias.name}" if module else alias.name,
+                    "direct",
+                )
+                for alias in node.names
             )
         elif (
             isinstance(node, ast.Call)
             and len(node.args) >= 1
             and isinstance(node.args[0], ast.Constant)
             and type(node.args[0].value) is str
-            and (
-                (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "import_module"
-                )
-                or (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id == "__import__"
-                )
-            )
         ):
-            names = (node.args[0].value,)
-        for name in names:
+            is_importlib = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "import_module"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in importlib_modules
+            ) or (
+                isinstance(node.func, ast.Name)
+                and node.func.id in import_functions
+            )
+            is_builtin = (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "__import__"
+            )
+            if is_importlib or is_builtin:
+                names = (
+                    (
+                        node.args[0].value,
+                        "importlib" if is_importlib else "builtin",
+                    ),
+                )
+        for name, kind in names:
+            if name in {"socket", "_socket"} and kind == "direct":
+                continue
+            if name == "sherpa_onnx" and kind == "importlib":
+                continue
             parts = set(name.lower().replace("-", "_").split("."))
             found.update(parts & forbidden)
     return tuple(sorted(found))
@@ -446,6 +628,14 @@ def _adapter_forbidden_imports(source: str) -> tuple[str, ...]:
             ")",
             ("repositories",),
         ),
+        ("from sqlite3 import connect as open_database", ("sqlite3",)),
+        (
+            "import importlib as loader\n"
+            "network = loader.import_module('socket')",
+            ("socket",),
+        ),
+        ("import sherpa_onnx", ("sherpa_onnx",)),
+        ("__import__('sherpa_onnx')", ("sherpa_onnx",)),
     ),
 )
 def test_adapter_import_guard_detects_forbidden_mutations(

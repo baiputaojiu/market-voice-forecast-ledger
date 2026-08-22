@@ -28,6 +28,7 @@ class _StrictModel(BaseModel):
 
 class AdapterRequest(_StrictModel):
     adapter_contract_version: str
+    audio_duration_ms: int
     audio_path: str
     audio_sha256: str
     interviewer_boundary: float
@@ -49,6 +50,8 @@ class AdapterRequest(_StrictModel):
     def _validate_shape(self) -> "AdapterRequest":
         if (
             not _safe_token(self.adapter_contract_version)
+            or type(self.audio_duration_ms) is not int
+            or not 1 <= self.audio_duration_ms <= 2_147_483_647
             or not _safe_token(self.model_name)
             or not _safe_token(self.model_version)
             or not _safe_token(self.threshold_config_version)
@@ -135,6 +138,7 @@ class AdapterResponse(_StrictModel):
             or not _safe_token(self.vad_contract_version)
             or not _sha256(self.input_hash)
             or not _sha256(self.output_hash)
+            or not self.segments
             or len(self.segments) > MAX_ADAPTER_SEGMENTS
         ):
             raise ValueError("invalid adapter response")
@@ -218,6 +222,31 @@ def decode_response(payload: object, *, expected_request: AdapterRequest) -> Ada
         )
         if response.output_hash != expected_hash:
             raise ValueError("adapter output hash mismatch")
+        for segment in response.segments:
+            if segment.end_ms > expected_request.audio_duration_ms:
+                raise ValueError("adapter segment exceeds audio")
+            expected_evidence = sha256_text(
+                canonical_json(
+                    {
+                        "audio_sha256": expected_request.audio_sha256,
+                        "end_ms": segment.end_ms,
+                        "ordinal": segment.ordinal,
+                        "raw_score": segment.raw_score,
+                        "start_ms": segment.start_ms,
+                    }
+                )
+            )
+            if segment.evidence_hash != expected_evidence:
+                raise ValueError("adapter evidence hash mismatch")
+        maximum = max(segment.raw_score for segment in response.segments)
+        if maximum >= expected_request.subject_boundary:
+            expected_proposal = VoiceProposal.LIKELY_PRESENT
+        elif maximum <= expected_request.interviewer_boundary:
+            expected_proposal = VoiceProposal.LIKELY_ABSENT
+        else:
+            expected_proposal = VoiceProposal.NEEDS_REVIEW
+        if response.proposal is not expected_proposal:
+            raise ValueError("adapter proposal mismatch")
         return response
     except (
         UnicodeDecodeError,

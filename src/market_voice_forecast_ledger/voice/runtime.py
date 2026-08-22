@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ _LOCK_KEYS = frozenset(
         "model",
         "provider",
         "python",
+        "python_startup",
         "sherpa_onnx",
         "vad",
         "vad_contract_version",
@@ -53,6 +55,12 @@ class RuntimeAttestation:
     python_path: Path
     python_sha256: str
     python_version: str
+    python_import_root: Path
+    python_import_files: tuple[tuple[str, str], ...]
+    python_startup_manifest_path: Path
+    python_startup_manifest_sha256: str
+    python_pyvenv_path: Path
+    python_pyvenv_sha256: str
     yt_dlp_path: Path
     yt_dlp_sha256: str
     yt_dlp_version: str
@@ -92,6 +100,7 @@ def attest_runtime(
         lock_path = _private_file(settings.voice_runtime_dir / "runtime-lock.json", runtime_root)
         lock = _read_lock(lock_path)
         python = _artifact(lock["python"], runtime_root, {"path", "sha256", "version"})
+        startup = _startup_attestation(lock["python_startup"], runtime_root)
         yt_dlp = _artifact(lock["yt_dlp"], runtime_root, {"path", "sha256", "version"})
         deno = _artifact(lock["deno"], runtime_root, {"path", "sha256", "version"})
         ffmpeg = _artifact(lock["ffmpeg"], runtime_root, {"path", "sha256", "version"})
@@ -125,6 +134,12 @@ def attest_runtime(
             python_path=python["path"],
             python_sha256=python["sha256"],
             python_version=python["version"],
+            python_import_root=startup["import_root"],
+            python_import_files=startup["files"],
+            python_startup_manifest_path=startup["manifest_path"],
+            python_startup_manifest_sha256=startup["manifest_sha256"],
+            python_pyvenv_path=startup["pyvenv_path"],
+            python_pyvenv_sha256=startup["pyvenv_sha256"],
             yt_dlp_path=yt_dlp["path"],
             yt_dlp_sha256=yt_dlp["sha256"],
             yt_dlp_version=yt_dlp["version"],
@@ -158,6 +173,201 @@ def _validate_allowlists(allowlists: RuntimeAllowlists) -> None:
         allowlists.sherpa_wheel_sha256,
     )):
         raise ValueError("invalid allowlists")
+
+
+def verify_runtime_startup(
+    attestation: RuntimeAttestation, data_root: Path
+) -> None:
+    try:
+        if not isinstance(attestation, RuntimeAttestation):
+            raise ValueError("invalid runtime attestation")
+        private_data = _private_root(data_root)
+        runtime_root = _private_child_root(
+            attestation.python_path.parent, private_data
+        )
+        expected_import_root = runtime_root / "Lib" / "site-packages"
+        import_root = _private_child_root(
+            attestation.python_import_root, runtime_root
+        )
+        if import_root != expected_import_root:
+            raise ValueError("unexpected Python import root")
+        _reject_runtime_startup_hooks(runtime_root)
+        manifest = _private_file(
+            attestation.python_startup_manifest_path, runtime_root
+        )
+        pyvenv = _private_file(attestation.python_pyvenv_path, runtime_root)
+        if (
+            manifest != runtime_root / "startup-manifest.json"
+            or pyvenv != runtime_root / "pyvenv.cfg"
+            or _file_sha256(manifest)
+            != attestation.python_startup_manifest_sha256
+            or _file_sha256(pyvenv) != attestation.python_pyvenv_sha256
+        ):
+            raise ValueError("Python startup artifacts changed")
+        files = _read_startup_manifest(manifest, import_root)
+        if (
+            files != attestation.python_import_files
+            or _startup_inventory(import_root) != files
+        ):
+            raise ValueError("Python import inventory changed")
+        _validate_pyvenv(pyvenv)
+    except Exception:
+        raise _runtime_invalid() from None
+
+
+def _startup_attestation(
+    value: object, runtime_root: Path
+) -> dict[str, Any]:
+    expected_keys = {
+        "import_root",
+        "manifest_path",
+        "manifest_sha256",
+        "pyvenv_path",
+        "pyvenv_sha256",
+    }
+    if type(value) is not dict or set(value) != expected_keys:
+        raise ValueError("invalid Python startup attestation")
+    if not all(
+        isinstance(value[key], str)
+        for key in ("import_root", "manifest_path", "pyvenv_path")
+    ) or not all(
+        _sha256(value[key])
+        for key in ("manifest_sha256", "pyvenv_sha256")
+    ):
+        raise ValueError("invalid Python startup fields")
+    import_root = _private_child_root(Path(value["import_root"]), runtime_root)
+    manifest = _private_file(Path(value["manifest_path"]), runtime_root)
+    pyvenv = _private_file(Path(value["pyvenv_path"]), runtime_root)
+    if (
+        import_root != runtime_root / "Lib" / "site-packages"
+        or manifest != runtime_root / "startup-manifest.json"
+        or pyvenv != runtime_root / "pyvenv.cfg"
+        or _file_sha256(manifest) != value["manifest_sha256"]
+        or _file_sha256(pyvenv) != value["pyvenv_sha256"]
+    ):
+        raise ValueError("Python startup identity mismatch")
+    _reject_runtime_startup_hooks(runtime_root)
+    files = _read_startup_manifest(manifest, import_root)
+    if _startup_inventory(import_root) != files:
+        raise ValueError("Python import inventory mismatch")
+    _validate_pyvenv(pyvenv)
+    return {
+        "import_root": import_root,
+        "files": files,
+        "manifest_path": manifest,
+        "manifest_sha256": value["manifest_sha256"],
+        "pyvenv_path": pyvenv,
+        "pyvenv_sha256": value["pyvenv_sha256"],
+    }
+
+
+def _read_startup_manifest(
+    path: Path, import_root: Path
+) -> tuple[tuple[str, str], ...]:
+    body = path.read_bytes()
+    if not body or len(body) > 8_388_608:
+        raise ValueError("invalid startup manifest size")
+    value = json.loads(
+        body.decode("utf-8", errors="strict"), object_pairs_hook=_unique_object
+    )
+    if type(value) is not dict or set(value) != {"files"}:
+        raise ValueError("invalid startup manifest")
+    raw_files = value["files"]
+    if type(raw_files) is not list or not raw_files or len(raw_files) > 100_000:
+        raise ValueError("invalid startup file inventory")
+    files: list[tuple[str, str]] = []
+    for item in raw_files:
+        if type(item) is not dict or set(item) != {"path", "sha256"}:
+            raise ValueError("invalid startup file")
+        relative = item["path"]
+        digest = item["sha256"]
+        if (
+            type(relative) is not str
+            or not relative
+            or "\\" in relative
+            or relative.startswith("/")
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or not _sha256(digest)
+        ):
+            raise ValueError("invalid startup file identity")
+        _reject_startup_hook(relative)
+        candidate = _private_file(import_root / Path(relative), import_root)
+        if _file_sha256(candidate) != digest:
+            raise ValueError("startup file changed")
+        files.append((relative, digest))
+    result = tuple(files)
+    if result != tuple(sorted(set(result))):
+        raise ValueError("startup inventory is not canonical")
+    names = {relative for relative, _digest in result}
+    if (
+        "market_voice_forecast_ledger/voice/adapter_main.py" not in names
+        or "sherpa_onnx/__init__.py" not in names
+    ):
+        raise ValueError("required startup material is absent")
+    return result
+
+
+def _startup_inventory(import_root: Path) -> tuple[tuple[str, str], ...]:
+    files: list[tuple[str, str]] = []
+    for current, directories, filenames in os.walk(
+        import_root, topdown=True, followlinks=False
+    ):
+        current_path = Path(current)
+        if _is_reparse(current_path):
+            raise ValueError("startup directory is a reparse point")
+        for directory in directories:
+            if _is_reparse(current_path / directory):
+                raise ValueError("startup directory is a reparse point")
+        for filename in filenames:
+            candidate = _private_file(current_path / filename, import_root)
+            relative = candidate.relative_to(import_root).as_posix()
+            _reject_startup_hook(relative)
+            files.append((relative, _file_sha256(candidate)))
+    return tuple(sorted(files))
+
+
+def _reject_startup_hook(relative: str) -> None:
+    name = relative.rsplit("/", 1)[-1].casefold()
+    if (
+        name.endswith(".pth")
+        or name.startswith("sitecustomize.")
+        or name.startswith("usercustomize.")
+    ):
+        raise ValueError("Python startup hook is forbidden")
+
+
+def _reject_runtime_startup_hooks(runtime_root: Path) -> None:
+    for current, directories, filenames in os.walk(
+        runtime_root, topdown=True, followlinks=False
+    ):
+        current_path = Path(current)
+        if _is_reparse(current_path):
+            raise ValueError("runtime directory is a reparse point")
+        for directory in directories:
+            if _is_reparse(current_path / directory):
+                raise ValueError("runtime directory is a reparse point")
+        for filename in filenames:
+            _reject_startup_hook(filename)
+
+
+def _validate_pyvenv(path: Path) -> None:
+    body = path.read_bytes()
+    if not body or len(body) > 65_536:
+        raise ValueError("invalid pyvenv config")
+    text = body.decode("utf-8", errors="strict")
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        if "=" not in raw_line:
+            raise ValueError("invalid pyvenv config")
+        key, item = (part.strip() for part in raw_line.split("=", 1))
+        folded = key.casefold()
+        if not folded or folded in values or "\x00" in item:
+            raise ValueError("invalid pyvenv config")
+        values[folded] = item.casefold()
+    if values.get("include-system-site-packages") != "false":
+        raise ValueError("system site packages are not isolated")
 
 
 def _read_lock(path: Path) -> dict[str, Any]:
@@ -251,7 +461,16 @@ def _require_no_reparse(path: Path) -> None:
 
 def _is_reparse(path: Path) -> bool:
     isjunction = getattr(os.path, "isjunction", lambda _: False)
-    return path.is_symlink() or bool(isjunction(path))
+    try:
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    except OSError:
+        attributes = 0
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return (
+        path.is_symlink()
+        or bool(isjunction(path))
+        or bool(attributes & reparse_flag)
+    )
 
 
 def _file_sha256(path: Path) -> str:
@@ -298,4 +517,5 @@ __all__ = [
     "RuntimeAttestation",
     "VersionProbe",
     "attest_runtime",
+    "verify_runtime_startup",
 ]

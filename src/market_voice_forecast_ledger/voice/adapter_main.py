@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import _socket
 import socket
 import sys
 from collections.abc import Callable
@@ -39,14 +40,17 @@ def process_payload(
     *,
     backend_factory: BackendFactory | None = None,
     socket_module: Any = None,
+    low_level_socket_module: Any = None,
 ) -> bytes:
     feature: bytearray | None = None
     try:
         request = _decode_request(payload)
         if socket_module is None:
             socket_module = socket
+        if low_level_socket_module is None:
+            low_level_socket_module = _socket
 
-        _install_network_denial(socket_module)
+        _install_network_denial(socket_module, low_level_socket_module)
         feature = decode_reference_feature(
             request, max_bytes=request.reference_feature_length
         )
@@ -99,13 +103,24 @@ def _decode_request(payload: object) -> AdapterRequest:
     return request
 
 
-def _install_network_denial(socket_module: Any) -> None:
+def _install_network_denial(
+    socket_module: Any, low_level_socket_module: Any
+) -> None:
     def _network_disabled(*args: object, **kwargs: object) -> object:
         raise OSError("network disabled")
 
-    socket_module.socket = _network_disabled
-    socket_module.create_connection = _network_disabled
-    socket_module.getaddrinfo = _network_disabled
+    for name in (
+        "socket",
+        "SocketType",
+        "create_connection",
+        "getaddrinfo",
+        "socketpair",
+        "fromfd",
+        "fromshare",
+    ):
+        setattr(socket_module, name, _network_disabled)
+    for name in ("socket", "socketpair"):
+        setattr(low_level_socket_module, name, _network_disabled)
 
 
 def _create_backend(request: AdapterRequest, feature: bytearray) -> _Backend:
@@ -130,6 +145,8 @@ def _create_backend(request: AdapterRequest, feature: bytearray) -> _Backend:
             or wav.getcomptype() != "NONE"
         ):
             raise ValueError("invalid normalized audio")
+        if (wav.getnframes() * 1_000) // 16_000 != request.audio_duration_ms:
+            raise ValueError("normalized audio duration changed")
         pcm = array("h")
         pcm.frombytes(wav.readframes(wav.getnframes()))
     if sys.byteorder != "little":

@@ -1,4 +1,6 @@
 import hashlib
+import os
+import stat
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -84,14 +86,35 @@ def test_downloader_uses_fixed_attested_argv_hidden_window_and_discarded_output(
     job_dir = work_root / "job-1"
     job_dir.mkdir()
     runner = FakeMediaRunner()
+    source_environment = {
+        "SystemRoot": "C:/Windows",
+        "TEMP": "C:/Temp",
+        "FFREPORT": "file=private-report.log",
+        "HTTPS_PROXY": "http://private-proxy",
+        "YOUTUBE_API_KEY": "private-api-key",
+        "APPDATA": "C:/private-browser",
+        "PATH": "C:/private-helper-bin",
+        "YTDLP_NO_PLUGINS": "attacker-value",
+    }
 
-    result = MediaAcquirer(runner, attestation, work_root).acquire(
+    result = MediaAcquirer(
+        runner,
+        attestation,
+        work_root,
+        source_environment=source_environment,
+    ).acquire(
         "abcdefghijk", job_dir
     )
 
     assert runner.calls == [
         (
             str(attestation.yt_dlp_path),
+            "--ignore-config",
+            "--no-config-locations",
+            "--no-plugin-dirs",
+            "--no-cache-dir",
+            "--downloader",
+            "native",
             "--no-playlist",
             "--no-write-info-json",
             "--no-write-thumbnail",
@@ -110,6 +133,12 @@ def test_downloader_uses_fixed_attested_argv_hidden_window_and_discarded_output(
         {
             "check": False,
             "creationflags": subprocess.CREATE_NO_WINDOW,
+            "cwd": str(job_dir.resolve()),
+            "env": {
+                "SystemRoot": "C:/Windows",
+                "TEMP": "C:/Temp",
+                "YTDLP_NO_PLUGINS": "1",
+            },
             "shell": False,
             "stderr": subprocess.DEVNULL,
             "stdin": subprocess.DEVNULL,
@@ -131,7 +160,18 @@ def test_normalizer_uses_fixed_ffmpeg_argv_and_exact_inventory(tmp_path: Path) -
     target = job_dir / "normalized.wav"
     runner = FakeMediaRunner(output=b"normalized")
 
-    result = MediaNormalizer(runner, attestation, work_root).normalize(source, target)
+    result = MediaNormalizer(
+        runner,
+        attestation,
+        work_root,
+        source_environment={
+            "SystemRoot": "C:/Windows",
+            "TEMP": "C:/Temp",
+            "FFREPORT": "file=private-report.log",
+            "HTTP_PROXY": "http://private-proxy",
+            "PATH": "C:/private-helper-bin",
+        },
+    ).normalize(source, target)
 
     assert runner.calls == [
         (
@@ -153,13 +193,219 @@ def test_normalizer_uses_fixed_ffmpeg_argv_and_exact_inventory(tmp_path: Path) -
             str(target),
         )
     ]
-    assert runner.kwargs[0]["timeout"] == NORMALIZE_TIMEOUT_SECONDS
-    assert runner.kwargs[0]["shell"] is False
-    assert runner.kwargs[0]["stdout"] is subprocess.DEVNULL
-    assert runner.kwargs[0]["stderr"] is subprocess.DEVNULL
+    assert runner.kwargs == [
+        {
+            "check": False,
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "cwd": str(job_dir.resolve()),
+            "env": {
+                "SystemRoot": "C:/Windows",
+                "TEMP": "C:/Temp",
+            },
+            "shell": False,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "timeout": NORMALIZE_TIMEOUT_SECONDS,
+        }
+    ]
     assert result.path == target.resolve()
     assert result.sha256 == hashlib.sha256(b"normalized").hexdigest()
     assert set(job_dir.iterdir()) == {source, target}
+
+
+def test_acquirer_creates_a_fresh_direct_private_job_directory(tmp_path: Path) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+
+    result = MediaAcquirer(
+        FakeMediaRunner(), attestation, work_root, source_environment={}
+    ).acquire("abcdefghijk", job_dir)
+
+    assert result.path.parent == job_dir.resolve()
+    assert job_dir.is_dir()
+    if os.name != "nt":
+        assert stat.S_IMODE(job_dir.stat().st_mode) & 0o077 == 0
+
+
+@pytest.mark.parametrize("failure", ("timeout", "nonzero"))
+def test_acquisition_removes_only_its_partial_target_and_can_retry(
+    tmp_path: Path, failure: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+    job_dir.mkdir()
+    other_job = work_root / "registered-job"
+    other_job.mkdir()
+    registered = other_job / "normalized.wav"
+    registered.write_bytes(b"registered-private-artifact")
+    runner = FakeMediaRunner(
+        output=b"partial" if failure == "nonzero" else None,
+        returncode=7 if failure == "nonzero" else 0,
+        error=(
+            subprocess.TimeoutExpired(["private-tool"], 1)
+            if failure == "timeout"
+            else None
+        ),
+        write_before_error=b"partial" if failure == "timeout" else None,
+    )
+    acquirer = MediaAcquirer(runner, attestation, work_root, source_environment={})
+
+    with pytest.raises(DomainError, match="media acquisition failed"):
+        acquirer.acquire("abcdefghijk", job_dir)
+
+    assert not (job_dir / "source.media").exists()
+    assert registered.read_bytes() == b"registered-private-artifact"
+    runner.error = None
+    runner.write_before_error = None
+    runner.returncode = 0
+    runner.output = b"complete"
+    result = acquirer.acquire("abcdefghijk", job_dir)
+    assert result.path.read_bytes() == b"complete"
+    assert registered.read_bytes() == b"registered-private-artifact"
+
+
+@pytest.mark.parametrize("failure", ("timeout", "nonzero"))
+def test_normalization_removes_only_its_partial_target_and_can_retry(
+    tmp_path: Path, failure: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+    job_dir.mkdir()
+    source = job_dir / "source.media"
+    source.write_bytes(b"registered-source")
+    unrelated = work_root / "unrelated-private-artifact"
+    unrelated.write_bytes(b"preserve-me")
+    runner = FakeMediaRunner(
+        output=b"partial" if failure == "nonzero" else None,
+        returncode=7 if failure == "nonzero" else 0,
+        error=(
+            subprocess.TimeoutExpired(["private-tool"], 1)
+            if failure == "timeout"
+            else None
+        ),
+        write_before_error=b"partial" if failure == "timeout" else None,
+    )
+    normalizer = MediaNormalizer(
+        runner, attestation, work_root, source_environment={}
+    )
+    target = job_dir / "normalized.wav"
+
+    with pytest.raises(DomainError, match="media normalization failed"):
+        normalizer.normalize(source, target)
+
+    assert source.read_bytes() == b"registered-source"
+    assert not target.exists()
+    assert unrelated.read_bytes() == b"preserve-me"
+    runner.error = None
+    runner.write_before_error = None
+    runner.returncode = 0
+    runner.output = b"complete"
+    result = normalizer.normalize(source, target)
+    assert result.path.read_bytes() == b"complete"
+    assert source.read_bytes() == b"registered-source"
+    assert unrelated.read_bytes() == b"preserve-me"
+
+
+def test_full_windows_reparse_attribute_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "ordinary-looking-directory"
+    path.mkdir()
+    original_lstat = os.lstat
+
+    class ReparseStat:
+        st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        def __init__(self, original: os.stat_result) -> None:
+            self._original = original
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._original, name)
+
+    def fake_lstat(candidate: os.PathLike[str] | str) -> object:
+        value = original_lstat(candidate)
+        if Path(candidate) == path:
+            return ReparseStat(value)
+        return value
+
+    monkeypatch.setattr(media.os, "lstat", fake_lstat)
+    assert media._is_reparse(path)
+
+
+@pytest.mark.parametrize("tool", ("yt_dlp", "deno"))
+def test_acquirer_rejects_post_call_executable_identity_drift(
+    tmp_path: Path, tool: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+    job_dir.mkdir()
+    executable = getattr(attestation, f"{tool}_path")
+
+    def replace_executable(_output: Path) -> None:
+        replacement = executable.with_suffix(".replacement")
+        replacement.write_bytes(executable.read_bytes())
+        os.replace(replacement, executable)
+
+    runner = FakeMediaRunner(after_call=replace_executable)
+    with pytest.raises(DomainError, match="media acquisition failed"):
+        MediaAcquirer(
+            runner, attestation, work_root, source_environment={}
+        ).acquire("abcdefghijk", job_dir)
+
+    assert not (job_dir / "source.media").exists()
+
+
+def test_normalizer_rejects_post_call_ffmpeg_identity_drift(tmp_path: Path) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+    job_dir.mkdir()
+    source = job_dir / "source.media"
+    source.write_bytes(b"source")
+
+    def replace_executable(_output: Path) -> None:
+        replacement = attestation.ffmpeg_path.with_suffix(".replacement")
+        replacement.write_bytes(attestation.ffmpeg_path.read_bytes())
+        os.replace(replacement, attestation.ffmpeg_path)
+
+    runner = FakeMediaRunner(after_call=replace_executable)
+    with pytest.raises(DomainError, match="media normalization failed"):
+        MediaNormalizer(
+            runner, attestation, work_root, source_environment={}
+        ).normalize(source, job_dir / "normalized.wav")
+
+    assert source.read_bytes() == b"source"
+    assert not (job_dir / "normalized.wav").exists()
+
+
+def test_acquirer_rejects_executable_replacement_during_pre_call_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+    job_dir.mkdir()
+    runner = FakeMediaRunner()
+    original_hash = media._file_sha256
+    replaced = False
+
+    def racing_hash(path: Path) -> str:
+        nonlocal replaced
+        digest = original_hash(path)
+        if path == attestation.yt_dlp_path and not replaced:
+            replacement = path.with_suffix(".replacement")
+            replacement.write_bytes(path.read_bytes())
+            os.replace(replacement, path)
+            replaced = True
+        return digest
+
+    monkeypatch.setattr(media, "_file_sha256", racing_hash)
+
+    with pytest.raises(DomainError, match="media acquisition failed"):
+        MediaAcquirer(
+            runner, attestation, work_root, source_environment={}
+        ).acquire("abcdefghijk", job_dir)
+
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize(
@@ -315,6 +561,9 @@ def test_adapter_process_uses_isolated_python_bounded_transport_and_clean_env(
         "SystemRoot": "C:/Windows",
         "TEMP": "C:/Temp",
         "PYTHONNOUSERSITE": "attacker-value",
+        "PYTHONPATH": "C:/private-import-hook",
+        "PYTHONHOME": "C:/private-python-home",
+        "PYTHONSTARTUP": "C:/private-startup.py",
         "HTTPS_PROXY": "private-proxy",
         "YOUTUBE_API_KEY": "private-api-key",
         "APPDATA": "private-browser-state",
@@ -443,6 +692,7 @@ def test_default_adapter_runner_kills_process_that_lingers_after_stdout(
         "adapter_version",
         "vad_version",
         "audio_hash",
+        "audio_duration",
         "audio_escape",
     ),
 )
@@ -460,6 +710,7 @@ def test_adapter_request_must_match_attestation_and_private_audio(
         "adapter_version": ("adapter_contract_version", "other-adapter-v1"),
         "vad_version": ("vad_contract_version", "other-vad-v1"),
         "audio_hash": ("audio_sha256", "0" * 64),
+        "audio_duration": ("audio_duration_ms", 1_999),
         "audio_escape": ("audio_path", str((tmp_path / "outside.wav").resolve())),
     }
     field, value = mutations[mutation]
@@ -473,6 +724,22 @@ def test_adapter_request_must_match_attestation_and_private_audio(
         VoiceAdapterProcess(runner, attestation, work_root).score(request)
 
     assert caught.value.code == "VOICE_ADAPTER_PROCESS_FAILED"
+    assert runner.calls == []
+
+
+def test_adapter_process_rejects_non_wav_audio_before_spawn(tmp_path: Path) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+    audio = Path(request.audio_path)
+    audio.write_bytes(b"not-a-normalized-wav")
+    values = request.model_dump(mode="python")
+    values["audio_sha256"] = hashlib.sha256(audio.read_bytes()).hexdigest()
+    forged = type(request).with_canonical_hash(**values)
+    runner = FakeAdapterRunner()
+
+    with pytest.raises(DomainError, match="voice adapter process failed"):
+        VoiceAdapterProcess(runner, attestation, work_root).score(forged)
+
     assert runner.calls == []
 
 
@@ -539,3 +806,79 @@ def test_process_rejects_forged_attestation_outside_private_data_root(
         VoiceAdapterProcess(runner, forged, work_root).score(request)
 
     assert runner.calls == []
+
+
+def test_process_rejects_private_startup_hook_before_spawn(tmp_path: Path) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+    site_packages = (
+        attestation.python_path.parent / "Lib" / "site-packages"
+    )
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (site_packages / "attacker.pth").write_text(
+        "import private_startup_hook", encoding="utf-8"
+    )
+    runner = FakeAdapterRunner()
+
+    with pytest.raises(DomainError, match="voice adapter process failed"):
+        VoiceAdapterProcess(runner, attestation, work_root).score(request)
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("material", ("adapter", "sherpa", "extra"))
+def test_process_rejects_import_inventory_drift_before_spawn(
+    tmp_path: Path, material: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+    paths = {
+        relative: attestation.python_import_root / Path(relative)
+        for relative, _digest in attestation.python_import_files
+    }
+    if material == "adapter":
+        paths[
+            "market_voice_forecast_ledger/voice/adapter_main.py"
+        ].write_bytes(b"mutated-installed-adapter")
+    elif material == "sherpa":
+        paths["sherpa_onnx/__init__.py"].write_bytes(b"mutated-sherpa")
+    else:
+        (attestation.python_import_root / "private-sentinel.py").write_bytes(
+            b"private-sentinel"
+        )
+    runner = FakeAdapterRunner()
+
+    with pytest.raises(DomainError, match="voice adapter process failed") as caught:
+        VoiceAdapterProcess(runner, attestation, work_root).score(request)
+
+    assert runner.calls == []
+    assert "private-sentinel" not in str(caught.value)
+
+
+@pytest.mark.parametrize("material", ("python_identity", "adapter"))
+def test_process_rejects_runtime_drift_after_runner_returns(
+    tmp_path: Path, material: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+
+    def mutate_runtime() -> None:
+        if material == "python_identity":
+            replacement = attestation.python_path.with_suffix(".replacement")
+            replacement.write_bytes(attestation.python_path.read_bytes())
+            os.replace(replacement, attestation.python_path)
+            return
+        path = (
+            attestation.python_import_root
+            / "market_voice_forecast_ledger"
+            / "voice"
+            / "adapter_main.py"
+        )
+        path.write_bytes(b"mutated-after-runner")
+
+    runner = FakeAdapterRunner(after_call=mutate_runtime)
+
+    with pytest.raises(DomainError, match="voice adapter process failed"):
+        VoiceAdapterProcess(runner, attestation, work_root).score(request)
+
+    assert len(runner.calls) == 1

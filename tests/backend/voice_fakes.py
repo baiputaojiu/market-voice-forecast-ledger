@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,27 @@ def _write(path: Path, contents: bytes) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(contents)
     return hashlib.sha256(contents).hexdigest()
+
+
+def _synthetic_pcm_wav(*, duration_ms: int = 2_000) -> bytes:
+    frame_count = 16_000 * duration_ms // 1_000
+    pcm = b"\x00\x00" * frame_count
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + len(pcm),
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        16_000,
+        32_000,
+        2,
+        16,
+        b"data",
+        len(pcm),
+    ) + pcm
 
 
 def fake_runtime_attestation(
@@ -39,11 +61,55 @@ def fake_runtime_attestation(
         "model": _write(model, b"synthetic-model"),
         "vad": _write(vad, b"synthetic-vad"),
     }
+    import_root = runtime_root / "Lib" / "site-packages"
+    import_files = tuple(
+        (
+            relative,
+            _write(import_root / Path(relative), contents),
+        )
+        for relative, contents in (
+            (
+                "market_voice_forecast_ledger/__init__.py",
+                b"# synthetic installed project\n",
+            ),
+            (
+                "market_voice_forecast_ledger/voice/adapter_main.py",
+                b"# synthetic installed adapter\n",
+            ),
+            ("sherpa_onnx/__init__.py", b"# synthetic installed sherpa\n"),
+        )
+    )
+    manifest = runtime_root / "startup-manifest.json"
+    manifest_sha256 = _write(
+        manifest,
+        json.dumps(
+            {
+                "files": [
+                    {"path": relative, "sha256": digest}
+                    for relative, digest in import_files
+                ]
+            },
+            separators=(",", ":"),
+        ).encode("utf-8"),
+    )
+    pyvenv = runtime_root / "pyvenv.cfg"
+    pyvenv_sha256 = _write(
+        pyvenv,
+        b"home = C:/synthetic-python\n"
+        b"include-system-site-packages = false\n"
+        b"version = 3.14.6\n",
+    )
     return (
         RuntimeAttestation(
             python_path=python.resolve(),
             python_sha256=hashes["python"],
             python_version="3.14.6",
+            python_import_root=import_root.resolve(),
+            python_import_files=import_files,
+            python_startup_manifest_path=manifest.resolve(),
+            python_startup_manifest_sha256=manifest_sha256,
+            python_pyvenv_path=pyvenv.resolve(),
+            python_pyvenv_sha256=pyvenv_sha256,
             yt_dlp_path=yt_dlp.resolve(),
             yt_dlp_sha256=hashes["yt_dlp"],
             yt_dlp_version="2026.08.19",
@@ -85,12 +151,14 @@ class FakeMediaRunner:
         output: bytes | None = b"synthetic-media",
         returncode: int = 0,
         error: Exception | None = None,
+        write_before_error: bytes | None = None,
         extra_name: str | None = None,
         after_call: Any = None,
     ) -> None:
         self.output = output
         self.returncode = returncode
         self.error = error
+        self.write_before_error = write_before_error
         self.extra_name = extra_name
         self.after_call = after_call
         self.calls: list[tuple[str, ...]] = []
@@ -99,13 +167,15 @@ class FakeMediaRunner:
     def __call__(self, argv: tuple[str, ...], **kwargs: object) -> FakeCompleted:
         self.calls.append(tuple(argv))
         self.kwargs.append(dict(kwargs))
-        if self.error is not None:
-            raise self.error
         output_path = (
             Path(argv[argv.index("-o") + 1])
             if "-o" in argv
             else Path(argv[-1])
         )
+        if self.write_before_error is not None:
+            output_path.write_bytes(self.write_before_error)
+        if self.error is not None:
+            raise self.error
         if self.output is not None:
             output_path.write_bytes(self.output)
         if self.extra_name is not None:
@@ -121,10 +191,11 @@ def valid_adapter_request(
 ) -> AdapterRequest:
     audio = work_root / "job-1" / "normalized.wav"
     audio.parent.mkdir(parents=True, exist_ok=True)
-    audio.write_bytes(b"synthetic-normalized-audio")
+    audio.write_bytes(_synthetic_pcm_wav())
     feature = b"synthetic-reference-feature"
     return AdapterRequest.with_canonical_hash(
         adapter_contract_version=attestation.adapter_contract_version,
+        audio_duration_ms=2_000,
         audio_path=str(audio.resolve()),
         audio_sha256=hashlib.sha256(audio.read_bytes()).hexdigest(),
         interviewer_boundary=0.2,
@@ -153,7 +224,17 @@ def adapter_response_payload(request: AdapterRequest) -> bytes:
         "segments": [
             {
                 "end_ms": 1000,
-                "evidence_hash": "d" * 64,
+                "evidence_hash": sha256_text(
+                    canonical_json(
+                        {
+                            "audio_sha256": request.audio_sha256,
+                            "end_ms": 1000,
+                            "ordinal": 1,
+                            "raw_score": 0.9,
+                            "start_ms": 0,
+                        }
+                    )
+                ),
                 "ordinal": 1,
                 "raw_score": 0.9,
                 "start_ms": 0,
@@ -172,10 +253,12 @@ class FakeAdapterRunner:
         stdout: bytes | None = None,
         returncode: int = 0,
         error: Exception | None = None,
+        after_call: Any = None,
     ) -> None:
         self.stdout = stdout
         self.returncode = returncode
         self.error = error
+        self.after_call = after_call
         self.calls: list[tuple[str, ...]] = []
         self.kwargs: list[dict[str, object]] = []
 
@@ -188,6 +271,8 @@ class FakeAdapterRunner:
         if stdout is None:
             request = AdapterRequest.model_validate_json(kwargs["input"], strict=True)
             stdout = adapter_response_payload(request)
+        if self.after_call is not None:
+            self.after_call()
         return FakeCompleted(returncode=self.returncode, stdout=stdout)
 
 

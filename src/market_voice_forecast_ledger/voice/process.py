@@ -10,7 +10,9 @@ from pathlib import Path
 
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.voice.media import (
+    _FileIdentity,
     _file_sha256,
+    _normalized_wav_duration_ms,
     _private_existing_file,
     _private_root,
     _require_attested_file,
@@ -22,7 +24,10 @@ from market_voice_forecast_ledger.voice.protocol import (
     decode_response,
     encode_request,
 )
-from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
+from market_voice_forecast_ledger.voice.runtime import (
+    RuntimeAttestation,
+    verify_runtime_startup,
+)
 
 
 ADAPTER_TIMEOUT_SECONDS = 900
@@ -58,7 +63,7 @@ class VoiceAdapterProcess:
 
     def score(self, request: AdapterRequest) -> AdapterResponse:
         try:
-            payload = self._validated_payload(request)
+            payload, python_identity = self._validated_payload(request)
             environment = _allowlisted_environment(self._source_environment)
             completed = self._runner(
                 (
@@ -78,6 +83,14 @@ class VoiceAdapterProcess:
                 env=environment,
                 max_stdout_bytes=MAX_ADAPTER_RESPONSE_BYTES,
             )
+            data_root = _private_root(self._private_work_root).parent
+            _require_attested_file(
+                self._attestation.python_path,
+                self._attestation.python_sha256,
+                data_root,
+                expected_identity=python_identity,
+            )
+            verify_runtime_startup(self._attestation, data_root)
             returncode = getattr(completed, "returncode", None)
             stdout = getattr(completed, "stdout", None)
             if (
@@ -96,7 +109,9 @@ class VoiceAdapterProcess:
                 "VOICE_ADAPTER_RESPONSE_INVALID", "adapter response is invalid"
             ) from None
 
-    def _validated_payload(self, request: AdapterRequest) -> bytes:
+    def _validated_payload(
+        self, request: AdapterRequest
+    ) -> tuple[bytes, _FileIdentity]:
         if not callable(self._runner) or not isinstance(
             self._attestation, RuntimeAttestation
         ):
@@ -119,9 +134,10 @@ class VoiceAdapterProcess:
             raise ValueError("adapter identity mismatch")
         work_root = _private_root(self._private_work_root)
         data_root = work_root.parent
-        _require_attested_file(
+        python_identity = _require_attested_file(
             attestation.python_path, attestation.python_sha256, data_root
         )
+        verify_runtime_startup(attestation, data_root)
         _require_attested_file(
             attestation.model_path, attestation.model_sha256, data_root
         )
@@ -137,9 +153,10 @@ class VoiceAdapterProcess:
         if (
             audio.name != "normalized.wav"
             or _file_sha256(audio) != request.audio_sha256
+            or _normalized_wav_duration_ms(audio) != request.audio_duration_ms
         ):
             raise ValueError("audio identity mismatch")
-        return encode_request(request)
+        return encode_request(request), python_identity
 
 
 def _allowlisted_environment(source: Mapping[str, str]) -> dict[str, str]:
