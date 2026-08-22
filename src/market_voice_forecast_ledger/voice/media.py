@@ -40,6 +40,138 @@ class _DirectoryIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class PrivateJobWorkspace:
+    path: Path
+    identity: _DirectoryIdentity
+
+    @classmethod
+    def capture(cls, path: Path) -> "PrivateJobWorkspace":
+        raw = path.absolute()
+        _require_no_reparse(raw)
+        resolved = raw.resolve(strict=True)
+        if raw != resolved or not resolved.is_dir() or _is_reparse(resolved):
+            raise ValueError("private job directory is invalid")
+        return cls(path=resolved, identity=_directory_identity(resolved))
+
+    def require_empty(self) -> None:
+        root = self._verified_root()
+        if tuple(os.scandir(root)):
+            raise ValueError("private job directory is not empty")
+
+    def unexpected_leaves(
+        self, planned_paths: tuple[Path, Path, Path]
+    ) -> tuple[Path, ...]:
+        root = self._verified_root()
+        planned = _planned_private_paths(root, planned_paths)
+        leaves: list[Path] = []
+        pending = [(root, self.identity)]
+        while pending:
+            directory, expected_identity = pending.pop()
+            if (
+                _is_reparse(directory)
+                or _directory_identity(directory) != expected_identity
+            ):
+                raise ValueError("private job directory identity changed")
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            for entry in entries:
+                candidate = Path(entry.path).absolute()
+                candidate_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(candidate_stat.st_mode) and not _is_reparse(
+                    candidate
+                ):
+                    pending.append((candidate, _directory_identity(candidate)))
+                elif (
+                    stat.S_ISREG(candidate_stat.st_mode)
+                    or stat.S_ISLNK(candidate_stat.st_mode)
+                    or _is_reparse(candidate)
+                ):
+                    if candidate not in planned:
+                        leaves.append(candidate)
+                else:
+                    raise ValueError("private job inventory is invalid")
+        self._verified_root()
+        return tuple(sorted(leaves, key=str))
+
+    def remove_unregistered_leaf(
+        self,
+        path: Path,
+        planned_paths: tuple[Path, Path, Path],
+    ) -> None:
+        root = self._verified_root()
+        planned = _planned_private_paths(root, planned_paths)
+        candidate = path.absolute()
+        if candidate in planned:
+            raise ValueError("registered private artifact cannot be removed")
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            raise ValueError("private artifact escaped job directory") from None
+        if not relative.parts:
+            raise ValueError("private artifact path is invalid")
+        _require_no_reparse(candidate.parent)
+        candidate_stat = os.lstat(candidate)
+        if not (
+            stat.S_ISREG(candidate_stat.st_mode)
+            or stat.S_ISLNK(candidate_stat.st_mode)
+            or _is_reparse(candidate)
+        ):
+            raise ValueError("private artifact is not an unlinkable leaf")
+        _unlink_unregistered_leaf(candidate)
+        if os.path.lexists(candidate):
+            raise OSError("private artifact unlink did not complete")
+        self._verified_root()
+
+    def remove_verified_empty_directories(self) -> None:
+        root = self._verified_root()
+        directories: list[tuple[Path, _DirectoryIdentity]] = []
+        pending = [(root, self.identity)]
+        while pending:
+            directory, expected_identity = pending.pop()
+            if (
+                _is_reparse(directory)
+                or _directory_identity(directory) != expected_identity
+            ):
+                raise ValueError("private job directory identity changed")
+            directories.append((directory, expected_identity))
+            for entry in os.scandir(directory):
+                candidate = Path(entry.path).absolute()
+                candidate_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(candidate_stat.st_mode) and not _is_reparse(
+                    candidate
+                ):
+                    pending.append((candidate, _directory_identity(candidate)))
+                else:
+                    raise ValueError("private job directory is not empty")
+        for directory, expected_identity in sorted(
+            directories,
+            key=lambda item: len(item[0].parts),
+            reverse=True,
+        ):
+            if (
+                _is_reparse(directory)
+                or _directory_identity(directory) != expected_identity
+                or tuple(os.scandir(directory))
+            ):
+                raise ValueError("private job directory is not empty")
+            _rmdir_unregistered_directory(directory)
+            if os.path.lexists(directory):
+                raise OSError("private directory removal did not complete")
+
+    def _verified_root(self) -> Path:
+        raw = self.path.absolute()
+        _require_no_reparse(raw)
+        resolved = raw.resolve(strict=True)
+        if (
+            raw != resolved
+            or not resolved.is_dir()
+            or _is_reparse(resolved)
+            or _directory_identity(resolved) != self.identity
+        ):
+            raise ValueError("private job directory identity changed")
+        return resolved
+
+
+@dataclass(frozen=True, slots=True)
 class AcquiredMedia:
     path: Path
     sha256: str
@@ -360,6 +492,31 @@ def create_private_job_directory(configured_root: Path) -> Path:
         return resolved
     except Exception:
         raise _acquisition_failed() from None
+
+
+def _planned_private_paths(
+    root: Path, planned_paths: tuple[Path, Path, Path]
+) -> frozenset[Path]:
+    if (
+        type(planned_paths) is not tuple
+        or len(planned_paths) != 3
+        or tuple(path.name for path in planned_paths)
+        != ("source.media", "source.media.part", "normalized.wav")
+        or any(
+            path.absolute() != path or path.parent != root
+            for path in planned_paths
+        )
+    ):
+        raise ValueError("registered private artifact paths are invalid")
+    return frozenset(planned_paths)
+
+
+def _unlink_unregistered_leaf(path: Path) -> None:
+    os.unlink(path)
+
+
+def _rmdir_unregistered_directory(path: Path) -> None:
+    path.rmdir()
 
 
 def _canonical_watch_url(video_id: object) -> str:

@@ -44,6 +44,7 @@ from market_voice_forecast_ledger.services.voice_reference import (
     ReferenceMediaPlan,
     VoiceReferenceService,
 )
+from market_voice_forecast_ledger.voice import media as voice_media
 from market_voice_forecast_ledger.voice.media import AcquiredMedia, NormalizedAudio
 from market_voice_forecast_ledger.voice.protocol import (
     ReferenceDryRunRequest,
@@ -308,10 +309,12 @@ def test_reference_repository_persists_calibration_identity_and_profile_owner(
         )
         repository.add_calibration_identity(identity)
 
-    assert repository.list_active_reference_profile_ids() == (
-        seed.reference_profile_id,
-        profile_id,
-    )
+    with pytest.raises(DomainError, match="VOICE_REFERENCE_STORED_INVALID"):
+        repository.list_active_reference_profile_ids()
+    assert db.execute(
+        "SELECT subject_id FROM voice_reference_profiles WHERE id=?",
+        (profile_id,),
+    ).fetchone()[0] == other_subject_id
     assert repository.get_calibration_identity(identity.calibration_hash) == identity
 
 
@@ -1247,6 +1250,182 @@ def test_calibration_preregisters_all_targets_and_cleans_files_produced_on_failu
     assert all(not Path(row["local_path"]).exists() for row in rows)
 
 
+def test_calibration_retains_nested_unexpected_leaves_and_reports_dir_failure(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    models = calibration_models(tmp_path / "models")
+    private_root = tmp_path / "private"
+    unrelated_job = private_root / "unrelated-job"
+    unrelated_job.mkdir(parents=True)
+    unrelated_target = unrelated_job / "keep.bin"
+    unrelated_target.write_bytes(b"unrelated-private-data")
+    simulated_reparse: set[Path] = set()
+    original_is_reparse = voice_media._is_reparse
+
+    class NestedFailureMedia(FakeReferenceMedia):
+        def prepare(self, model, approval, plan):
+            del model, approval
+            for path in plan.artifact_paths:
+                path.write_bytes(b"planned-registered-output")
+            unexpected = plan.source_path.parent / "unexpected-dir"
+            deep = unexpected / "deep"
+            deep.mkdir(parents=True)
+            (deep / "private.bin").write_bytes(b"unexpected-private-data")
+            (unexpected / "direct.bin").write_bytes(
+                b"direct-delete-private-data"
+            )
+            private_link = deep / "private-link.bin"
+            try:
+                private_link.symlink_to(unrelated_target)
+            except OSError:
+                private_link.write_bytes(b"synthetic-reparse-leaf")
+                simulated_reparse.add(private_link.absolute())
+            raise RuntimeError("C:/private/nested-producer-failure")
+
+    unlink_failures = {"private.bin", "private-link.bin"}
+
+    def flaky_unlink(path: Path) -> None:
+        candidate = Path(path)
+        if candidate.name in unlink_failures:
+            unlink_failures.remove(candidate.name)
+            raise PermissionError("injected unlink failure")
+        candidate.unlink()
+
+    rmdir_failed = False
+
+    def flaky_rmdir(path: Path) -> None:
+        nonlocal rmdir_failed
+        candidate = Path(path)
+        if candidate.name == "unexpected-dir" and not rmdir_failed:
+            rmdir_failed = True
+            raise PermissionError("injected rmdir failure")
+        candidate.rmdir()
+
+    def is_reparse(path: Path) -> bool:
+        candidate = Path(path).absolute()
+        return candidate in simulated_reparse or original_is_reparse(path)
+
+    monkeypatch.setattr(
+        voice_media, "_unlink_unregistered_leaf", flaky_unlink, raising=False
+    )
+    monkeypatch.setattr(
+        voice_media, "_rmdir_unregistered_directory", flaky_rmdir, raising=False
+    )
+    monkeypatch.setattr(voice_media, "_is_reparse", is_reparse)
+    media = NestedFailureMedia(private_root)
+    retention = FakeRetention(db=db)
+    service = VoiceReferenceService(
+        db,
+        media=media,
+        scorer=FakeReferenceScorer(
+            db,
+            {model.model_name: (0.8, 0.2) for model in models},
+            elapsed_ms={model.model_name: 100 for model in models},
+        ),
+        retention=retention,
+        clock=lambda: NOW,
+    )
+    approve_complete_reference_set(service, seed)
+
+    with pytest.raises(DomainError) as caught:
+        service.calibrate(models)
+
+    assert caught.value.code == "VOICE_REFERENCE_CLEANUP_FAILED"
+    rows = db.execute(
+        "SELECT id, local_path FROM local_artifacts ORDER BY id"
+    ).fetchall()
+    names = tuple(Path(row["local_path"]).name for row in rows)
+    assert names[:3] == ("source.media", "source.media.part", "normalized.wav")
+    assert unlink_failures == set()
+    assert frozenset(names[3:]) == {
+        "private.bin",
+        "private-link.bin",
+    }
+    assert retention.calls == [1, 2, 3, 4, 5]
+    assert tuple(
+        path
+        for path in private_root.rglob("*")
+        if path.is_file() or path.is_symlink()
+    ) == (unrelated_target,)
+    assert unrelated_target.read_bytes() == b"unrelated-private-data"
+    assert rmdir_failed is True
+
+
+def test_calibration_direct_deletes_unexpected_leaf_if_registration_fails(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    models = calibration_models(tmp_path / "models")
+    private_root = tmp_path / "private"
+
+    class NestedFailureMedia(FakeReferenceMedia):
+        def prepare(self, model, approval, plan):
+            del model, approval
+            for path in plan.artifact_paths:
+                path.write_bytes(b"planned-registered-output")
+            nested = plan.source_path.parent / "unexpected-dir"
+            nested.mkdir()
+            (nested / "registration-failure.bin").write_bytes(
+                b"unexpected-private-data"
+            )
+            raise RuntimeError("C:/private/nested-producer-failure")
+
+    first_unlink = True
+
+    def flaky_unlink(path: Path) -> None:
+        nonlocal first_unlink
+        candidate = Path(path)
+        if candidate.name == "registration-failure.bin" and first_unlink:
+            first_unlink = False
+            raise PermissionError("injected unlink failure")
+        candidate.unlink()
+
+    monkeypatch.setattr(
+        voice_media, "_unlink_unregistered_leaf", flaky_unlink, raising=False
+    )
+    media = NestedFailureMedia(private_root)
+    retention = FakeRetention(db=db)
+    service = VoiceReferenceService(
+        db,
+        media=media,
+        scorer=FakeReferenceScorer(
+            db,
+            {model.model_name: (0.8, 0.2) for model in models},
+            elapsed_ms={model.model_name: 100 for model in models},
+        ),
+        retention=retention,
+        clock=lambda: NOW,
+    )
+    add_artifact = service._artifacts.add_audio_artifact
+
+    def failing_registration(
+        path: Path, *, created_at: datetime | None = None
+    ) -> int:
+        if path.name == "registration-failure.bin":
+            raise sqlite3.OperationalError("injected registration failure")
+        return add_artifact(path, created_at=created_at)
+
+    monkeypatch.setattr(
+        service._artifacts, "add_audio_artifact", failing_registration
+    )
+    approve_complete_reference_set(service, seed)
+
+    with pytest.raises(DomainError) as caught:
+        service.calibrate(models)
+
+    assert caught.value.code == "VOICE_REFERENCE_CALIBRATION_FAILED"
+    assert retention.calls == [1, 2, 3]
+    assert db.execute("SELECT COUNT(*) FROM local_artifacts").fetchone()[0] == 3
+    assert tuple(
+        path for path in private_root.rglob("*") if path.is_file()
+    ) == ()
+
+
 def test_calibration_rejects_ambient_transaction_before_private_production(
     db: sqlite3.Connection, tmp_path: Path
 ) -> None:
@@ -1713,6 +1892,34 @@ def test_reference_bundle_rejects_feature_contract_metadata_corruption(
         "WHERE reference_profile_id=?",
         (profile_id,),
     ).fetchone()[0] == "sherpa-speaker-embedding-v2"
+
+
+def test_active_reference_ids_traverse_canonical_bundles(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    activation = service.activate_calibration(result)
+    repository = VoiceVerificationRepository(db)
+    expected_ids = tuple(
+        profile_id for _, profile_id in activation.reference_profile_ids
+    )
+
+    assert repository.list_active_reference_profile_ids() == expected_ids
+
+    db.execute("DROP TRIGGER voice_reference_features_no_update")
+    db.execute(
+        "UPDATE voice_reference_features SET encoding_version=? "
+        "WHERE reference_profile_id=?",
+        ("sherpa-speaker-embedding-v2", expected_ids[0]),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        repository.list_active_reference_profile_ids()
+
+    assert caught.value.code == "VOICE_REFERENCE_STORED_INVALID"
 
 
 def test_activation_rereads_complete_existing_bundles_before_mutation(

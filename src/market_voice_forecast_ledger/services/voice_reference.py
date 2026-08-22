@@ -38,10 +38,10 @@ from market_voice_forecast_ledger.repositories.voice_verification import (
 )
 from market_voice_forecast_ledger.services.audit import validate_audit_reason
 from market_voice_forecast_ledger.services.retention import AudioDeletionResult
-from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
 from market_voice_forecast_ledger.voice.media import (
     AcquiredMedia,
     NormalizedAudio,
+    PrivateJobWorkspace,
     create_private_job_directory,
     normalized_wav_duration_ms,
 )
@@ -56,6 +56,7 @@ from market_voice_forecast_ledger.voice.protocol import (
     ReferenceScoreRequest,
     ReferenceScoreResponse,
 )
+from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -1043,6 +1044,10 @@ class VoiceReferenceService:
         value: CalibrationResult | None = None
         failure: BaseException | None = None
         planned_paths: set[Path] = set()
+        workspaces: list[
+            tuple[PrivateJobWorkspace, tuple[Path, Path, Path]]
+        ] = []
+        registered_paths: set[Path] = set()
         try:
             for subject_id, approvals in approvals_by_subject:
                 subject_audio: list[
@@ -1053,12 +1058,18 @@ class VoiceReferenceService:
                     self._validate_media_plan(
                         plan, planned_paths, model, approval
                     )
+                    workspace = PrivateJobWorkspace.capture(
+                        plan.source_path.parent
+                    )
+                    workspace.require_empty()
+                    workspaces.append((workspace, plan.artifact_paths))
                     planned_paths.update(plan.artifact_paths)
                     for target in plan.artifact_paths:
                         artifact_id = self._artifacts.add_audio_artifact(
                             target, created_at=_utc_datetime(self._clock())
                         )
                         artifact_ids.append(artifact_id)
+                        registered_paths.add(target)
                     audio = self._media.prepare(  # type: ignore[union-attr]
                         model, approval, plan
                     )
@@ -1146,8 +1157,22 @@ class VoiceReferenceService:
             )
         except BaseException as cause:
             failure = cause
+        reconciliation_failed = self._reconcile_unexpected_artifacts(
+            tuple(workspaces), artifact_ids, registered_paths
+        )
         cleanup_failed = self._cleanup_artifacts(tuple(artifact_ids))
-        if cleanup_failed:
+        postcondition_failed = self._private_job_postcondition_failed(
+            tuple(workspaces), registered_paths
+        )
+        directory_cleanup_failed = self._remove_private_job_directories(
+            tuple(workspaces)
+        )
+        if (
+            reconciliation_failed
+            or cleanup_failed
+            or postcondition_failed
+            or directory_cleanup_failed
+        ):
             raise DomainError(
                 "VOICE_REFERENCE_CLEANUP_FAILED",
                 "voice reference cleanup failed",
@@ -1186,6 +1211,84 @@ class VoiceReferenceService:
                     or result.error_code is not None
                 ):
                     failed = True
+            except BaseException as cause:
+                if isinstance(cause, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failed = True
+        return failed
+
+    def _reconcile_unexpected_artifacts(
+        self,
+        workspaces: tuple[
+            tuple[PrivateJobWorkspace, tuple[Path, Path, Path]], ...
+        ],
+        artifact_ids: list[int],
+        registered_paths: set[Path],
+    ) -> bool:
+        failed = False
+        for workspace, planned in workspaces:
+            try:
+                leaves = workspace.unexpected_leaves(planned)
+            except BaseException as cause:
+                if isinstance(cause, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failed = True
+                continue
+            for leaf in leaves:
+                try:
+                    workspace.remove_unregistered_leaf(leaf, planned)
+                    continue
+                except BaseException as cause:
+                    if isinstance(cause, (KeyboardInterrupt, SystemExit)):
+                        raise
+                try:
+                    artifact_id = self._artifacts.add_audio_artifact(
+                        leaf, created_at=_utc_datetime(self._clock())
+                    )
+                    artifact_ids.append(artifact_id)
+                    registered_paths.add(leaf)
+                except BaseException as cause:
+                    if isinstance(cause, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    try:
+                        workspace.remove_unregistered_leaf(leaf, planned)
+                    except BaseException as removal_cause:
+                        if isinstance(
+                            removal_cause, (KeyboardInterrupt, SystemExit)
+                        ):
+                            raise
+                        failed = True
+        return failed
+
+    def _private_job_postcondition_failed(
+        self,
+        workspaces: tuple[
+            tuple[PrivateJobWorkspace, tuple[Path, Path, Path]], ...
+        ],
+        registered_paths: set[Path],
+    ) -> bool:
+        failed = False
+        for workspace, planned in workspaces:
+            try:
+                leaves = workspace.unexpected_leaves(planned)
+                if any(leaf not in registered_paths for leaf in leaves):
+                    failed = True
+            except BaseException as cause:
+                if isinstance(cause, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failed = True
+        return failed
+
+    def _remove_private_job_directories(
+        self,
+        workspaces: tuple[
+            tuple[PrivateJobWorkspace, tuple[Path, Path, Path]], ...
+        ],
+    ) -> bool:
+        failed = False
+        for workspace, _ in workspaces:
+            try:
+                workspace.remove_verified_empty_directories()
             except BaseException as cause:
                 if isinstance(cause, (KeyboardInterrupt, SystemExit)):
                     raise

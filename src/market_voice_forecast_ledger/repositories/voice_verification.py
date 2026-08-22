@@ -363,12 +363,38 @@ class VoiceVerificationRepository:
     def list_active_reference_profile_ids(self) -> tuple[int, ...]:
         rows = tuple(
             self._conn.execute(
-                "SELECT id FROM voice_reference_profiles WHERE is_active=1 "
+                "SELECT id, subject_id, threshold_config_version "
+                "FROM voice_reference_profiles WHERE is_active=1 "
                 "ORDER BY subject_id, id"
             )
         )
         ids = tuple(row["id"] for row in rows)
         if any(not _positive_sqlite_int(item) for item in ids):
+            _stored_reference_invalid()
+        bundles = tuple(self.get_reference_bundle(item) for item in ids)
+        if bundles and (
+            len({bundle.threshold_config_version for bundle in bundles}) != 1
+            or any(
+                not bundle.is_active
+                or bundle.reference_profile_id != row["id"]
+                or bundle.subject_id != row["subject_id"]
+                or bundle.threshold_config_version
+                != row["threshold_config_version"]
+                or len(bundle.clips) != 6
+                or tuple(clip.ordinal for clip in bundle.clips)
+                != tuple(range(1, 7))
+                or tuple(clip.clip_kind for clip in bundle.clips)
+                != (
+                    "enrollment",
+                    "enrollment",
+                    "held_out_positive",
+                    "negative",
+                    "negative",
+                    "negative",
+                )
+                for row, bundle in zip(rows, bundles, strict=True)
+            )
+        ):
             _stored_reference_invalid()
         return ids
 
