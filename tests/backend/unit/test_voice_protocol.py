@@ -1,7 +1,10 @@
 import base64
+import ast
 import hashlib
 import json
 import math
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +23,12 @@ from market_voice_forecast_ledger.voice.protocol import (
     wipe_reference_feature,
 )
 from market_voice_forecast_ledger.voice import protocol
+from market_voice_forecast_ledger.voice import adapter_main
+from tests.backend.voice_fakes import (
+    adapter_response_payload,
+    fake_runtime_attestation,
+    valid_adapter_request,
+)
 
 
 def _request() -> AdapterRequest:
@@ -290,3 +299,161 @@ def test_response_segment_count_guard_is_not_hidden_by_the_byte_limit() -> None:
     compact_response = AdapterResponse.model_construct(**values)
     with pytest.raises(ValueError, match="invalid adapter response"):
         compact_response._validate_shape()
+
+
+def test_adapter_entrypoint_denies_socket_before_backend_and_wipes_feature(
+    tmp_path: Path,
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+    captured: dict[str, object] = {}
+
+    class FakeBackend:
+        def score(self) -> AdapterResponse:
+            feature = captured["feature"]
+            assert isinstance(feature, bytearray)
+            assert feature == bytearray(len(feature))
+            with pytest.raises(OSError, match="network disabled"):
+                socket_module.socket()
+            return decode_response(
+                adapter_response_payload(request), expected_request=request
+            )
+
+    def backend_factory(
+        received: AdapterRequest, feature: bytearray
+    ) -> FakeBackend:
+        assert received == request
+        with pytest.raises(OSError, match="network disabled"):
+            socket_module.socket()
+        captured["feature"] = feature
+        return FakeBackend()
+
+    socket_module = SimpleNamespace(
+        socket=lambda: "unsafe",
+        create_connection=lambda: "unsafe",
+        getaddrinfo=lambda: "unsafe",
+    )
+    output = adapter_main.process_payload(
+        encode_request(request),
+        backend_factory=backend_factory,
+        socket_module=socket_module,
+    )
+
+    assert (
+        decode_response(output, expected_request=request).input_hash
+        == request.input_hash
+    )
+    assert output.count(b"{") >= 1
+    assert json.loads(output)["output_hash"]
+
+
+def test_adapter_entrypoint_wipes_feature_when_initialization_fails(
+    tmp_path: Path,
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+    captured: list[bytearray] = []
+
+    def failing_factory(
+        received: AdapterRequest, feature: bytearray
+    ) -> object:
+        captured.append(feature)
+        raise RuntimeError(f"private-sentinel {received.audio_path}")
+
+    with pytest.raises(DomainError, match="voice adapter process failed") as caught:
+        adapter_main.process_payload(
+            encode_request(request),
+            backend_factory=failing_factory,
+            socket_module=SimpleNamespace(
+                socket=lambda: None,
+                create_connection=lambda: None,
+                getaddrinfo=lambda: None,
+            ),
+        )
+
+    assert caught.value.code == "VOICE_ADAPTER_PROCESS_FAILED"
+    assert captured[0] == bytearray(len(captured[0]))
+    assert "private-sentinel" not in str(caught.value)
+    assert request.audio_path not in str(caught.value)
+
+
+def _adapter_forbidden_imports(source: str) -> tuple[str, ...]:
+    forbidden = {
+        "analysis",
+        "api",
+        "credentials",
+        "db",
+        "repositories",
+        "services",
+        "subprocess",
+        "youtube",
+    }
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        names: tuple[str, ...] = ()
+        if isinstance(node, ast.Import):
+            names = tuple(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names = (node.module or "",) + tuple(
+                alias.name for alias in node.names
+            )
+        elif (
+            isinstance(node, ast.Call)
+            and len(node.args) >= 1
+            and isinstance(node.args[0], ast.Constant)
+            and type(node.args[0].value) is str
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                )
+                or (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "__import__"
+                )
+            )
+        ):
+            names = (node.args[0].value,)
+        for name in names:
+            parts = set(name.lower().replace("-", "_").split("."))
+            found.update(parts & forbidden)
+    return tuple(sorted(found))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    (
+        ("import subprocess", ("subprocess",)),
+        ("from market_voice_forecast_ledger.db import database", ("db",)),
+        (
+            "def load():\n"
+            "    from market_voice_forecast_ledger.services import youtube",
+            ("services", "youtube"),
+        ),
+        ("from . import db as storage", ("db",)),
+        (
+            "from market_voice_forecast_ledger.credentials.windows import Vault as V",
+            ("credentials",),
+        ),
+        (
+            "from market_voice_forecast_ledger.api import app\nimport analysis as a",
+            ("analysis", "api"),
+        ),
+        (
+            "import importlib\n"
+            "repository = importlib.import_module(\n"
+            "    'market_voice_forecast_ledger.repositories.voice'\n"
+            ")",
+            ("repositories",),
+        ),
+    ),
+)
+def test_adapter_import_guard_detects_forbidden_mutations(
+    mutation: str, expected: tuple[str, ...]
+) -> None:
+    assert _adapter_forbidden_imports(mutation) == expected
+
+
+def test_adapter_entrypoint_has_no_forbidden_imports() -> None:
+    source = Path(adapter_main.__file__).read_text(encoding="utf-8")
+    assert _adapter_forbidden_imports(source) == ()

@@ -234,6 +234,7 @@ def _imports_outside(
     *,
     forbidden: Callable[[str], bool],
     allowed_paths: tuple[str, ...],
+    allowed_imports: tuple[tuple[str, str], ...] = (),
 ) -> tuple[tuple[str, int, str], ...]:
     matches = []
     for path in _python_files((PACKAGE_ROOT,)):
@@ -241,7 +242,11 @@ def _imports_outside(
         tree = _tree(path)
         for node in _runtime_import_nodes(tree):
             for imported in _imported_names(node, relative):
-                if forbidden(imported) and relative not in allowed_paths:
+                if (
+                    forbidden(imported)
+                    and relative not in allowed_paths
+                    and (relative, imported) not in allowed_imports
+                ):
                     matches.append((relative, node.lineno, imported))
     return tuple(matches)
 
@@ -261,6 +266,7 @@ def _network_imports_outside(
     return _imports_outside(
         forbidden=lambda name: name.startswith(network_roots),
         allowed_paths=(allowed_path,),
+        allowed_imports=(("voice/adapter_main.py", "socket"),),
     )
 
 
@@ -291,6 +297,10 @@ def _scheduler_imports_outside(
             or name.endswith(".TaskSchedulerAdapter")
         ),
         allowed_paths=allowed_paths,
+        allowed_imports=(
+            ("voice/media.py", "subprocess"),
+            ("voice/process.py", "subprocess"),
+        ),
     )
 
 
@@ -468,6 +478,40 @@ def test_scheduler_guard_detects_local_and_module_root_import_mutations(
             5,
             "market_voice_forecast_ledger.windows.task_scheduler",
         ),
+    }
+
+
+def test_network_guard_allows_only_adapter_socket_import_mutation(monkeypatch):
+    tree = ast.parse("import socket\nimport requests\n")
+    fake_path = Path("mutation.py")
+    monkeypatch.setitem(globals(), "_python_files", lambda _roots: (fake_path,))
+    monkeypatch.setitem(globals(), "_relative", lambda _path: "voice/adapter_main.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+
+    assert _network_imports_outside("youtube/client.py") == (
+        ("voice/adapter_main.py", 2, "requests"),
+    )
+
+
+def test_scheduler_guard_allows_only_exact_voice_subprocess_imports(monkeypatch):
+    paths = (Path("media.py"), Path("process.py"), Path("other.py"))
+    relatives = {
+        "media.py": "voice/media.py",
+        "process.py": "voice/process.py",
+        "other.py": "voice/other.py",
+    }
+    tree = ast.parse("import subprocess\nimport win32com\n")
+    monkeypatch.setitem(globals(), "_python_files", lambda _roots: paths)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda path: relatives[path.name]
+    )
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+
+    assert set(_scheduler_imports_outside(())) == {
+        ("voice/media.py", 2, "win32com"),
+        ("voice/process.py", 2, "win32com"),
+        ("voice/other.py", 1, "subprocess"),
+        ("voice/other.py", 2, "win32com"),
     }
 
 
