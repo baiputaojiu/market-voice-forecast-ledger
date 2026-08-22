@@ -1,6 +1,6 @@
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
-from math import nan
+from math import inf, nan
 
 import pytest
 
@@ -102,6 +102,30 @@ def test_calibration_rejects_missing_bands_and_nonfinite_scores(samples) -> None
     assert caught.value.code == "VOICE_CALIBRATION_INVALID"
 
 
+@pytest.mark.parametrize(
+    "samples",
+    (
+        (
+            CalibrationSample(1, "held_out_positive", 1.000_001),
+            CalibrationSample(1, "negative", 0.0),
+        ),
+        (
+            CalibrationSample(1, "held_out_positive", 0.0),
+            CalibrationSample(1, "negative", -1.000_001),
+        ),
+        (
+            CalibrationSample(1, "held_out_positive", inf),
+            CalibrationSample(1, "negative", -1.0),
+        ),
+    ),
+)
+def test_calibration_rejects_scores_outside_cosine_domain(samples) -> None:
+    with pytest.raises(DomainError) as caught:
+        calibrate_thresholds(samples)
+
+    assert caught.value.code == "VOICE_CALIBRATION_INVALID"
+
+
 def test_classification_rejects_nonfinite_scores() -> None:
     calibration = calibrate_thresholds(
         (
@@ -112,6 +136,21 @@ def test_classification_rejects_nonfinite_scores() -> None:
 
     with pytest.raises(DomainError) as caught:
         classify_presence_score(nan, calibration)
+
+    assert caught.value.code == "VOICE_SCORE_INVALID"
+
+
+@pytest.mark.parametrize("score", (-1.000_001, 1.000_001))
+def test_classification_rejects_scores_outside_cosine_domain(score) -> None:
+    calibration = calibrate_thresholds(
+        (
+            CalibrationSample(1, "held_out_positive", 0.71),
+            CalibrationSample(1, "negative", 0.21),
+        )
+    )
+
+    with pytest.raises(DomainError) as caught:
+        classify_presence_score(score, calibration)
 
     assert caught.value.code == "VOICE_SCORE_INVALID"
 

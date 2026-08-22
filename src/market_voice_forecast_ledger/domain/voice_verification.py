@@ -122,7 +122,10 @@ def calibrate_thresholds(samples: Sequence[CalibrationSample]) -> VoiceCalibrati
     if (
         not positives
         or not negatives
-        or any(not isfinite(value) for value in (*positives, *negatives))
+        or any(
+            not isfinite(value) or not -1.0 <= value <= 1.0
+            for value in (*positives, *negatives)
+        )
     ):
         raise DomainError(
             "VOICE_CALIBRATION_INVALID", "calibration samples are invalid"
@@ -143,7 +146,7 @@ def calibrate_thresholds(samples: Sequence[CalibrationSample]) -> VoiceCalibrati
 def classify_presence_score(
     score: float, calibration: VoiceCalibration
 ) -> VoiceProposal:
-    if not isfinite(score):
+    if not isfinite(score) or not -1.0 <= score <= 1.0:
         raise DomainError("VOICE_SCORE_INVALID", "voice score is invalid")
     if ScoreRule("gte", calibration.subject_boundary).matches(score):
         return VoiceProposal.LIKELY_PRESENT

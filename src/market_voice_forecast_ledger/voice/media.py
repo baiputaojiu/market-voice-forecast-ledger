@@ -69,6 +69,27 @@ class MediaAcquirer:
         )
 
     def acquire(self, video_id: str, target_dir: Path) -> AcquiredMedia:
+        return self._acquire(video_id, target_dir, registered=False)
+
+    def acquire_registered(
+        self,
+        video_id: str,
+        target_dir: Path,
+        *,
+        source_path: Path,
+        part_path: Path,
+    ) -> AcquiredMedia:
+        if (
+            not isinstance(target_dir, Path)
+            or source_path != target_dir / "source.media"
+            or part_path != target_dir / "source.media.part"
+        ):
+            raise _acquisition_failed()
+        return self._acquire(video_id, target_dir, registered=True)
+
+    def _acquire(
+        self, video_id: str, target_dir: Path, *, registered: bool
+    ) -> AcquiredMedia:
         work_dir: Path | None = None
         work_identity: _DirectoryIdentity | None = None
         download_path: Path | None = None
@@ -159,18 +180,19 @@ class MediaAcquirer:
             digest = _nonempty_file_sha256(output)
             return AcquiredMedia(path=output, sha256=digest, video_id=video_id)
         except Exception:
-            _remove_unregistered_target(
-                download_path,
-                work_dir,
-                self._private_work_root,
-                work_identity,
-            )
-            _remove_unregistered_target(
-                download_part_path,
-                work_dir,
-                self._private_work_root,
-                work_identity,
-            )
+            if not registered:
+                _remove_unregistered_target(
+                    download_path,
+                    work_dir,
+                    self._private_work_root,
+                    work_identity,
+                )
+                _remove_unregistered_target(
+                    download_part_path,
+                    work_dir,
+                    self._private_work_root,
+                    work_identity,
+                )
             raise _acquisition_failed() from None
 
 
@@ -191,6 +213,16 @@ class MediaNormalizer:
         )
 
     def normalize(self, source: Path, target: Path) -> NormalizedAudio:
+        return self._normalize(source, target, registered=False)
+
+    def normalize_registered(
+        self, source: Path, target: Path
+    ) -> NormalizedAudio:
+        return self._normalize(source, target, registered=True)
+
+    def _normalize(
+        self, source: Path, target: Path, *, registered: bool
+    ) -> NormalizedAudio:
         work_dir: Path | None = None
         work_identity: _DirectoryIdentity | None = None
         target_path: Path | None = None
@@ -273,12 +305,13 @@ class MediaNormalizer:
                 source_sha256=source_sha256,
             )
         except Exception:
-            _remove_unregistered_target(
-                target_path,
-                work_dir,
-                self._private_work_root,
-                work_identity,
-            )
+            if not registered:
+                _remove_unregistered_target(
+                    target_path,
+                    work_dir,
+                    self._private_work_root,
+                    work_identity,
+                )
             raise _normalization_failed() from None
 
 
@@ -287,6 +320,15 @@ def canonical_watch_url(video_id: str) -> str:
         return _canonical_watch_url(video_id)
     except Exception:
         raise _acquisition_failed() from None
+
+
+def normalized_wav_duration_ms(path: Path) -> int:
+    try:
+        if not isinstance(path, Path):
+            raise ValueError("invalid normalized audio")
+        return _normalized_wav_duration_ms(path)
+    except Exception:
+        raise _normalization_failed() from None
 
 
 def _canonical_watch_url(video_id: object) -> str:
@@ -541,4 +583,5 @@ __all__ = [
     "MediaNormalizer",
     "NormalizedAudio",
     "canonical_watch_url",
+    "normalized_wav_duration_ms",
 ]

@@ -21,7 +21,15 @@ from market_voice_forecast_ledger.voice.protocol import (
     MAX_ADAPTER_RESPONSE_BYTES,
     AdapterRequest,
     AdapterResponse,
+    ReferenceAudioInput,
+    ReferenceDryRunRequest,
+    ReferenceEnrollmentRequest,
+    ReferenceRequest,
+    ReferenceResponse,
+    ReferenceScoreRequest,
+    decode_reference_response,
     decode_response,
+    encode_reference_request,
     encode_request,
 )
 from market_voice_forecast_ledger.voice.runtime import (
@@ -159,6 +167,136 @@ class VoiceAdapterProcess:
         return encode_request(request), python_identity
 
 
+class ReferenceAdapterProcess:
+    def __init__(
+        self,
+        runner: AdapterRunner | None,
+        attestation: RuntimeAttestation,
+        private_work_root: Path,
+        *,
+        source_environment: Mapping[str, str] | None = None,
+    ) -> None:
+        self._runner = runner or _bounded_run
+        self._attestation = attestation
+        self._private_work_root = private_work_root
+        self._source_environment = (
+            os.environ if source_environment is None else source_environment
+        )
+
+    def execute(self, request: ReferenceRequest) -> ReferenceResponse:
+        try:
+            payload, python_identity = self._validated_payload(request)
+            completed = self._runner(
+                (
+                    str(self._attestation.python_path),
+                    "-I",
+                    "-m",
+                    _ADAPTER_MODULE,
+                ),
+                shell=False,
+                timeout=ADAPTER_TIMEOUT_SECONDS,
+                check=False,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                input=payload,
+                env=_allowlisted_environment(self._source_environment),
+                max_stdout_bytes=MAX_ADAPTER_RESPONSE_BYTES,
+            )
+            data_root = _private_root(self._private_work_root).parent
+            _require_attested_file(
+                self._attestation.python_path,
+                self._attestation.python_sha256,
+                data_root,
+                expected_identity=python_identity,
+            )
+            verify_runtime_startup(self._attestation, data_root)
+            returncode = getattr(completed, "returncode", None)
+            stdout = getattr(completed, "stdout", None)
+            if (
+                type(returncode) is not int
+                or returncode != 0
+                or type(stdout) is not bytes
+                or len(stdout) > MAX_ADAPTER_RESPONSE_BYTES
+            ):
+                raise ValueError("reference adapter process failed")
+            return decode_reference_response(
+                stdout, expected_request=request
+            )
+        except Exception:
+            raise DomainError(
+                "VOICE_REFERENCE_ADAPTER_PROCESS_FAILED",
+                "reference adapter process failed",
+            ) from None
+
+    def _validated_payload(
+        self, request: ReferenceRequest
+    ) -> tuple[bytes, _FileIdentity]:
+        if not callable(self._runner) or not isinstance(
+            self._attestation, RuntimeAttestation
+        ):
+            raise ValueError("invalid reference adapter dependencies")
+        if not isinstance(
+            request,
+            (
+                ReferenceDryRunRequest,
+                ReferenceEnrollmentRequest,
+                ReferenceScoreRequest,
+            ),
+        ):
+            raise ValueError("invalid reference adapter request")
+        attestation = self._attestation
+        if (
+            attestation.provider != "CPUExecutionProvider"
+            or request.adapter_contract_version
+            != attestation.adapter_contract_version
+            or request.model_name != attestation.model_name
+            or request.model_version != attestation.model_version
+            or request.model_path != str(attestation.model_path)
+            or request.model_sha256 != attestation.model_sha256
+        ):
+            raise ValueError("reference adapter identity mismatch")
+        work_root = _private_root(self._private_work_root)
+        data_root = work_root.parent
+        python_identity = _require_attested_file(
+            attestation.python_path, attestation.python_sha256, data_root
+        )
+        verify_runtime_startup(attestation, data_root)
+        _require_attested_file(
+            attestation.model_path, attestation.model_sha256, data_root
+        )
+        for item in _reference_audios(request):
+            self._validate_audio(item, work_root)
+        return encode_reference_request(request), python_identity
+
+    def _validate_audio(
+        self, item: ReferenceAudioInput, work_root: Path
+    ) -> None:
+        audio_path = Path(item.audio_path)
+        audio = _private_existing_file(
+            audio_path, audio_path.parent.resolve()
+        )
+        try:
+            audio.relative_to(work_root)
+        except ValueError:
+            raise ValueError("reference audio escaped private work root") from None
+        if (
+            audio.name != "normalized.wav"
+            or _file_sha256(audio) != item.audio_sha256
+            or _normalized_wav_duration_ms(audio) != item.audio_duration_ms
+        ):
+            raise ValueError("reference audio identity mismatch")
+
+
+def _reference_audios(
+    request: ReferenceRequest,
+) -> tuple[ReferenceAudioInput, ...]:
+    if isinstance(request, ReferenceScoreRequest):
+        return (request.audio,)
+    return request.audios
+
+
 def _allowlisted_environment(source: Mapping[str, str]) -> dict[str, str]:
     if not isinstance(source, Mapping):
         raise ValueError("invalid environment")
@@ -261,4 +399,8 @@ def _process_failed() -> DomainError:
     )
 
 
-__all__ = ["ADAPTER_TIMEOUT_SECONDS", "VoiceAdapterProcess"]
+__all__ = [
+    "ADAPTER_TIMEOUT_SECONDS",
+    "ReferenceAdapterProcess",
+    "VoiceAdapterProcess",
+]

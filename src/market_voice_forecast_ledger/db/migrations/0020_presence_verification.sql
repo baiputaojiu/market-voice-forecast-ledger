@@ -189,6 +189,52 @@ CREATE TABLE voice_verification_reviews (
     reviewed_at TEXT NOT NULL
 );
 
+CREATE TRIGGER speaker_threshold_configs_limited_update
+BEFORE UPDATE ON speaker_threshold_configs
+WHEN NOT (
+    NEW.version IS OLD.version
+    AND NEW.model_name IS OLD.model_name
+    AND NEW.model_version IS OLD.model_version
+    AND NEW.subject_operator IS OLD.subject_operator
+    AND NEW.subject_boundary IS OLD.subject_boundary
+    AND NEW.interviewer_operator IS OLD.interviewer_operator
+    AND NEW.interviewer_boundary IS OLD.interviewer_boundary
+    AND NEW.created_at IS OLD.created_at
+    AND OLD.is_active = 1
+    AND NEW.is_active = 0
+    AND voice_reference_threshold_transition_authorized(
+        OLD.version, OLD.is_active, NEW.is_active
+    ) = 1
+)
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_SPEAKER_THRESHOLD_CONFIG'); END;
+
+CREATE TRIGGER speaker_threshold_configs_no_delete
+BEFORE DELETE ON speaker_threshold_configs
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_SPEAKER_THRESHOLD_CONFIG'); END;
+
+CREATE TRIGGER voice_reference_profiles_limited_update
+BEFORE UPDATE ON voice_reference_profiles
+WHEN NOT (
+    NEW.id IS OLD.id
+    AND NEW.subject_id IS OLD.subject_id
+    AND NEW.model_name IS OLD.model_name
+    AND NEW.model_version IS OLD.model_version
+    AND NEW.adapter_version IS OLD.adapter_version
+    AND NEW.feature_hash IS OLD.feature_hash
+    AND NEW.threshold_config_version IS OLD.threshold_config_version
+    AND NEW.created_at IS OLD.created_at
+    AND OLD.is_active = 1
+    AND NEW.is_active = 0
+    AND voice_reference_profile_transition_authorized(
+        OLD.id, OLD.subject_id, OLD.is_active, NEW.is_active
+    ) = 1
+)
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VOICE_REFERENCE_PROFILE'); END;
+
+CREATE TRIGGER voice_reference_profiles_no_delete
+BEFORE DELETE ON voice_reference_profiles
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VOICE_REFERENCE_PROFILE'); END;
+
 CREATE TRIGGER voice_reference_clips_require_owner
 BEFORE INSERT ON voice_reference_clips
 WHEN NOT EXISTS (
@@ -430,3 +476,46 @@ WHEN EXISTS (
     WHERE existing.id=NEW.id OR existing.run_id=NEW.run_id
 )
 BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VOICE_REVIEW'); END;
+
+CREATE TABLE voice_reference_calibrations (
+    calibration_hash TEXT PRIMARY KEY CHECK (
+        typeof(calibration_hash) = 'text'
+        AND length(CAST(calibration_hash AS BLOB)) = 64
+        AND calibration_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    expected_prior_fingerprint TEXT NOT NULL CHECK (
+        typeof(expected_prior_fingerprint) = 'text'
+        AND length(CAST(expected_prior_fingerprint AS BLOB)) = 64
+        AND expected_prior_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    threshold_config_version TEXT NOT NULL UNIQUE
+        REFERENCES speaker_threshold_configs(version),
+    model_sha256 TEXT NOT NULL CHECK (
+        typeof(model_sha256) = 'text'
+        AND length(CAST(model_sha256 AS BLOB)) = 64
+        AND model_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    feature_contract_hash TEXT NOT NULL CHECK (
+        typeof(feature_contract_hash) = 'text'
+        AND length(CAST(feature_contract_hash AS BLOB)) = 64
+        AND feature_contract_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    activated_at TEXT NOT NULL
+);
+
+CREATE TRIGGER voice_reference_calibrations_no_update
+BEFORE UPDATE ON voice_reference_calibrations
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VOICE_CALIBRATION'); END;
+
+CREATE TRIGGER voice_reference_calibrations_no_delete
+BEFORE DELETE ON voice_reference_calibrations
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VOICE_CALIBRATION'); END;
+
+CREATE TRIGGER voice_reference_calibrations_no_replace
+BEFORE INSERT ON voice_reference_calibrations
+WHEN EXISTS (
+    SELECT 1 FROM voice_reference_calibrations AS existing
+    WHERE existing.calibration_hash=NEW.calibration_hash
+       OR existing.threshold_config_version=NEW.threshold_config_version
+)
+BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_VOICE_CALIBRATION'); END;

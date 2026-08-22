@@ -478,6 +478,122 @@ def test_voice_records_reject_raw_update_and_delete(
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("table", "authorization_name", "error_code"),
+    (
+        (
+            "speaker_threshold_configs",
+            "voice_reference_threshold_transition_authorized",
+            "IMMUTABLE_SPEAKER_THRESHOLD_CONFIG",
+        ),
+        (
+            "voice_reference_profiles",
+            "voice_reference_profile_transition_authorized",
+            "IMMUTABLE_VOICE_REFERENCE_PROFILE",
+        ),
+    ),
+)
+def test_calibration_heads_allow_only_authorized_exact_deactivation(
+    populated_database,
+    tmp_path,
+    table,
+    authorization_name,
+    error_code,
+) -> None:
+    database_path = tmp_path / f"{table}-guard.sqlite3"
+    shutil.copyfile(populated_database, database_path)
+    conn = open_database(database_path)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA recursive_triggers=OFF")
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE is_active=1 ORDER BY 1 LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        identity = row["version"] if table == "speaker_threshold_configs" else row["id"]
+        where_column = "version" if table == "speaker_threshold_configs" else "id"
+
+        for statement in (
+            f"UPDATE {table} SET is_active=0 WHERE {where_column}=?",
+            f"UPDATE {table} SET model_version=model_version || '-changed' "
+            f"WHERE {where_column}=?",
+            f"DELETE FROM {table} WHERE {where_column}=?",
+        ):
+            conn.execute("BEGIN")
+            try:
+                with pytest.raises(sqlite3.IntegrityError, match=error_code):
+                    conn.execute(statement, (identity,))
+            finally:
+                conn.rollback()
+
+        if table == "speaker_threshold_configs":
+            conn.create_function(authorization_name, 3, lambda *_: 1)
+        else:
+            conn.create_function(authorization_name, 4, lambda *_: 1)
+
+        conn.execute("BEGIN")
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match=error_code):
+                conn.execute(
+                    f"UPDATE {table} SET model_version=model_version || '-changed' "
+                    f"WHERE {where_column}=?",
+                    (identity,),
+                )
+        finally:
+            conn.rollback()
+
+        conn.execute("BEGIN")
+        conn.execute(
+            f"UPDATE {table} SET is_active=0 WHERE {where_column}=?",
+            (identity,),
+        )
+        assert conn.execute(
+            f"SELECT is_active FROM {table} WHERE {where_column}=?",
+            (identity,),
+        ).fetchone()[0] == 0
+        conn.rollback()
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "error_code"),
+    (
+        ("speaker_threshold_configs", "APPEND_ONLY"),
+        ("voice_reference_profiles", "APPEND_ONLY"),
+    ),
+)
+def test_calibration_heads_reject_or_replace_with_recursive_triggers_off(
+    populated_database,
+    table,
+    error_code,
+) -> None:
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        row = conn.execute(f"SELECT * FROM {table} ORDER BY 1 LIMIT 1").fetchone()
+        columns = tuple(row.keys())
+        conn.execute("BEGIN")
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match=error_code):
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} "
+                    f"({', '.join(columns)}) VALUES "
+                    f"({', '.join('?' for _ in columns)})",
+                    tuple(row),
+                )
+        finally:
+            conn.rollback()
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.close()
+
+
 def test_presence_tables_reject_replace_with_logical_identity(
     populated_database,
 ) -> None:

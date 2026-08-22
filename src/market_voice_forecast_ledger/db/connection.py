@@ -12,6 +12,16 @@ def open_database(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA recursive_triggers = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
+    conn.create_function(
+        "voice_reference_threshold_transition_authorized",
+        3,
+        lambda *_: 0,
+    )
+    conn.create_function(
+        "voice_reference_profile_transition_authorized",
+        4,
+        lambda *_: 0,
+    )
     return conn
 
 
@@ -20,8 +30,7 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
+        conn.commit()
     except BaseException:
         conn.rollback()
         raise
-    else:
-        conn.commit()

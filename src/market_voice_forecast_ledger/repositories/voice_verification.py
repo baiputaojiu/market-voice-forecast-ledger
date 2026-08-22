@@ -52,6 +52,7 @@ _RUNNABLE_STATUSES = frozenset({JobStatus.QUEUED.value, JobStatus.RETRYING.value
 _JOB_STATUSES = frozenset(status.value for status in JobStatus)
 _UNIT_STATUSES = frozenset(status.value for status in UnitStatus)
 _ATTEMPT_RESULT_STATUSES = frozenset({"success", "failed", "interrupted"})
+_SQLITE_INT_MAX = 2**63 - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +97,16 @@ class ReferenceBundle:
     is_active: bool
     clips: tuple[StoredReferenceClip, ...]
     feature: StoredReferenceFeature
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCalibrationIdentity:
+    calibration_hash: str
+    expected_prior_fingerprint: str
+    threshold_config_version: str
+    model_sha256: str
+    feature_contract_hash: str
+    activated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +267,118 @@ class VoiceVerificationRepository:
         self._conn = conn
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
+    def add_reference_profile(
+        self,
+        *,
+        subject_id: int,
+        model_name: str,
+        model_version: str,
+        adapter_version: str,
+        feature_hash: str,
+        threshold_config_version: str,
+        created_at: datetime,
+        is_active: bool,
+    ) -> int:
+        if (
+            not _positive_sqlite_int(subject_id)
+            or not _is_token(model_name)
+            or not _is_token(model_version)
+            or not _is_token(adapter_version)
+            or not _is_hash(feature_hash)
+            or not _is_token(threshold_config_version)
+            or not _is_exact_utc(created_at)
+            or type(is_active) is not bool
+        ):
+            _invalid_reference()
+        cursor = self._conn.execute(
+            """
+            INSERT INTO voice_reference_profiles(
+                subject_id, model_name, model_version, adapter_version,
+                feature_hash, threshold_config_version, created_at, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                subject_id,
+                model_name,
+                model_version,
+                adapter_version,
+                feature_hash,
+                threshold_config_version,
+                utc_iso(created_at),
+                int(is_active),
+            ),
+        )
+        return _lastrowid(cursor)
+
+    def list_active_reference_profile_ids(self) -> tuple[int, ...]:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT id FROM voice_reference_profiles WHERE is_active=1 "
+                "ORDER BY subject_id, id"
+            )
+        )
+        ids = tuple(row["id"] for row in rows)
+        if any(not _positive_sqlite_int(item) for item in ids):
+            _stored_reference_invalid()
+        return ids
+
+    def add_calibration_identity(
+        self, identity: StoredCalibrationIdentity
+    ) -> None:
+        if not _valid_calibration_identity(identity):
+            _invalid_reference()
+        self._conn.execute(
+            """
+            INSERT INTO voice_reference_calibrations(
+                calibration_hash, expected_prior_fingerprint,
+                threshold_config_version, model_sha256,
+                feature_contract_hash, activated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                identity.calibration_hash,
+                identity.expected_prior_fingerprint,
+                identity.threshold_config_version,
+                identity.model_sha256,
+                identity.feature_contract_hash,
+                utc_iso(identity.activated_at),
+            ),
+        )
+
+    def find_calibration_identity(
+        self, calibration_hash: str
+    ) -> StoredCalibrationIdentity | None:
+        if not _is_hash(calibration_hash):
+            _invalid_reference()
+        row = self._conn.execute(
+            "SELECT * FROM voice_reference_calibrations WHERE calibration_hash=?",
+            (calibration_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            identity = StoredCalibrationIdentity(
+                calibration_hash=row["calibration_hash"],
+                expected_prior_fingerprint=row["expected_prior_fingerprint"],
+                threshold_config_version=row["threshold_config_version"],
+                model_sha256=row["model_sha256"],
+                feature_contract_hash=row["feature_contract_hash"],
+                activated_at=_parse_utc(row["activated_at"]),
+            )
+            if not _valid_calibration_identity(identity):
+                raise ValueError("stored calibration identity is invalid")
+            return identity
+        except (LookupError, TypeError, ValueError):
+            _stored_reference_invalid()
+
+    def get_calibration_identity(
+        self, calibration_hash: str
+    ) -> StoredCalibrationIdentity:
+        identity = self.find_calibration_identity(calibration_hash)
+        if identity is None:
+            _stored_reference_invalid()
+        return identity
+
     def add_reference_clip(
         self,
         reference_profile_id: int,
@@ -267,20 +390,15 @@ class VoiceVerificationRepository:
         approved_at: datetime,
     ) -> int:
         if (
-            type(reference_profile_id) is not int
-            or reference_profile_id <= 0
-            or type(ordinal) is not int
-            or ordinal <= 0
+            not _positive_sqlite_int(reference_profile_id)
+            or not _positive_sqlite_int(ordinal)
             or type(clip_kind) is not str
             or clip_kind not in _CLIP_KINDS
             or type(command) is not ReferenceClipCommand
-            or type(command.subject_id) is not int
-            or command.subject_id <= 0
-            or type(command.video_id) is not int
-            or command.video_id <= 0
-            or type(command.start_ms) is not int
-            or type(command.end_ms) is not int
-            or command.start_ms < 0
+            or not _positive_sqlite_int(command.subject_id)
+            or not _positive_sqlite_int(command.video_id)
+            or not _nonnegative_sqlite_int(command.start_ms)
+            or not _positive_sqlite_int(command.end_ms)
             or command.start_ms >= command.end_ms
             or type(command.actor) is not str
             or command.actor != "local_user"
@@ -348,15 +466,13 @@ class VoiceVerificationRepository:
         created_at: datetime,
     ) -> int:
         if (
-            type(reference_profile_id) is not int
-            or reference_profile_id <= 0
+            not _positive_sqlite_int(reference_profile_id)
             or not _is_token(encoding_version)
-            or float_dtype not in {"float32", "float64"}
-            or type(dimension) is not int
-            or dimension <= 0
+            or float_dtype not in {"float32", "float32-le", "float64"}
+            or not _positive_sqlite_int(dimension)
             or type(embedding_blob) is not bytes
             or len(embedding_blob)
-            != dimension * (4 if float_dtype == "float32" else 8)
+            != dimension * (4 if float_dtype in {"float32", "float32-le"} else 8)
             or not _is_exact_utc(created_at)
         ):
             _invalid_reference()
@@ -389,7 +505,7 @@ class VoiceVerificationRepository:
         return _lastrowid(cursor)
 
     def get_reference_bundle(self, reference_profile_id: int) -> ReferenceBundle:
-        if type(reference_profile_id) is not int or reference_profile_id <= 0:
+        if not _positive_sqlite_int(reference_profile_id):
             _stored_reference_invalid()
         try:
             profile = self._read_reference_profile(reference_profile_id)
@@ -1757,11 +1873,12 @@ class VoiceVerificationRepository:
             )
             or row["reference_profile_id"] != profile["id"]
             or not _is_token(row["encoding_version"])
-            or row["float_dtype"] not in {"float32", "float64"}
+            or row["float_dtype"] not in {"float32", "float32-le", "float64"}
             or row["dimension"] <= 0
             or type(row["embedding_blob"]) is not bytes
             or len(row["embedding_blob"])
-            != row["dimension"] * (4 if row["float_dtype"] == "float32" else 8)
+            != row["dimension"]
+            * (4 if row["float_dtype"] in {"float32", "float32-le"} else 8)
             or not _is_hash(row["feature_sha256"])
             or hashlib.sha256(row["embedding_blob"]).hexdigest()
             != row["feature_sha256"]
@@ -2119,6 +2236,26 @@ def _is_hash(value: object) -> bool:
 
 def _is_token(value: object) -> bool:
     return type(value) is str and _SAFE_TOKEN.fullmatch(value) is not None
+
+
+def _positive_sqlite_int(value: object) -> bool:
+    return type(value) is int and 0 < value <= _SQLITE_INT_MAX
+
+
+def _nonnegative_sqlite_int(value: object) -> bool:
+    return type(value) is int and 0 <= value <= _SQLITE_INT_MAX
+
+
+def _valid_calibration_identity(value: object) -> bool:
+    return (
+        type(value) is StoredCalibrationIdentity
+        and _is_hash(value.calibration_hash)
+        and _is_hash(value.expected_prior_fingerprint)
+        and _is_token(value.threshold_config_version)
+        and _is_hash(value.model_sha256)
+        and _is_hash(value.feature_contract_hash)
+        and _is_exact_utc(value.activated_at)
+    )
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:

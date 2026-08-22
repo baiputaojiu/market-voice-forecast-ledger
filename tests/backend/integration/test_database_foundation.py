@@ -122,6 +122,37 @@ def test_transaction_rolls_back_exception_and_clears_active_state(tmp_path):
         reopened.close()
 
 
+def test_transaction_rolls_back_deferred_foreign_key_commit_failure(tmp_path):
+    database_path = tmp_path / "deferred-commit.sqlite3"
+    conn = open_database(database_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE deferred_parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE deferred_child(
+                parent_id INTEGER NOT NULL,
+                FOREIGN KEY(parent_id) REFERENCES deferred_parent(id)
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            with transaction(conn):
+                conn.execute(
+                    "INSERT INTO deferred_child(parent_id) VALUES (99)"
+                )
+
+        assert conn.in_transaction is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM deferred_child"
+        ).fetchone()[0] == 0
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.close()
+
+
 def test_fixed_jst_cutoff_is_next_local_midnight_expressed_in_utc():
     assert JST.utcoffset(None) == timedelta(hours=9)
     assert cutoff_exclusive_utc(date(2026, 8, 14)) == datetime(

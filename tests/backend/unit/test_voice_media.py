@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.voice import media
 from market_voice_forecast_ledger.voice.media import (
@@ -18,18 +19,30 @@ from market_voice_forecast_ledger.voice.media import (
 )
 from market_voice_forecast_ledger.voice.process import (
     ADAPTER_TIMEOUT_SECONDS,
+    ReferenceAdapterProcess,
     VoiceAdapterProcess,
 )
 from market_voice_forecast_ledger.voice import process as voice_process
 from market_voice_forecast_ledger.voice.protocol import (
     MAX_ADAPTER_RESPONSE_BYTES,
+    ReferenceAudioInput,
+    ReferenceDryRunRequest,
+    ReferenceDryRunResponse,
+    ReferenceFeatureInput,
+    ReferenceScoreRequest,
+    ReferenceScoreResponse,
+    decode_reference_request,
+    encode_reference_request,
+    encode_reference_response,
     encode_request,
 )
 from tests.backend.voice_fakes import (
     FakeAdapterRunner,
+    FakeCompleted,
     FakeMediaRunner,
     adapter_response_payload,
     fake_runtime_attestation,
+    _synthetic_pcm_wav,
     valid_adapter_request,
 )
 
@@ -283,6 +296,49 @@ def test_acquisition_removes_only_its_partial_target_and_can_retry(
     result = acquirer.acquire("abcdefghijk", job_dir)
     assert result.path.read_bytes() == b"complete"
     assert registered.read_bytes() == b"registered-private-artifact"
+
+
+def test_registered_media_failures_leave_every_target_for_retention(
+    tmp_path: Path,
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    acquire_job = work_root / "registered-acquire"
+    acquire_job.mkdir()
+    source = acquire_job / "source.media"
+    part = acquire_job / "source.media.part"
+    acquirer = MediaAcquirer(
+        _PartialYtDlpRunner("nonzero"),
+        attestation,
+        work_root,
+        source_environment={},
+    )
+
+    with pytest.raises(DomainError, match="media acquisition failed"):
+        acquirer.acquire_registered(
+            "abcdefghijk",
+            acquire_job,
+            source_path=source,
+            part_path=part,
+        )
+
+    assert part.read_bytes() == b"realistic-partial-media"
+
+    normalize_job = work_root / "registered-normalize"
+    normalize_job.mkdir()
+    normalize_source = normalize_job / "source.media"
+    normalize_source.write_bytes(b"source")
+    normalized = normalize_job / "normalized.wav"
+    normalizer = MediaNormalizer(
+        FakeMediaRunner(output=b"partial-normalized", returncode=7),
+        attestation,
+        work_root,
+        source_environment={},
+    )
+
+    with pytest.raises(DomainError, match="media normalization failed"):
+        normalizer.normalize_registered(normalize_source, normalized)
+
+    assert normalized.read_bytes() == b"partial-normalized"
 
 
 @pytest.mark.parametrize("failure", ("timeout", "nonzero"))
@@ -655,6 +711,143 @@ def test_adapter_process_uses_isolated_python_bounded_transport_and_clean_env(
             "timeout": ADAPTER_TIMEOUT_SECONDS,
         }
     ]
+
+
+def test_reference_adapter_process_validates_private_audio_and_uses_child_cpu(
+    tmp_path: Path,
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    attestation = replace(
+        attestation,
+        model_name="3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+        model_version="sherpa-onnx-1.13.4",
+    )
+    ordinary = valid_adapter_request(attestation, work_root)
+    audio_path = Path(ordinary.audio_path)
+    audio_path.write_bytes(_synthetic_pcm_wav(duration_ms=4_000))
+    audio = ReferenceAudioInput(
+        approval_hash="d" * 64,
+        audio_duration_ms=4_000,
+        audio_path=ordinary.audio_path,
+        audio_sha256=hashlib.sha256(audio_path.read_bytes()).hexdigest(),
+        clip_kind="held_out_positive",
+        end_ms=3_000,
+        ordinal=3,
+        start_ms=0,
+        subject_id=1,
+        video_id=2,
+    )
+    feature_body = b"\x01" * (192 * 4)
+    feature = ReferenceFeatureInput.from_bytes(
+        encoding_version="sherpa-speaker-embedding-v1",
+        float_dtype="float32-le",
+        dimension=192,
+        embedding_blob=feature_body,
+        subject_id=1,
+    )
+    identity = {
+        "adapter_contract_version": attestation.adapter_contract_version,
+        "model_name": attestation.model_name,
+        "model_path": str(attestation.model_path),
+        "model_sha256": attestation.model_sha256,
+        "model_version": attestation.model_version,
+    }
+    score_request = ReferenceScoreRequest.with_canonical_hash(
+        **identity,
+        operation="reference_score",
+        audio=audio,
+        feature=feature,
+    )
+    dry_request = ReferenceDryRunRequest.with_canonical_hash(
+        **identity,
+        operation="reference_dry_run",
+        audios=tuple(audio for _ in range(20)),
+        candidate_count=20,
+        features=tuple(
+            feature.model_copy(update={"subject_id": subject_id})
+            for subject_id in range(1, 5)
+        ),
+    )
+
+    class ReferenceRunner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+            self.kwargs: list[dict[str, object]] = []
+
+        def __call__(self, argv, **kwargs):
+            self.calls.append(tuple(argv))
+            self.kwargs.append(dict(kwargs))
+            request = decode_reference_request(kwargs["input"])
+            if isinstance(request, ReferenceScoreRequest):
+                values: dict[str, object] = {
+                    "adapter_contract_version": request.adapter_contract_version,
+                    "cpu_time_ms": 19,
+                    "input_hash": request.input_hash,
+                    "model_name": request.model_name,
+                    "model_version": request.model_version,
+                    "operation": request.operation,
+                    "raw_score": 0.61,
+                }
+                values["output_hash"] = sha256_text(canonical_json(values))
+                response = ReferenceScoreResponse.model_validate(
+                    values, strict=True
+                )
+            else:
+                assert isinstance(request, ReferenceDryRunRequest)
+                values = {
+                    "adapter_contract_version": request.adapter_contract_version,
+                    "candidate_count": 20,
+                    "cpu_time_ms": 37,
+                    "input_hash": request.input_hash,
+                    "model_name": request.model_name,
+                    "model_version": request.model_version,
+                    "operation": request.operation,
+                }
+                values["output_hash"] = sha256_text(canonical_json(values))
+                response = ReferenceDryRunResponse.model_validate(
+                    values, strict=True
+                )
+            return FakeCompleted(
+                returncode=0,
+                stdout=encode_reference_response(response),
+            )
+
+    runner = ReferenceRunner()
+    process = ReferenceAdapterProcess(
+        runner,
+        attestation,
+        work_root,
+        source_environment={"SystemRoot": "C:/Windows", "SECRET": "private"},
+    )
+
+    score = process.execute(score_request)
+    dry_run = process.execute(dry_request)
+
+    assert isinstance(score, ReferenceScoreResponse)
+    assert score.raw_score == 0.61
+    assert isinstance(dry_run, ReferenceDryRunResponse)
+    assert dry_run.cpu_time_ms == 37
+    assert runner.calls == [
+        (
+            str(attestation.python_path),
+            "-I",
+            "-m",
+            "market_voice_forecast_ledger.voice.adapter_main",
+        ),
+        (
+            str(attestation.python_path),
+            "-I",
+            "-m",
+            "market_voice_forecast_ledger.voice.adapter_main",
+        ),
+    ]
+    assert runner.kwargs[0]["input"] == encode_reference_request(score_request)
+    assert runner.kwargs[1]["input"] == encode_reference_request(dry_request)
+    assert runner.kwargs[0]["env"] == {
+        "SystemRoot": "C:/Windows",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUTF8": "1",
+    }
 
 
 def test_adapter_empty_source_environment_inherits_nothing(tmp_path: Path) -> None:

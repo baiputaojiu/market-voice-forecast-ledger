@@ -17,8 +17,20 @@ from market_voice_forecast_ledger.voice.protocol import (
     MAX_ADAPTER_RESPONSE_BYTES,
     MAX_ADAPTER_SEGMENTS,
     AdapterRequest,
+    ReferenceAudioInput,
+    ReferenceDryRunRequest,
+    ReferenceDryRunResponse,
+    ReferenceEnrollmentRequest,
+    ReferenceEnrollmentResponse,
+    ReferenceFeatureInput,
+    ReferenceScoreRequest,
+    ReferenceScoreResponse,
+    decode_reference_request,
+    decode_reference_response,
     decode_reference_feature,
     decode_response,
+    encode_reference_request,
+    encode_reference_response,
     encode_request,
     wipe_reference_feature,
 )
@@ -647,3 +659,235 @@ def test_adapter_import_guard_detects_forbidden_mutations(
 def test_adapter_entrypoint_has_no_forbidden_imports() -> None:
     source = Path(adapter_main.__file__).read_text(encoding="utf-8")
     assert _adapter_forbidden_imports(source) == ()
+
+
+def _reference_audio(ordinal: int = 1) -> ReferenceAudioInput:
+    return ReferenceAudioInput(
+        approval_hash=f"{ordinal:x}" * 64,
+        audio_duration_ms=40_000,
+        audio_path=f"C:/private/work/reference-{ordinal}/normalized.wav",
+        audio_sha256=f"{ordinal + 4:x}" * 64,
+        clip_kind="enrollment" if ordinal <= 2 else "negative",
+        end_ms=ordinal * 5_000 + 10_000,
+        ordinal=ordinal,
+        start_ms=ordinal * 5_000,
+        subject_id=1,
+        video_id=ordinal,
+    )
+
+
+def _reference_feature(marker: int = 1) -> ReferenceFeatureInput:
+    body = bytes([marker]) * (192 * 4)
+    return ReferenceFeatureInput.from_bytes(
+        encoding_version="sherpa-speaker-embedding-v1",
+        float_dtype="float32-le",
+        dimension=192,
+        embedding_blob=body,
+        subject_id=marker,
+    )
+
+
+def _reference_identity() -> dict[str, object]:
+    return {
+        "adapter_contract_version": "voice-adapter-v1",
+        "model_name": "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+        "model_path": "C:/private/models/campplus.onnx",
+        "model_sha256": "a" * 64,
+        "model_version": "sherpa-onnx-1.13.4",
+    }
+
+
+def test_reference_operations_bind_ranges_features_and_child_cpu() -> None:
+    enrollment = ReferenceEnrollmentRequest.with_canonical_hash(
+        **_reference_identity(),
+        operation="reference_enrollment",
+        audios=(_reference_audio(1), _reference_audio(2)),
+    )
+    score = ReferenceScoreRequest.with_canonical_hash(
+        **_reference_identity(),
+        operation="reference_score",
+        audio=_reference_audio(3),
+        feature=_reference_feature(),
+    )
+    dry_run = ReferenceDryRunRequest.with_canonical_hash(
+        **_reference_identity(),
+        operation="reference_dry_run",
+        audios=tuple(_reference_audio((index % 6) + 1) for index in range(20)),
+        candidate_count=20,
+        features=tuple(_reference_feature(index) for index in range(1, 5)),
+    )
+
+    for request in (enrollment, score, dry_run):
+        encoded = encode_reference_request(request)
+        assert decode_reference_request(encoded) == request
+        assert json.loads(encoded)["input_hash"] == request.input_hash
+
+    changed_range = enrollment.model_copy(
+        update={
+            "audios": (
+                enrollment.audios[0].model_copy(update={"end_ms": 15_001}),
+                enrollment.audios[1],
+            )
+        }
+    )
+    with pytest.raises(DomainError) as caught:
+        encode_reference_request(changed_range)
+    assert caught.value.code == "VOICE_REFERENCE_ADAPTER_REQUEST_INVALID"
+
+    malformed = json.loads(encode_reference_request(score))
+    malformed["feature"]["embedding_b64"] = (
+        "*" + malformed["feature"]["embedding_b64"][1:]
+    )
+    with pytest.raises(DomainError) as malformed_error:
+        decode_reference_request(canonical_json(malformed).encode("utf-8"))
+    assert malformed_error.value.code == "VOICE_REFERENCE_ADAPTER_REQUEST_INVALID"
+
+    feature = _reference_feature()
+    enrollment_values: dict[str, object] = {
+        "adapter_contract_version": enrollment.adapter_contract_version,
+        "cpu_time_ms": 7,
+        "encoding_version": feature.encoding_version,
+        "feature_b64": feature.embedding_b64,
+        "feature_length": feature.feature_length,
+        "feature_sha256": feature.feature_sha256,
+        "float_dtype": feature.float_dtype,
+        "dimension": feature.dimension,
+        "input_hash": enrollment.input_hash,
+        "model_name": enrollment.model_name,
+        "model_version": enrollment.model_version,
+        "operation": enrollment.operation,
+    }
+    enrollment_values["output_hash"] = sha256_text(
+        canonical_json(enrollment_values)
+    )
+    enrollment_response = ReferenceEnrollmentResponse.model_validate(
+        enrollment_values, strict=True
+    )
+    score_values: dict[str, object] = {
+        "adapter_contract_version": score.adapter_contract_version,
+        "cpu_time_ms": 11,
+        "input_hash": score.input_hash,
+        "model_name": score.model_name,
+        "model_version": score.model_version,
+        "operation": score.operation,
+        "raw_score": 0.75,
+    }
+    score_values["output_hash"] = sha256_text(canonical_json(score_values))
+    score_response = ReferenceScoreResponse.model_validate(
+        score_values, strict=True
+    )
+    dry_values: dict[str, object] = {
+        "adapter_contract_version": dry_run.adapter_contract_version,
+        "candidate_count": 20,
+        "cpu_time_ms": 37,
+        "input_hash": dry_run.input_hash,
+        "model_name": dry_run.model_name,
+        "model_version": dry_run.model_version,
+        "operation": dry_run.operation,
+    }
+    dry_values["output_hash"] = sha256_text(canonical_json(dry_values))
+    dry_response = ReferenceDryRunResponse.model_validate(
+        dry_values, strict=True
+    )
+
+    assert decode_reference_response(
+        encode_reference_response(enrollment_response),
+        expected_request=enrollment,
+    ) == enrollment_response
+    assert decode_reference_response(
+        encode_reference_response(score_response), expected_request=score
+    ) == score_response
+    assert decode_reference_response(
+        encode_reference_response(dry_response), expected_request=dry_run
+    ).cpu_time_ms == 37
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"candidate_count": 19},
+        {"cpu_time_ms": -1},
+        {"input_hash": "f" * 64},
+        {"model_name": "wespeaker_zh_cnceleb_resnet34.onnx"},
+    ),
+)
+def test_reference_dry_run_response_rejects_identity_and_cpu_mutations(
+    mutation,
+) -> None:
+    request = ReferenceDryRunRequest.with_canonical_hash(
+        **_reference_identity(),
+        operation="reference_dry_run",
+        audios=tuple(_reference_audio((index % 6) + 1) for index in range(20)),
+        candidate_count=20,
+        features=tuple(_reference_feature(index) for index in range(1, 5)),
+    )
+    values: dict[str, object] = {
+        "adapter_contract_version": request.adapter_contract_version,
+        "candidate_count": 20,
+        "cpu_time_ms": 37,
+        "input_hash": request.input_hash,
+        "model_name": request.model_name,
+        "model_version": request.model_version,
+        "operation": request.operation,
+    }
+    values.update(mutation)
+    values["output_hash"] = sha256_text(
+        canonical_json(
+            {key: value for key, value in values.items() if key != "output_hash"}
+        )
+    )
+
+    with pytest.raises(DomainError) as caught:
+        decode_reference_response(
+            canonical_json(values).encode("utf-8"),
+            expected_request=request,
+        )
+
+    assert caught.value.code == "VOICE_REFERENCE_ADAPTER_RESPONSE_INVALID"
+    assert caught.value.__cause__ is None
+
+
+def test_reference_entrypoint_denies_network_and_reports_child_cpu() -> None:
+    request = ReferenceScoreRequest.with_canonical_hash(
+        **_reference_identity(),
+        operation="reference_score",
+        audio=_reference_audio(3),
+        feature=_reference_feature(),
+    )
+    socket_module = SimpleNamespace(
+        socket=lambda: "unsafe",
+        SocketType=lambda: "unsafe",
+        create_connection=lambda: "unsafe",
+        getaddrinfo=lambda: "unsafe",
+        socketpair=lambda: "unsafe",
+    )
+    low_level_socket_module = SimpleNamespace(
+        socket=lambda: "unsafe", socketpair=lambda: "unsafe"
+    )
+
+    def reference_backend(received):
+        assert received == request
+        with pytest.raises(OSError, match="network disabled"):
+            socket_module.socket()
+        values: dict[str, object] = {
+            "adapter_contract_version": request.adapter_contract_version,
+            "cpu_time_ms": 23,
+            "input_hash": request.input_hash,
+            "model_name": request.model_name,
+            "model_version": request.model_version,
+            "operation": request.operation,
+            "raw_score": 0.5,
+        }
+        values["output_hash"] = sha256_text(canonical_json(values))
+        return ReferenceScoreResponse.model_validate(values, strict=True)
+
+    output = adapter_main.process_reference_payload(
+        encode_reference_request(request),
+        backend=reference_backend,
+        socket_module=socket_module,
+        low_level_socket_module=low_level_socket_module,
+    )
+
+    response = decode_reference_response(output, expected_request=request)
+    assert response.raw_score == 0.5
+    assert response.cpu_time_ms == 23

@@ -1,11 +1,14 @@
 """Network-denied entrypoint for CPU-only local speaker scoring."""
 
+import base64
 import hashlib
 import json
 import math
 import _socket
 import socket
+import struct
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,9 +21,23 @@ from market_voice_forecast_ledger.voice.protocol import (
     MAX_ADAPTER_SEGMENTS,
     AdapterRequest,
     AdapterResponse,
+    ReferenceAudioInput,
+    ReferenceDryRunRequest,
+    ReferenceDryRunResponse,
+    ReferenceEnrollmentRequest,
+    ReferenceEnrollmentResponse,
+    ReferenceRequest,
+    ReferenceResponse,
+    ReferenceScoreRequest,
+    ReferenceScoreResponse,
+    decode_reference_input_feature,
+    decode_reference_request,
+    decode_reference_response,
     decode_reference_feature,
     decode_response,
+    encode_reference_response,
     encode_request,
+    reference_feature_semantics,
     wipe_reference_feature,
 )
 
@@ -33,6 +50,7 @@ class _Backend(Protocol):
 
 
 BackendFactory = Callable[[AdapterRequest, bytearray], _Backend]
+ReferenceBackend = Callable[[ReferenceRequest], ReferenceResponse]
 
 
 def process_payload(
@@ -71,10 +89,48 @@ def process_payload(
             wipe_reference_feature(feature)
 
 
+def process_reference_payload(
+    payload: bytes,
+    *,
+    backend: ReferenceBackend | None = None,
+    socket_module: Any = None,
+    low_level_socket_module: Any = None,
+) -> bytes:
+    try:
+        request = decode_reference_request(payload)
+        if socket_module is None:
+            socket_module = socket
+        if low_level_socket_module is None:
+            low_level_socket_module = _socket
+        _install_network_denial(socket_module, low_level_socket_module)
+        response = (backend or _execute_reference_request)(request)
+        encoded = encode_reference_response(response)
+        canonical = decode_reference_response(
+            encoded, expected_request=request
+        )
+        return encode_reference_response(canonical)
+    except Exception:
+        raise DomainError(
+            "VOICE_REFERENCE_ADAPTER_PROCESS_FAILED",
+            "reference adapter process failed",
+        ) from None
+
+
 def main() -> int:
     try:
         payload = sys.stdin.buffer.read(MAX_ADAPTER_REQUEST_BYTES + 1)
-        output = process_payload(payload)
+        value = json.loads(payload.decode("utf-8", errors="strict"))
+        output = (
+            process_reference_payload(payload)
+            if type(value) is dict
+            and value.get("operation")
+            in {
+                "reference_enrollment",
+                "reference_score",
+                "reference_dry_run",
+            }
+            else process_payload(payload)
+        )
         if len(output) > MAX_ADAPTER_RESPONSE_BYTES:
             raise ValueError("adapter output is oversized")
         sys.stdout.buffer.write(output)
@@ -161,6 +217,173 @@ def _create_backend(request: AdapterRequest, feature: bytearray) -> _Backend:
         samples=samples,
         reference=tuple(float(value) for value in reference),
     )
+
+
+def _execute_reference_request(request: ReferenceRequest) -> ReferenceResponse:
+    started = time.process_time_ns()
+    runtime = _ReferenceEmbeddingRuntime.initialize(request)
+    if isinstance(request, ReferenceEnrollmentRequest):
+        embeddings = tuple(runtime.embedding(item) for item in request.audios)
+        feature = _normalized_average(embeddings)
+        feature_blob = struct.pack(f"<{len(feature)}f", *feature)
+        encoding, float_dtype, dimension = reference_feature_semantics(
+            request.model_name
+        )
+        values: dict[str, object] = {
+            "adapter_contract_version": request.adapter_contract_version,
+            "cpu_time_ms": _elapsed_cpu_ms(started),
+            "dimension": dimension,
+            "encoding_version": encoding,
+            "feature_b64": base64.b64encode(feature_blob).decode("ascii"),
+            "feature_length": len(feature_blob),
+            "feature_sha256": hashlib.sha256(feature_blob).hexdigest(),
+            "float_dtype": float_dtype,
+            "input_hash": request.input_hash,
+            "model_name": request.model_name,
+            "model_version": request.model_version,
+            "operation": request.operation,
+        }
+        values["output_hash"] = sha256_text(canonical_json(values))
+        return ReferenceEnrollmentResponse.model_validate(values, strict=True)
+    if isinstance(request, ReferenceScoreRequest):
+        feature = _reference_feature_values(request.feature)
+        try:
+            raw_score = _cosine(feature, runtime.embedding(request.audio))
+        finally:
+            feature = ()
+        values = {
+            "adapter_contract_version": request.adapter_contract_version,
+            "cpu_time_ms": _elapsed_cpu_ms(started),
+            "input_hash": request.input_hash,
+            "model_name": request.model_name,
+            "model_version": request.model_version,
+            "operation": request.operation,
+            "raw_score": raw_score,
+        }
+        values["output_hash"] = sha256_text(canonical_json(values))
+        return ReferenceScoreResponse.model_validate(values, strict=True)
+    if not isinstance(request, ReferenceDryRunRequest):
+        raise ValueError("unsupported reference request")
+    features = tuple(_reference_feature_values(item) for item in request.features)
+    try:
+        for audio in request.audios:
+            embedding = runtime.embedding(audio)
+            max(_cosine(feature, embedding) for feature in features)
+    finally:
+        features = ()
+    values = {
+        "adapter_contract_version": request.adapter_contract_version,
+        "candidate_count": request.candidate_count,
+        "cpu_time_ms": _elapsed_cpu_ms(started),
+        "input_hash": request.input_hash,
+        "model_name": request.model_name,
+        "model_version": request.model_version,
+        "operation": request.operation,
+    }
+    values["output_hash"] = sha256_text(canonical_json(values))
+    return ReferenceDryRunResponse.model_validate(values, strict=True)
+
+
+class _ReferenceEmbeddingRuntime:
+    def __init__(self, extractor: Any) -> None:
+        self._extractor = extractor
+
+    @classmethod
+    def initialize(
+        cls, request: ReferenceRequest
+    ) -> "_ReferenceEmbeddingRuntime":
+        import importlib
+
+        _require_file_hash(Path(request.model_path), request.model_sha256)
+        sherpa = importlib.import_module("sherpa_onnx")
+        config = sherpa.SpeakerEmbeddingExtractorConfig(
+            model=request.model_path,
+            num_threads=1,
+            debug=False,
+            provider="cpu",
+        )
+        extractor = sherpa.SpeakerEmbeddingExtractor(config)
+        readiness = getattr(extractor, "is_ready", None)
+        if callable(readiness) and not readiness():
+            raise ValueError("speaker extractor is not ready")
+        return cls(extractor)
+
+    def embedding(self, audio: ReferenceAudioInput) -> tuple[float, ...]:
+        import wave
+        from array import array
+
+        path = Path(audio.audio_path)
+        _require_file_hash(path, audio.audio_sha256)
+        with wave.open(str(path), "rb") as wav:
+            if (
+                wav.getnchannels() != 1
+                or wav.getsampwidth() != 2
+                or wav.getframerate() != 16_000
+                or wav.getcomptype() != "NONE"
+                or (wav.getnframes() * 1_000) // 16_000
+                != audio.audio_duration_ms
+            ):
+                raise ValueError("invalid reference audio")
+            start_frame = audio.start_ms * 16
+            frame_count = (audio.end_ms - audio.start_ms) * 16
+            if start_frame + frame_count > wav.getnframes():
+                raise ValueError("reference range exceeds audio")
+            wav.setpos(start_frame)
+            pcm = array("h")
+            pcm.frombytes(wav.readframes(frame_count))
+        if sys.byteorder != "little":
+            pcm.byteswap()
+        if len(pcm) != frame_count:
+            raise ValueError("reference range is incomplete")
+        samples = tuple(value / 32_768.0 for value in pcm)
+        stream = self._extractor.create_stream()
+        stream.accept_waveform(16_000, samples)
+        stream.input_finished()
+        result = tuple(float(value) for value in self._extractor.compute(stream))
+        if not result or any(not math.isfinite(value) for value in result):
+            raise ValueError("invalid speaker embedding")
+        return result
+
+
+def _reference_feature_values(feature: Any) -> tuple[float, ...]:
+    from array import array
+
+    body = decode_reference_input_feature(feature)
+    try:
+        values = array("f")
+        values.frombytes(body)
+        if sys.byteorder != "little":
+            values.byteswap()
+        result = tuple(float(value) for value in values)
+        if len(result) != feature.dimension or any(
+            not math.isfinite(value) for value in result
+        ):
+            raise ValueError("invalid reference feature")
+        return result
+    finally:
+        wipe_reference_feature(body)
+
+
+def _normalized_average(
+    embeddings: tuple[tuple[float, ...], ...]
+) -> tuple[float, ...]:
+    if not embeddings or len({len(item) for item in embeddings}) != 1:
+        raise ValueError("embedding dimensions differ")
+    averaged = tuple(
+        sum(item[index] for item in embeddings) / len(embeddings)
+        for index in range(len(embeddings[0]))
+    )
+    norm = math.sqrt(sum(value * value for value in averaged))
+    if norm == 0.0 or not math.isfinite(norm):
+        raise ValueError("enrollment embedding norm is zero")
+    return tuple(value / norm for value in averaged)
+
+
+def _elapsed_cpu_ms(started_ns: int) -> int:
+    elapsed = time.process_time_ns() - started_ns
+    if elapsed < 0:
+        raise ValueError("child CPU clock moved backwards")
+    return (elapsed + 999_999) // 1_000_000
 
 
 class _SherpaBackend:
