@@ -405,6 +405,64 @@ def test_manifest_round_trip_and_runnable_jobs_are_fifo(db) -> None:
     assert repository.list_runnable_job_ids() == (job.job_id,)
 
 
+def test_video_pipeline_transaction_owned_creation_requires_caller_transaction(
+    db,
+) -> None:
+    job = seed_job(db)
+    service = JobStateService(db, clock=lambda: REVIEWED_AT)
+
+    with pytest.raises(DomainError) as caught:
+        service.create_video_pipeline_in_transaction(
+            build_presence_job_manifest(job.snapshot),
+            (job.reference.candidate_id,),
+            created_at=REVIEWED_AT,
+        )
+    assert caught.value.code == "JOB_TRANSACTION_REQUIRED"
+
+
+def test_video_pipeline_transaction_owned_creation_rolls_back_with_caller(
+    db,
+) -> None:
+    job = seed_job(db)
+    before_jobs = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    before_sets = db.execute(
+        "SELECT COUNT(*) FROM video_pipeline_job_binding_sets"
+    ).fetchone()[0]
+    before_bindings = db.execute(
+        "SELECT COUNT(*) FROM video_pipeline_job_bindings"
+    ).fetchone()[0]
+    service = JobStateService(db, clock=lambda: NOW)
+
+    with pytest.raises(RuntimeError, match="injected caller failure"):
+        with transaction(db):
+            created_job_id = service.create_video_pipeline_in_transaction(
+                build_presence_job_manifest(job.snapshot),
+                (job.reference.candidate_id,),
+                created_at=REVIEWED_AT,
+            )
+            created = db.execute(
+                "SELECT created_at, updated_at FROM jobs WHERE id=?",
+                (created_job_id,),
+            ).fetchone()
+            assert created["created_at"] == utc_iso(REVIEWED_AT)
+            assert created["updated_at"] == utc_iso(REVIEWED_AT)
+            raise RuntimeError("injected caller failure")
+
+    assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == before_jobs
+    assert (
+        db.execute(
+            "SELECT COUNT(*) FROM video_pipeline_job_binding_sets"
+        ).fetchone()[0]
+        == before_sets
+    )
+    assert (
+        db.execute(
+            "SELECT COUNT(*) FROM video_pipeline_job_bindings"
+        ).fetchone()[0]
+        == before_bindings
+    )
+
+
 def test_runnable_job_list_rejects_unknown_stored_status(db) -> None:
     job = seed_job(db)
     db.execute("PRAGMA ignore_check_constraints=ON")

@@ -72,6 +72,19 @@ class JobStateService:
         manifest: JobManifest,
         candidate_ids: list[int] | tuple[int, ...],
     ) -> int:
+        with transaction(self._conn):
+            return self.create_video_pipeline_in_transaction(
+                manifest,
+                candidate_ids,
+            )
+
+    def create_video_pipeline_in_transaction(
+        self,
+        manifest: JobManifest,
+        candidate_ids: list[int] | tuple[int, ...],
+        created_at: datetime | None = None,
+    ) -> int:
+        self._require_transaction()
         normalized = self._validate_manifest(manifest)
         if normalized.kind is not JobKind.VIDEO_PIPELINE:
             raise DomainError(
@@ -96,13 +109,14 @@ class JobStateService:
                 "INVALID_VIDEO_PIPELINE_BINDINGS",
                 "video-pipeline bindings require unique positive candidate ids",
             )
-        with transaction(self._conn):
-            job_id = self._jobs.create(
-                normalized, source_job_id=None, created_at=self._clock()
-            )
-            self._jobs.create_sealed_video_pipeline_bindings(job_id, bindings)
-            self._require_video_pipeline_runnable(self._jobs.get(job_id))
-            return job_id
+        job_id = self._jobs.create(
+            normalized,
+            source_job_id=None,
+            created_at=created_at or self._clock(),
+        )
+        self._jobs.create_sealed_video_pipeline_bindings(job_id, bindings)
+        self._require_video_pipeline_runnable(self._jobs.get(job_id))
+        return job_id
 
     def create_successor(
         self,
