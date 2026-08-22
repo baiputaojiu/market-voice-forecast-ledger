@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
+from threading import Lock
 from typing import Protocol
 
 from market_voice_forecast_ledger.db.connection import transaction
@@ -64,6 +65,7 @@ _KNOWN_FAILURE_CODES = frozenset(
         "VOICE_ADAPTER_RESPONSE_INVALID",
         "VOICE_MEDIA_ACQUISITION_FAILED",
         "VOICE_MEDIA_NORMALIZATION_FAILED",
+        "VOICE_PROCESSING_FAILED",
     }
 )
 _RECOVERABLE_STATUSES = frozenset(
@@ -74,6 +76,7 @@ _RECOVERABLE_STATUSES = frozenset(
         JobStatus.CANCEL_REQUESTED.value,
     }
 )
+_WAKE_LOCK = Lock()
 
 
 class MediaAcquirer(Protocol):
@@ -188,33 +191,61 @@ class PresenceVerificationWorker:
         self._responses: dict[int, AdapterResponse] = {}
 
     def run_once(self) -> PresenceWorkerSummary:
-        recoverable_id = self._first_recoverable_job_id()
-        if recoverable_id is not None:
+        acquired = False
+        try:
+            acquired = _WAKE_LOCK.acquire(blocking=False)
+            if not acquired:
+                return _empty_summary()
+            return self._run_once_unlocked()
+        except Exception as cause:
+            return _failed_summary(None, _safe_failure_code(cause))
+        finally:
+            if acquired:
+                _WAKE_LOCK.release()
+
+    def _run_once_unlocked(self) -> PresenceWorkerSummary:
+        try:
+            target = self._claim_next_fifo()
+        except Exception:
+            return _failed_summary(None, "VOICE_PROCESSING_FAILED")
+        if target is None:
+            return _empty_summary()
+        job_id, requires_recovery = target
+        if requires_recovery:
             try:
-                plan = self.recover_job(recoverable_id)
-            except Exception:
-                return _failed_summary(recoverable_id, "VOICE_PROCESSING_FAILED")
-            status = self._jobs.status(recoverable_id)
+                plan = self._recover_job(job_id)
+            except Exception as cause:
+                return _failed_summary(job_id, _safe_failure_code(cause))
+            status = self._jobs.status(job_id)
             if status is JobStatus.SUCCEEDED:
-                return _succeeded_summary(recoverable_id)
-            boundary = _boundary_summary(recoverable_id, status)
+                return _succeeded_summary(job_id)
+            boundary = _boundary_summary(job_id, status)
             if boundary is not None:
                 return boundary
             if plan.next_unit_key is None:
-                return _failed_summary(
-                    recoverable_id, "VOICE_PROCESSING_FAILED"
-                )
-            return self._execute_job(recoverable_id)
-
-        try:
-            job_id = self._claim_next_fifo()
-        except Exception:
-            return _failed_summary(None, "VOICE_PROCESSING_FAILED")
-        if job_id is None:
-            return _empty_summary()
+                return _failed_summary(job_id, "VOICE_PROCESSING_FAILED")
         return self._execute_job(job_id)
 
     def recover_job(self, job_id: int) -> ResumePlan:
+        acquired = False
+        try:
+            acquired = _WAKE_LOCK.acquire(blocking=False)
+            if not acquired:
+                raise DomainError(
+                    "VOICE_PROCESSING_FAILED",
+                    "presence worker is unavailable",
+                )
+            return self._recover_job(job_id)
+        except Exception as cause:
+            raise _safe_domain_error(cause) from None
+        finally:
+            if acquired:
+                _WAKE_LOCK.release()
+
+    def _recover_job(self, job_id: int) -> ResumePlan:
+        boundary_plan = self._settle_requested_boundary(job_id)
+        if boundary_plan is not None:
+            return boundary_plan
         artifacts = self._canonical_artifacts(job_id)
         artifact_hashes = self._verified_artifact_hashes(artifacts)
         with transaction(self._conn):
@@ -247,6 +278,39 @@ class PresenceVerificationWorker:
         if plan.next_unit_key in {"audio:acquire", "audio:normalize"}:
             self._discard_stale_audio(job_id, from_unit=plan.next_unit_key)
         return plan
+
+    def _settle_requested_boundary(self, job_id: int) -> ResumePlan | None:
+        with transaction(self._conn):
+            self._jobs.require_canonical_video_pipeline_job(job_id)
+            self._voice.require_job_artifacts(job_id)
+            status = self._jobs.status(job_id)
+            if status not in {
+                JobStatus.PAUSE_REQUESTED,
+                JobStatus.CANCEL_REQUESTED,
+            }:
+                return None
+            try:
+                plan = self._jobs.recover_interrupted_in_transaction(job_id, {})
+            except DomainError as cause:
+                if (
+                    status is not JobStatus.CANCEL_REQUESTED
+                    or cause.code != "STOPPED_JOB_REQUIRES_SUCCESSOR"
+                    or self._jobs.status(job_id) is not JobStatus.STOPPED
+                ):
+                    raise
+                plan = self._resume_plan_from_state(job_id)
+            self._voice.require_job_artifacts(job_id)
+            return plan
+
+    def _resume_plan_from_state(self, job_id: int) -> ResumePlan:
+        units = tuple(self._jobs.unit(job_id, key) for key in _UNIT_KEYS)
+        reused = tuple(
+            unit.unit_key for unit in units if unit.status is UnitStatus.SUCCESS
+        )
+        pending = tuple(
+            unit.unit_key for unit in units if unit.status is UnitStatus.PENDING
+        )
+        return ResumePlan(reused, pending, pending[0] if pending else None)
 
     def _execute_job(self, job_id: int) -> PresenceWorkerSummary:
         while True:
@@ -363,6 +427,15 @@ class PresenceVerificationWorker:
         self, job_id: int, unit_key: str, output_hash: str
     ) -> None:
         with transaction(self._conn):
+            artifacts = self._canonical_artifacts(job_id)
+            self._require_current_unit_input(job_id, unit_key, artifacts)
+            if self._current_unit_artifact_hash(
+                job_id, unit_key, artifacts
+            ) != output_hash:
+                raise DomainError(
+                    "VOICE_PROCESSING_FAILED",
+                    "presence unit artifact changed",
+                )
             self._jobs.complete_unit_in_transaction(
                 job_id, unit_key, output_hash
             )
@@ -407,6 +480,14 @@ class PresenceVerificationWorker:
         )
         completed_at = self._clock()
         with transaction(self._conn):
+            current = self._canonical_artifacts(job_id)
+            self._require_same_artifacts(artifacts, current)
+            self._require_current_unit_input(
+                job_id,
+                "voice:proposal",
+                current,
+                response=response,
+            )
             self._voice.add_run_with_segments(
                 result, segments, completed_at=completed_at
             )
@@ -420,12 +501,16 @@ class PresenceVerificationWorker:
                     "presence proposal could not be verified",
                 )
 
-    def _claim_next_fifo(self) -> int | None:
+    def _claim_next_fifo(self) -> tuple[int, bool] | None:
         with transaction(self._conn):
             runnable = self._voice.list_runnable_job_ids()
-            if not runnable:
+            recoverable = self._recoverable_job_ids_in_transaction()
+            candidates = tuple(sorted((*runnable, *recoverable)))
+            if not candidates:
                 return None
-            job_id = runnable[0]
+            job_id = candidates[0]
+            if job_id in recoverable:
+                return job_id, True
             self._jobs.require_canonical_video_pipeline_job(job_id)
             artifacts = self._voice.require_job_artifacts(job_id)
             self._require_frozen_current(artifacts)
@@ -442,7 +527,33 @@ class PresenceVerificationWorker:
                 job_id, unit_key, external_hash
             )
             self._voice.require_job_artifacts(job_id)
-            return job_id
+            return job_id, False
+
+    def _recoverable_job_ids_in_transaction(self) -> tuple[int, ...]:
+        rows = tuple(
+            self._conn.execute(
+                "SELECT job.id, job.status, typeof(job.id) AS type_id, "
+                "typeof(job.status) AS type_status "
+                "FROM voice_verification_manifests AS manifest "
+                "JOIN jobs AS job ON job.id=manifest.job_id "
+                "WHERE job.status IN ('running', 'failed', "
+                "'pause_requested', 'cancel_requested') ORDER BY job.id"
+            )
+        )
+        result: list[int] = []
+        for row in rows:
+            if (
+                row["type_id"] != "integer"
+                or row["type_status"] != "text"
+                or row["status"] not in _RECOVERABLE_STATUSES
+            ):
+                raise DomainError(
+                    "VOICE_PROCESSING_FAILED",
+                    "presence job inventory is invalid",
+                )
+            self._canonical_artifacts(row["id"])
+            result.append(row["id"])
+        return tuple(result)
 
     def _canonical_artifacts(self, job_id: int) -> VoiceJobArtifacts:
         self._jobs.require_canonical_video_pipeline_job(job_id)
@@ -496,6 +607,7 @@ class PresenceVerificationWorker:
         unit_key: str,
         *,
         artifacts: VoiceJobArtifacts | None = None,
+        response: AdapterResponse | None = None,
     ) -> str:
         canonical = artifacts or self._canonical_artifacts(job_id)
         manifest = canonical.manifest
@@ -541,8 +653,15 @@ class PresenceVerificationWorker:
                 }
             )
             if unit_key == "voice:proposal":
-                response = self._adapter_response(job_id, canonical)
-                payload["adapter_output_hash"] = response.output_hash
+                effective_response = response or self._adapter_response(
+                    job_id, canonical
+                )
+                if effective_response.input_hash != request.input_hash:
+                    raise DomainError(
+                        "VOICE_ADAPTER_RESPONSE_INVALID",
+                        "adapter response is invalid",
+                    )
+                payload["adapter_output_hash"] = effective_response.output_hash
         elif unit_key == "audio:cleanup":
             payload["artifacts"] = [
                 {
@@ -556,6 +675,62 @@ class PresenceVerificationWorker:
                 "VOICE_PROCESSING_FAILED", "presence unit is unsupported"
             )
         return _hash_payload(payload)
+
+    def _require_current_unit_input(
+        self,
+        job_id: int,
+        unit_key: str,
+        artifacts: VoiceJobArtifacts,
+        *,
+        response: AdapterResponse | None = None,
+    ) -> None:
+        unit = self._jobs.unit(job_id, unit_key)
+        current_hash = self._external_input_hash(
+            job_id,
+            unit_key,
+            artifacts=artifacts,
+            response=response,
+        )
+        if unit.external_input_hash != current_hash:
+            raise DomainError(
+                "VOICE_PROCESSING_FAILED",
+                "presence unit input changed",
+            )
+
+    def _current_unit_artifact_hash(
+        self,
+        job_id: int,
+        unit_key: str,
+        artifacts: VoiceJobArtifacts,
+    ) -> str:
+        paths = self._audio_paths(job_id, create=False)
+        if unit_key == "video:validate":
+            return self._video_artifact_hash(artifacts)
+        if unit_key == "audio:acquire":
+            return _file_sha256(paths.source)
+        if unit_key == "audio:normalize":
+            return _file_sha256(paths.normalized)
+        if unit_key in {"voice:vad", "voice:score"}:
+            response = self._responses.get(job_id)
+            request = self._adapter_request(artifacts, paths.normalized)
+            if response is None or response.input_hash != request.input_hash:
+                raise DomainError(
+                    "VOICE_ADAPTER_RESPONSE_INVALID",
+                    "adapter response is invalid",
+                )
+            return (
+                self._vad_artifact_hash(artifacts, response)
+                if unit_key == "voice:vad"
+                else self._score_artifact_hash(artifacts, response)
+            )
+        if unit_key == "audio:cleanup":
+            cleanup_hash = self._cleanup_artifact_hash(job_id)
+            if cleanup_hash is not None:
+                return cleanup_hash
+        raise DomainError(
+            "VOICE_PROCESSING_FAILED",
+            "presence unit artifact is unavailable",
+        )
 
     def _adapter_request(
         self, artifacts: VoiceJobArtifacts, audio_path: Path
@@ -1009,24 +1184,6 @@ class PresenceVerificationWorker:
         )
         return None if not pending else pending[0].unit_key
 
-    def _first_recoverable_job_id(self) -> int | None:
-        rows = tuple(
-            self._conn.execute(
-                "SELECT job.id, job.status FROM voice_verification_manifests "
-                "AS manifest JOIN jobs AS job ON job.id=manifest.job_id "
-                "WHERE job.status IN ('running', 'failed', "
-                "'pause_requested', 'cancel_requested') ORDER BY job.id"
-            )
-        )
-        if not rows:
-            return None
-        row = rows[0]
-        if type(row["id"]) is not int or row["status"] not in _RECOVERABLE_STATUSES:
-            raise DomainError(
-                "VOICE_PROCESSING_FAILED", "presence job inventory is invalid"
-            )
-        return row["id"]
-
     @staticmethod
     def _require_same_artifacts(
         before: VoiceJobArtifacts, after: VoiceJobArtifacts
@@ -1060,6 +1217,10 @@ def _safe_failure_code(cause: Exception) -> str:
     if isinstance(cause, DomainError) and cause.code in _KNOWN_FAILURE_CODES:
         return cause.code
     return "VOICE_PROCESSING_FAILED"
+
+
+def _safe_domain_error(cause: Exception) -> DomainError:
+    return DomainError(_safe_failure_code(cause), "presence processing failed")
 
 
 def _empty_summary() -> PresenceWorkerSummary:

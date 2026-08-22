@@ -6,11 +6,12 @@ import struct
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, cast
 
 import pytest
 
-from market_voice_forecast_ledger.db.connection import transaction
+from market_voice_forecast_ledger.db.connection import open_database, transaction
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.domain.common import (
     canonical_json,
@@ -48,6 +49,10 @@ from market_voice_forecast_ledger.voice.protocol import (
 from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
 from market_voice_forecast_ledger.workers.presence_verification import (
     PresenceVerificationWorker,
+)
+from tests.backend.integration.test_presence_pilot import (
+    pilot_service,
+    seed_pilot_environment,
 )
 from tests.backend.integration.test_voice_reference_enrollment import (
     FEATURE_BYTES,
@@ -1194,6 +1199,47 @@ class FailingPresenceMediaNormalizer(FakePresenceMediaNormalizer):
         )
 
 
+class ReentrantPresenceMediaNormalizer(FakePresenceMediaNormalizer):
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        competing_worker: PresenceVerificationWorker,
+    ) -> None:
+        super().__init__(db)
+        self._competing_worker = competing_worker
+        self.competing_summary = None
+
+    def normalize_registered(
+        self, source: Path, target: Path
+    ) -> NormalizedAudio:
+        self.competing_summary = self._competing_worker.run_once()
+        return super().normalize_registered(source, target)
+
+
+class MutatingPresenceMediaNormalizer(FakePresenceMediaNormalizer):
+    def __init__(self, db: sqlite3.Connection, mutation: str) -> None:
+        super().__init__(db)
+        self._mutation = mutation
+
+    def normalize_registered(
+        self, source: Path, target: Path
+    ) -> NormalizedAudio:
+        if self._mutation == "begin_to_producer":
+            source.write_bytes(b"mutated-before-normalizer-consumption")
+        normalized = super().normalize_registered(source, target)
+        if self._mutation == "producer_to_completion":
+            armed = True
+
+            def mutate_on_completion_begin(statement: str) -> None:
+                nonlocal armed
+                if armed and statement == "BEGIN IMMEDIATE":
+                    armed = False
+                    target.write_bytes(b"mutated-after-normalizer-validation")
+
+            self._db.set_trace_callback(mutate_on_completion_begin)
+        return normalized
+
+
 class FakePresenceAdapter:
     def __init__(
         self,
@@ -1335,6 +1381,100 @@ def _assert_current_presence_unverified(
         "WHERE candidate.id=?", (candidate_id,)
     ).fetchone()
     assert row is not None and row["state"] == "presence_unverified"
+
+
+@pytest.mark.parametrize(
+    ("lower_status", "higher_status"),
+    (
+        ("queued", "failed"),
+        ("queued", "retrying"),
+        ("failed", "queued"),
+        ("retrying", "queued"),
+    ),
+)
+def test_worker_selects_lowest_id_across_queued_failed_and_retrying_jobs(
+    db,
+    tmp_path: Path,
+    lower_status: str,
+    higher_status: str,
+) -> None:
+    seed_pilot_environment(db)
+    service = pilot_service(db)
+    preview = service.preview_pilot()
+    creation = service.create_pilot(preview.preview_hash)
+    lower_id, higher_id = creation.job_ids[:2]
+    jobs = JobStateService(db, clock=lambda: NOW)
+    for job_id, status in (
+        (lower_id, lower_status),
+        (higher_id, higher_status),
+    ):
+        if status == "queued":
+            continue
+        artifacts = VoiceVerificationRepository(db).require_job_artifacts(job_id)
+        external_hash = sha256_text(
+            canonical_json(
+                {
+                    "manifest_hash": artifacts.manifest.manifest_hash,
+                    "presence_decision_hash": (
+                        artifacts.manifest.snapshot.presence_decision_hash
+                    ),
+                    "reference_feature_hash": (
+                        artifacts.reference.feature.feature_sha256
+                    ),
+                    "schema": "presence-worker-external-input.v1",
+                    "unit_key": "video:validate",
+                }
+            )
+        )
+        jobs.begin_unit(job_id, "video:validate", external_hash)
+        jobs.fail_unit(job_id, "video:validate", "VOICE_PROCESSING_FAILED")
+        if status == "retrying":
+            jobs.resume(job_id, {})
+    manifest = VoiceVerificationRepository(db).get_manifest_for_job(lower_id)
+    harness = presence_worker_harness(
+        db, tmp_path, SimpleNamespace(snapshot=manifest.snapshot)
+    )
+
+    summary = harness.worker.run_once()
+
+    assert summary.job_id == lower_id
+    assert JobStateService(db).status(higher_id).value == higher_status
+
+
+def test_second_connection_does_not_recover_a_live_external_unit(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    database_path = Path(
+        db.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    competing_db = open_database(database_path)
+    try:
+        competing = presence_worker_harness(competing_db, tmp_path, job)
+        reentrant = ReentrantPresenceMediaNormalizer(db, competing.worker)
+        active = presence_worker_harness(
+            db, tmp_path, job, normalizer=reentrant
+        )
+
+        summary = active.worker.run_once()
+
+        assert summary.succeeded_jobs == 1
+        assert reentrant.competing_summary is not None
+        assert reentrant.competing_summary.job_id is None
+        assert reentrant.competing_summary.failed_jobs == 0
+        assert competing.acquirer.calls == []
+        assert competing.normalizer.calls == []
+        assert competing.adapter.calls == []
+        rows = tuple(
+            db.execute(
+                "SELECT status, attempt_count FROM job_units "
+                "WHERE job_id=? ORDER BY ordinal", (job.job_id,)
+            )
+        )
+        assert all(row["status"] == "success" for row in rows)
+        assert all(row["attempt_count"] == 1 for row in rows)
+    finally:
+        competing_db.close()
 
 
 @pytest.mark.parametrize("crash_after", VOICE_UNIT_KEYS)
@@ -1567,6 +1707,58 @@ def test_normalization_timeout_discards_partial_artifact_before_retry(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    ("hash_to_begin", "begin_to_producer", "producer_to_completion"),
+)
+def test_normalization_never_succeeds_with_stale_consumed_bytes(
+    db, tmp_path: Path, mutation: str
+) -> None:
+    job = seed_job(db)
+    normalizer = MutatingPresenceMediaNormalizer(db, mutation)
+
+    def arm_hash_to_begin_mutation(job_id: int, unit_key: str) -> None:
+        if mutation != "hash_to_begin" or unit_key != "audio:acquire":
+            return
+        source = (
+            tmp_path
+            / "presence-audio"
+            / f"presence-job-{job_id:020d}"
+            / "source.media"
+        )
+        armed = True
+
+        def mutate_on_begin(statement: str) -> None:
+            nonlocal armed
+            if armed and statement == "BEGIN IMMEDIATE":
+                armed = False
+                source.write_bytes(b"mutated-after-external-input-hash")
+
+        db.set_trace_callback(mutate_on_begin)
+
+    harness = presence_worker_harness(
+        db,
+        tmp_path,
+        job,
+        normalizer=normalizer,
+        after_unit_committed=arm_hash_to_begin_mutation,
+    )
+    try:
+        summary = harness.worker.run_once()
+    finally:
+        db.set_trace_callback(None)
+
+    assert summary.succeeded_jobs == 0
+    assert JobStateService(db).status(job.job_id) is JobStatus.FAILED
+    normalized = JobStateService(db).unit(job.job_id, "audio:normalize")
+    assert normalized.status.value == "failed"
+    assert normalized.output_hash is None
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_verification_runs"
+    ).fetchone()[0] == 0
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+@pytest.mark.parametrize(
     ("boundary_action", "expected_status"),
     (("pause", JobStatus.PAUSED), ("stop", JobStatus.STOPPED)),
 )
@@ -1593,6 +1785,47 @@ def test_worker_honors_pause_and_stop_at_committed_unit_boundary(
     assert summary.failed_code is None
     assert JobStateService(db).status(job.job_id) is expected_status
     assert harness.acquirer.calls == []
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+@pytest.mark.parametrize(
+    ("boundary_action", "expected_status", "summary_field"),
+    (
+        ("pause", JobStatus.PAUSED, "paused_jobs"),
+        ("stop", JobStatus.STOPPED, "stopped_jobs"),
+    ),
+)
+def test_requested_boundary_settles_before_adapter_verification(
+    db,
+    tmp_path: Path,
+    boundary_action: str,
+    expected_status: JobStatus,
+    summary_field: str,
+) -> None:
+    job = seed_job(db)
+    crashing = FakePresenceAdapter(
+        failure=cast(Exception, SimulatedCrash("voice:vad"))
+    )
+    first = presence_worker_harness(db, tmp_path, job, adapter=crashing)
+    with pytest.raises(SimulatedCrash):
+        first.worker.run_once()
+    assert JobStateService(db).unit(
+        job.job_id, "voice:vad"
+    ).status.value == "running"
+    jobs = JobStateService(db, clock=lambda: NOW)
+    if boundary_action == "pause":
+        jobs.request_pause(job.job_id)
+    else:
+        jobs.request_stop(job.job_id)
+    replacement = presence_worker_harness(db, tmp_path, job)
+
+    summary = replacement.worker.run_once()
+
+    assert JobStateService(db).status(job.job_id) is expected_status
+    assert getattr(summary, summary_field) == 1
+    assert replacement.acquirer.calls == []
+    assert replacement.normalizer.calls == []
+    assert replacement.adapter.calls == []
     _assert_current_presence_unverified(db, job.reference.candidate_id)
 
 
@@ -1639,6 +1872,104 @@ def test_worker_maps_private_failures_to_constant_safe_codes(
     assert error == expected_code
     assert "private" not in repr(summary).lower()
     _assert_current_presence_unverified(db, job.reference.candidate_id)
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    (
+        (
+            RuntimeError("PRIVATE_STATUS_SENTINEL C:/private/audio.wav"),
+            "VOICE_PROCESSING_FAILED",
+        ),
+        (
+            DomainError(
+                "VOICE_ADAPTER_PROCESS_FAILED",
+                "PRIVATE_STATUS_SENTINEL C:/private/audio.wav",
+            ),
+            "VOICE_ADAPTER_PROCESS_FAILED",
+        ),
+    ),
+)
+def test_run_once_sanitizes_complete_status_boundary(
+    db,
+    tmp_path: Path,
+    monkeypatch,
+    cause: Exception,
+    expected_code: str,
+) -> None:
+    job = seed_job(db)
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    def fail_status(_job_id: int) -> JobStatus:
+        raise cause
+
+    monkeypatch.setattr(harness.worker._jobs, "status", fail_status)
+
+    summary = harness.worker.run_once()
+
+    assert summary.failed_code == expected_code
+    assert "PRIVATE_STATUS_SENTINEL" not in repr(summary)
+    assert "private" not in repr(summary).lower()
+
+
+def test_run_once_sanitizes_closed_connection_during_selection(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    database_path = Path(
+        db.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    closed = open_database(database_path)
+    harness = presence_worker_harness(closed, tmp_path, job)
+    closed.close()
+
+    summary = harness.worker.run_once()
+
+    assert summary.failed_code == "VOICE_PROCESSING_FAILED"
+    assert "closed" not in repr(summary).lower()
+    assert "database" not in repr(summary).lower()
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    (
+        (
+            RuntimeError("PRIVATE_RECOVERY_SENTINEL C:/private/audio.wav"),
+            "VOICE_PROCESSING_FAILED",
+        ),
+        (
+            DomainError(
+                "VOICE_ADAPTER_RESPONSE_INVALID",
+                "PRIVATE_RECOVERY_SENTINEL C:/private/audio.wav",
+            ),
+            "VOICE_ADAPTER_RESPONSE_INVALID",
+        ),
+    ),
+)
+def test_recover_job_sanitizes_complete_public_boundary(
+    db,
+    tmp_path: Path,
+    monkeypatch,
+    cause: Exception,
+    expected_code: str,
+) -> None:
+    job = seed_job(db)
+    jobs = JobStateService(db, clock=lambda: NOW)
+    jobs.begin_unit(job.job_id, "video:validate")
+    jobs.fail_unit(job.job_id, "video:validate", "VOICE_PROCESSING_FAILED")
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    def fail_recovery(_job_id: int):
+        raise cause
+
+    monkeypatch.setattr(harness.worker, "_canonical_artifacts", fail_recovery)
+
+    with pytest.raises(DomainError) as caught:
+        harness.worker.recover_job(job.job_id)
+
+    assert caught.value.code == expected_code
+    assert "PRIVATE_RECOVERY_SENTINEL" not in str(caught.value)
+    assert "private" not in str(caught.value).lower()
 
 
 def test_worker_rejects_partial_adapter_response_before_any_run_write(
