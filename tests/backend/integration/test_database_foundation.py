@@ -46,6 +46,7 @@ EXPECTED_MIGRATIONS = (
     "0017_append_only_guards",
     "0018_youtube_discovery_cutover",
     "0019_market_masters_seed_channel",
+    "0020_presence_verification",
 )
 
 

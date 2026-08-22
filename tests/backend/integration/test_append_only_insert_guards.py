@@ -35,11 +35,12 @@ def test_migration_runner_records_current_migrations_once_and_remains_idempotent
         first = apply_migrations(conn)
         second = apply_migrations(conn)
         assert "0018_youtube_discovery_cutover" in first
-        assert first[-1] == "0019_market_masters_seed_channel"
+        assert first[-1] == "0020_presence_verification"
         assert second == ()
         for migration_name in (
             "0018_youtube_discovery_cutover",
             "0019_market_masters_seed_channel",
+            "0020_presence_verification",
         ):
             assert conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE name=?",
@@ -56,11 +57,9 @@ def populated_database(tmp_path_factory) -> Path:
         fixture.run_complete_flow()
         conn = fixture.connection
         threshold = conn.execute(
-            "SELECT version FROM speaker_threshold_configs WHERE is_active=1"
-        ).fetchone()[0]
-        subject_id = conn.execute(
-            "SELECT id FROM analysis_subjects ORDER BY id LIMIT 1"
-        ).fetchone()[0]
+            "SELECT version, model_name, model_version "
+            "FROM speaker_threshold_configs WHERE is_active=1"
+        ).fetchone()
         profile_version_id = conn.execute(
             "SELECT id FROM discovery_profile_versions ORDER BY id LIMIT 1"
         ).fetchone()[0]
@@ -73,22 +72,129 @@ def populated_database(tmp_path_factory) -> Path:
                 ") VALUES (?, 1, 'UCabcdefghijklmnopqrstuv')",
                 (profile_version_id,),
             )
-        conn.execute(
+        candidate = conn.execute(
+            """
+            SELECT candidate.id, candidate.video_id, candidate.profile_id,
+                   candidate.current_presence_decision_id,
+                   profile.subject_id,
+                   decision.decision_hash
+            FROM subject_video_candidates AS candidate
+            JOIN discovery_profiles AS profile ON profile.id=candidate.profile_id
+            JOIN presence_decisions AS decision
+              ON decision.id=candidate.current_presence_decision_id
+            ORDER BY candidate.id
+            LIMIT 1
+            """
+        ).fetchone()
+        feature_hash = "f" * 64
+        reference_profile_id = conn.execute(
             """
             INSERT INTO voice_reference_profiles(
                 subject_id, model_name, model_version, adapter_version,
                 feature_hash, threshold_config_version, created_at, is_active
-            ) VALUES (?, 'synthetic-voice-model', '1.0', 'adapter-v1',
-                      'synthetic-feature-hash', ?,
+            ) VALUES (?, ?, ?, 'adapter-v1', ?, ?,
                       '2026-08-15T00:00:00.000000Z', 1)
             """,
-            (subject_id, threshold),
+            (
+                candidate["subject_id"],
+                threshold["model_name"],
+                threshold["model_version"],
+                feature_hash,
+                threshold["version"],
+            ),
+        ).lastrowid
+        manifest = _video_manifest()
+        voice_job_id = JobStateService(conn).create_video_pipeline(
+            manifest, (candidate["id"],)
         )
-        candidate_id = conn.execute(
-            "SELECT id FROM subject_video_candidates ORDER BY id LIMIT 1"
-        ).fetchone()[0]
-        JobStateService(conn).create_video_pipeline(
-            _video_manifest(), (candidate_id,)
+        conn.execute(
+            """
+            INSERT INTO voice_reference_clips(
+                reference_profile_id, ordinal, clip_kind, subject_id, video_id,
+                start_ms, end_ms, normalized_audio_sha256, approval_actor,
+                approval_reason, approved_at, clip_hash
+            ) VALUES (?, 1, 'enrollment', ?, ?, 1000, 3000, ?, 'local_user',
+                      'clear solo speech', '2026-08-15T00:00:00.000000Z', ?)
+            """,
+            (
+                reference_profile_id,
+                candidate["subject_id"],
+                candidate["video_id"],
+                "a" * 64,
+                "b" * 64,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO voice_reference_features(
+                reference_profile_id, encoding_version, float_dtype, dimension,
+                embedding_blob, feature_sha256, created_at
+            ) VALUES (?, 'embedding-v1', 'float32', 4, ?, ?,
+                      '2026-08-15T00:00:00.000000Z')
+            """,
+            (reference_profile_id, sqlite3.Binary(b"\x00" * 16), feature_hash),
+        )
+        conn.execute(
+            """
+            INSERT INTO voice_verification_manifests(
+                job_id, candidate_id, video_id, profile_id,
+                presence_decision_id, presence_decision_hash,
+                reference_profile_id, reference_feature_hash,
+                threshold_config_version, model_name, model_version,
+                adapter_version, vad_contract_version,
+                selection_contract_version, manifest_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'adapter-v1',
+                      'vad-v1', 'selection-v1', ?,
+                      '2026-08-15T00:00:00.000000Z')
+            """,
+            (
+                voice_job_id,
+                candidate["id"],
+                candidate["video_id"],
+                candidate["profile_id"],
+                candidate["current_presence_decision_id"],
+                candidate["decision_hash"],
+                reference_profile_id,
+                feature_hash,
+                threshold["version"],
+                threshold["model_name"],
+                threshold["model_version"],
+                manifest.manifest_hash,
+            ),
+        )
+        run_id = conn.execute(
+            """
+            INSERT INTO voice_verification_runs(
+                job_id, candidate_id, input_hash, output_hash, proposal,
+                result_code, completed_at
+            ) VALUES (?, ?, ?, ?, 'likely_present', 'VOICE_PROPOSAL_READY',
+                      '2026-08-15T00:00:00.000000Z')
+            """,
+            (voice_job_id, candidate["id"], "c" * 64, "d" * 64),
+        ).lastrowid
+        conn.execute(
+            """
+            INSERT INTO voice_verification_segments(
+                run_id, ordinal, start_ms, end_ms, raw_match_score,
+                evidence_hash
+            ) VALUES (?, 1, 1000, 3000, 0.75, ?)
+            """,
+            (run_id, "e" * 64),
+        )
+        conn.execute(
+            """
+            INSERT INTO voice_verification_reviews(
+                run_id, action, actor, reason, prior_presence_decision_id,
+                prior_presence_decision_hash, review_hash, reviewed_at
+            ) VALUES (?, 'hold', 'local_user', 'needs another listen', ?, ?, ?,
+                      '2026-08-15T00:00:00.000000Z')
+            """,
+            (
+                run_id,
+                candidate["current_presence_decision_id"],
+                candidate["decision_hash"],
+                "1" * 64,
+            ),
         )
         conn.execute(
             """
@@ -149,7 +255,7 @@ def populated_database(tmp_path_factory) -> Path:
             INSERT INTO video_pipeline_job_bindings(job_id, candidate_id)
             VALUES (900103, ?)
             """,
-            (candidate_id,),
+            (candidate["id"],),
         )
         database_path = fixture.settings.database_path
     return database_path
@@ -168,6 +274,12 @@ _COLLISION_TABLES = (
     ("transcript_segments", "IMMUTABLE_TRANSCRIPT_BODY"),
     ("speaker_threshold_configs", "APPEND_ONLY"),
     ("voice_reference_profiles", "APPEND_ONLY"),
+    ("voice_reference_clips", "IMMUTABLE_VOICE_REFERENCE"),
+    ("voice_reference_features", "IMMUTABLE_VOICE_REFERENCE"),
+    ("voice_verification_manifests", "IMMUTABLE_VOICE_MANIFEST"),
+    ("voice_verification_runs", "IMMUTABLE_VOICE_RUN"),
+    ("voice_verification_segments", "IMMUTABLE_VOICE_RUN"),
+    ("voice_verification_reviews", "IMMUTABLE_VOICE_REVIEW"),
     ("jobs", "IMMUTABLE_JOB_MANIFEST"),
     ("job_units", "IMMUTABLE_JOB_MANIFEST"),
     ("job_unit_attempts", "APPEND_ONLY"),
@@ -191,6 +303,98 @@ _COLLISION_TABLES = (
     ("video_pipeline_job_binding_sets", "IMMUTABLE_JOB_BINDING"),
     ("video_pipeline_job_bindings", "IMMUTABLE_JOB_BINDING"),
 )
+
+
+@pytest.mark.parametrize(
+    ("table", "error_code"),
+    (
+        ("voice_reference_clips", "IMMUTABLE_VOICE_REFERENCE"),
+        ("voice_reference_features", "IMMUTABLE_VOICE_REFERENCE"),
+        ("voice_verification_manifests", "IMMUTABLE_VOICE_MANIFEST"),
+        ("voice_verification_runs", "IMMUTABLE_VOICE_RUN"),
+        ("voice_verification_segments", "IMMUTABLE_VOICE_RUN"),
+        ("voice_verification_reviews", "IMMUTABLE_VOICE_REVIEW"),
+    ),
+)
+def test_voice_records_reject_raw_update_and_delete(
+    populated_database, table, error_code
+):
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        row = conn.execute(f"SELECT * FROM {table} ORDER BY 1 LIMIT 1").fetchone()
+        assert row is not None, table
+        first_column = row.keys()[0]
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match=error_code):
+            conn.execute(
+                f"UPDATE {table} SET {first_column}={first_column} WHERE rowid=?",
+                (row["id"],),
+            )
+        conn.execute("ROLLBACK")
+
+        conn.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match=error_code):
+            conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["id"],))
+        conn.execute("ROLLBACK")
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
+
+
+def test_presence_tables_reject_replace_with_logical_identity(
+    populated_database,
+) -> None:
+    conn = sqlite3.connect(populated_database, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        cases = (
+            ("voice_reference_clips", {"id": 990001}, "IMMUTABLE_VOICE_REFERENCE"),
+            (
+                "voice_reference_features",
+                {"id": 990002},
+                "IMMUTABLE_VOICE_REFERENCE",
+            ),
+            (
+                "voice_verification_manifests",
+                {"id": 990003},
+                "IMMUTABLE_VOICE_MANIFEST",
+            ),
+            ("voice_verification_runs", {"id": 990004}, "IMMUTABLE_VOICE_RUN"),
+            (
+                "voice_verification_segments",
+                {"id": 990005},
+                "IMMUTABLE_VOICE_RUN",
+            ),
+            (
+                "voice_verification_reviews",
+                {"id": 990006},
+                "IMMUTABLE_VOICE_REVIEW",
+            ),
+        )
+        for table, overrides, error_code in cases:
+            row = conn.execute(f"SELECT * FROM {table} ORDER BY 1 LIMIT 1").fetchone()
+            values = dict(row)
+            values.update(overrides)
+            columns = tuple(values)
+            conn.execute("BEGIN")
+            with pytest.raises(sqlite3.IntegrityError, match=error_code):
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    tuple(values[column] for column in columns),
+                )
+            conn.execute("ROLLBACK")
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
 
 
 @pytest.mark.parametrize(

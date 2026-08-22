@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncServic
 
 CUTOVER = "0018_youtube_discovery_cutover"
 SEED_CHANNEL_MIGRATION = "0019_market_masters_seed_channel"
+PRESENCE_MIGRATION = "0020_presence_verification"
 OLD_MARKET_MASTERS_CHANNEL_ID = "UCJ1DVBLVpe4FvBZZ94kreaQ"
 CURRENT_MARKET_MASTERS_CHANNEL_ID = "UCXvjRTXoDa8tKwdkTaukGug"
 
@@ -73,7 +75,13 @@ EXPECTED_TABLES = (
     "video_pipeline_job_binding_sets",
     "video_pipeline_job_bindings",
     "videos",
+    "voice_reference_clips",
+    "voice_reference_features",
     "voice_reference_profiles",
+    "voice_verification_manifests",
+    "voice_verification_reviews",
+    "voice_verification_runs",
+    "voice_verification_segments",
     "youtube_daily_sync_requests",
     "youtube_quota_reservations",
     "youtube_search_windows",
@@ -239,7 +247,33 @@ EXPECTED_TRIGGERS = (
     "videos_limited_update",
     "videos_no_delete",
     "videos_no_replace",
+    "voice_reference_clips_no_delete",
+    "voice_reference_clips_no_replace",
+    "voice_reference_clips_no_update",
+    "voice_reference_clips_require_contiguous_ordinal",
+    "voice_reference_clips_require_owner",
+    "voice_reference_features_no_delete",
+    "voice_reference_features_no_replace",
+    "voice_reference_features_no_update",
+    "voice_reference_features_require_owner",
     "voice_reference_profiles_no_replace",
+    "voice_verification_manifests_no_delete",
+    "voice_verification_manifests_no_replace",
+    "voice_verification_manifests_no_update",
+    "voice_verification_manifests_require_owner",
+    "voice_verification_reviews_no_delete",
+    "voice_verification_reviews_no_replace",
+    "voice_verification_reviews_no_update",
+    "voice_verification_reviews_require_owner",
+    "voice_verification_runs_no_delete",
+    "voice_verification_runs_no_replace",
+    "voice_verification_runs_no_update",
+    "voice_verification_runs_require_owner",
+    "voice_verification_segments_no_delete",
+    "voice_verification_segments_no_replace",
+    "voice_verification_segments_no_update",
+    "voice_verification_segments_require_contiguous_ordinal",
+    "voice_verification_segments_require_owner",
     "youtube_daily_sync_requests_no_delete",
     "youtube_daily_sync_requests_no_replace",
     "youtube_daily_sync_requests_no_update",
@@ -269,6 +303,29 @@ NEW_APPEND_ONLY_TABLES = (
     "presence_decisions",
     "youtube_quota_reservations",
 )
+
+HISTORICAL_MIGRATION_HASHES = {
+    "0001_foundation.sql": "1a64290735d594986b6dd6224bd421a2db69d718708d635cdd4187e20df0e9e8",
+    "0002_audit.sql": "103d04a729ed11d50acecf360ec40a048a2b621a133be62eb6c61508dd859867",
+    "0003_sources.sql": "4b655e9133ddd74c746ff9bc531cc4a91c79adbf8721f388302af32dffc2c48e",
+    "0004_speakers.sql": "30aab01dc33490847e311aec5e55b518ca77edfb27d3181b12fd6a6d5f8fba71",
+    "0005_jobs.sql": "a4051c7963a32502de8bfb09d1b1888734965d95e706f99c7da88863dab7ec09",
+    "0006_analysis_runs.sql": "9988bef53fc61c914c3c75a081fea993f76e2712535674fadf6200790c6be962",
+    "0007_analysis_outputs.sql": "c300bdc7b6e72f203e783e9221668f5646b67f6b8dc4e55168d39bee3ea9eef2",
+    "0008_statements.sql": "14af6d968014b833bf440f1716d7d03d7a9f585b3b182e89e5fc7b1254ad1185",
+    "0009_periods.sql": "7ac36ea8e8ec2b59729573a76d60db272680feef6176a90f13205581dfd25435",
+    "0010_asset_mappings.sql": "f6b75423878ae5906b299e537357335818fb0661a67dbe3fe8bc8cfa97759f21",
+    "0011_mapping_reviews.sql": "2f661a5ff45e782fb078740cd4d89d04ed9baed7e1b3206478c65ad0c3b60130",
+    "0012_forecast_projections.sql": "b867d6fbb51ee974577a172911d07727f74cd9405fa7dc2440df81efaeb52c85",
+    "0013_current_results.sql": "16140c03b15419c9906c82e5ef9b5551bd5d4dbd8111eede773e21e1b22280d8",
+    "0013_video_pipeline_bindings.sql": "dd4b8f12bb1e198885a0cc579aa64deb7526c0c9e5ba168c20c3473b5c66cedb",
+    "0014_heatmap.sql": "abc37a1f80ddf1ea3aad78a0161e0eb1c74befd610a5c5785edcc7d22dd1685a",
+    "0015_retention.sql": "4b35b98ce412bcfd9a2d054598ca07a1a5f9d019da0958fed8bd8bde223f0054",
+    "0016_scope_generations.sql": "998051a89d36d8363127a69455fd142bfbcf90b0a2db5d13bf9bb9d02f73c12a",
+    "0017_append_only_guards.sql": "9b87ef9ce2a541733d4cf4081302940770455f3a6a5fdce4637fa9b804742769",
+    "0018_youtube_discovery_cutover.sql": "d143a406497e000f218d0bfd34c4d34192558d6453439f87125c78580d3b480e",
+    "0019_market_masters_seed_channel.sql": "2191b1a9bd1675084d35d224b65ba1b69b3a0ceee917202225d13f95af57856f",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +560,21 @@ def _columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
     return tuple(row["name"] for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _unique_column_sets(
+    conn: sqlite3.Connection, table: str
+) -> frozenset[tuple[str, ...]]:
+    return frozenset(
+        tuple(
+            row["name"]
+            for row in conn.execute(
+                'PRAGMA index_info("' + index["name"].replace('"', '""') + '")'
+            )
+        )
+        for index in conn.execute(f"PRAGMA index_list({table})")
+        if index["unique"]
+    )
+
+
 def _migration_names(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(
         row["name"]
@@ -578,7 +650,7 @@ def test_seed_channel_migration_changes_only_exact_retired_configuration(
             )
 
         applied = apply_migrations(conn)
-        assert applied == (SEED_CHANNEL_MIGRATION,)
+        assert applied == (SEED_CHANNEL_MIGRATION, PRESENCE_MIGRATION)
         repository = DiscoveryRepository(conn)
         current = repository.get_current_profile_version(subject_id)
         assert current.seed_channel_ids == (expected_seed,)
@@ -672,7 +744,10 @@ def test_retired_seed_failed_job_is_stopped_before_new_profile_job_is_created(
         )
         old_manifest = discovery.get_youtube_sync_manifest(old_request.job_id)
 
-        assert apply_migrations(conn) == (SEED_CHANNEL_MIGRATION,)
+        assert apply_migrations(conn) == (
+            SEED_CHANNEL_MIGRATION,
+            PRESENCE_MIGRATION,
+        )
         bootstrap_reference_data(conn)
         assert JobStateService(conn).request_stop(old_request.job_id) is (
             JobStatus.STOPPED
@@ -773,7 +848,220 @@ def test_fresh_database_finishes_with_only_collection_model_schema(db):
         "job_id",
         "candidate_id",
     )
+    assert _columns(db, "voice_reference_clips") == (
+        "id",
+        "reference_profile_id",
+        "ordinal",
+        "clip_kind",
+        "subject_id",
+        "video_id",
+        "start_ms",
+        "end_ms",
+        "normalized_audio_sha256",
+        "approval_actor",
+        "approval_reason",
+        "approved_at",
+        "clip_hash",
+    )
+    assert _columns(db, "voice_reference_features") == (
+        "id",
+        "reference_profile_id",
+        "encoding_version",
+        "float_dtype",
+        "dimension",
+        "embedding_blob",
+        "feature_sha256",
+        "created_at",
+    )
+    assert _columns(db, "voice_verification_manifests") == (
+        "id",
+        "job_id",
+        "candidate_id",
+        "video_id",
+        "profile_id",
+        "presence_decision_id",
+        "presence_decision_hash",
+        "reference_profile_id",
+        "reference_feature_hash",
+        "threshold_config_version",
+        "model_name",
+        "model_version",
+        "adapter_version",
+        "vad_contract_version",
+        "selection_contract_version",
+        "manifest_hash",
+        "created_at",
+    )
+    assert _columns(db, "voice_verification_runs") == (
+        "id",
+        "job_id",
+        "candidate_id",
+        "input_hash",
+        "output_hash",
+        "proposal",
+        "result_code",
+        "completed_at",
+    )
+    assert _columns(db, "voice_verification_segments") == (
+        "id",
+        "run_id",
+        "ordinal",
+        "start_ms",
+        "end_ms",
+        "raw_match_score",
+        "evidence_hash",
+    )
+    assert _columns(db, "voice_verification_reviews") == (
+        "id",
+        "run_id",
+        "action",
+        "actor",
+        "reason",
+        "prior_presence_decision_id",
+        "prior_presence_decision_hash",
+        "review_hash",
+        "reviewed_at",
+    )
+    assert _unique_column_sets(db, "voice_reference_clips") >= {
+        ("reference_profile_id", "ordinal"),
+    }
+    assert _unique_column_sets(db, "voice_reference_features") >= {
+        ("reference_profile_id",),
+    }
+    assert _unique_column_sets(db, "voice_verification_manifests") >= {
+        ("job_id",),
+        ("candidate_id", "manifest_hash"),
+    }
+    assert _unique_column_sets(db, "voice_verification_runs") >= {
+        ("job_id",),
+        ("candidate_id", "output_hash"),
+    }
+    assert _unique_column_sets(db, "voice_verification_segments") >= {
+        ("run_id", "ordinal"),
+    }
+    assert _unique_column_sets(db, "voice_verification_reviews") >= {
+        ("run_id",),
+    }
     assert CUTOVER in _migration_names(db)
+    assert PRESENCE_MIGRATION in _migration_names(db)
+
+
+def test_historical_migrations_remain_byte_identical() -> None:
+    migration_root = resources.files("market_voice_forecast_ledger.db.migrations")
+
+    assert {
+        name: hashlib.sha256(migration_root.joinpath(name).read_bytes()).hexdigest()
+        for name in HISTORICAL_MIGRATION_HASHES
+    } == HISTORICAL_MIGRATION_HASHES
+
+
+def test_presence_schema_rejects_invalid_enums_ordinals_ranges_scores_and_tokens(
+    db,
+) -> None:
+    db.execute("PRAGMA foreign_keys=OFF")
+    for trigger in (
+        "voice_reference_clips_require_contiguous_ordinal",
+        "voice_reference_clips_require_owner",
+        "voice_reference_features_require_owner",
+        "voice_verification_manifests_require_owner",
+        "voice_verification_runs_require_owner",
+        "voice_verification_segments_require_contiguous_ordinal",
+        "voice_verification_segments_require_owner",
+        "voice_verification_reviews_require_owner",
+    ):
+        db.execute(f"DROP TRIGGER {trigger}")
+
+    valid_hash = "a" * 64
+    clip_sql = """
+        INSERT INTO voice_reference_clips(
+            id, reference_profile_id, ordinal, clip_kind, subject_id, video_id,
+            start_ms, end_ms, normalized_audio_sha256, approval_actor,
+            approval_reason, approved_at, clip_hash
+        ) VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, 'local_user', 'clear speech',
+                  '2026-08-22T00:00:00.000000Z', ?)
+    """
+    for values in (
+        (1, 1, 0, "enrollment", 0, 1, valid_hash, valid_hash),
+        (2, 2, 1, "unknown", 0, 1, valid_hash, valid_hash),
+        (3, 3, 1, "negative", 1, 1, valid_hash, valid_hash),
+        (4, 4, 1, "held_out_positive", 0, 1, "short", valid_hash),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(clip_sql, values)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """
+            INSERT INTO voice_reference_features(
+                reference_profile_id, encoding_version, float_dtype, dimension,
+                embedding_blob, feature_sha256, created_at
+            ) VALUES (1, 'bad version', 'float32', 4, X'00000000', ?,
+                      '2026-08-22T00:00:00.000000Z')
+            """,
+            (valid_hash,),
+        )
+
+    manifest_sql = """
+        INSERT INTO voice_verification_manifests(
+            job_id, candidate_id, video_id, profile_id, presence_decision_id,
+            presence_decision_hash, reference_profile_id,
+            reference_feature_hash, threshold_config_version, model_name,
+            model_version, adapter_version, vad_contract_version,
+            selection_contract_version, manifest_hash, created_at
+        ) VALUES (1, 1, 1, 1, 1, ?, 1, ?, 'threshold-v1', 'bad/model',
+                  'model-v1', 'adapter-v1', 'vad-v1', 'selection-v1', ?,
+                  '2026-08-22T00:00:00.000000Z')
+    """
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(manifest_sql, (valid_hash, valid_hash, valid_hash))
+
+    run_sql = """
+        INSERT INTO voice_verification_runs(
+            job_id, candidate_id, input_hash, output_hash, proposal,
+            result_code, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, '2026-08-22T00:00:00.000000Z')
+    """
+    for values in (
+        (1, 1, valid_hash, valid_hash, "confirmed", "VOICE_READY"),
+        (2, 2, "short", valid_hash, "needs_review", "VOICE_READY"),
+        (3, 3, valid_hash, valid_hash, "likely_absent", "bad result"),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(run_sql, values)
+
+    segment_sql = """
+        INSERT INTO voice_verification_segments(
+            run_id, ordinal, start_ms, end_ms, raw_match_score, evidence_hash
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """
+    for values in (
+        (1, 0, 0, 1, 0.1, valid_hash),
+        (2, 1, 1, 1, 0.1, valid_hash),
+        (3, 1, 0, 1, 1_000_000.1, valid_hash),
+        (4, 1, 0, 1, 0.1, "short"),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(segment_sql, values)
+    segment_schema = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='voice_verification_segments'"
+    ).fetchone()["sql"]
+    assert "raw_match_score = raw_match_score" in segment_schema
+
+    review_sql = """
+        INSERT INTO voice_verification_reviews(
+            run_id, action, actor, reason, prior_presence_decision_id,
+            prior_presence_decision_hash, review_hash, reviewed_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, '2026-08-22T00:00:00.000000Z')
+    """
+    for values in (
+        (1, "approve", "local_user", "clear", valid_hash, valid_hash),
+        (2, "hold", "remote_user", "clear", valid_hash, valid_hash),
+        (3, "reject", "local_user", "", valid_hash, valid_hash),
+        (4, "confirm", "local_user", "x" * 241, valid_hash, valid_hash),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(review_sql, values)
 
 
 def test_final_schema_rejects_legacy_organization_rule_evidence(db):
