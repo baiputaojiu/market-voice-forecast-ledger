@@ -330,6 +330,7 @@ def _reject_startup_hook(relative: str) -> None:
     name = relative.rsplit("/", 1)[-1].casefold()
     if (
         name.endswith(".pth")
+        or name.endswith("._pth")
         or name.startswith("sitecustomize.")
         or name.startswith("usercustomize.")
     ):

@@ -72,6 +72,7 @@ class MediaAcquirer:
         work_dir: Path | None = None
         work_identity: _DirectoryIdentity | None = None
         download_path: Path | None = None
+        download_part_path: Path | None = None
         try:
             if not callable(self._runner) or not isinstance(
                 self._attestation, RuntimeAttestation
@@ -86,6 +87,7 @@ class MediaAcquirer:
             download_path = _new_private_target(
                 work_dir / "source.media", work_dir
             )
+            download_part_path = work_dir / "source.media.part"
             _require_inventory(work_dir, ())
             yt_dlp_identity = _require_attested_file(
                 self._attestation.yt_dlp_path,
@@ -103,6 +105,7 @@ class MediaAcquirer:
                 "--no-config-locations",
                 "--no-plugin-dirs",
                 "--no-cache-dir",
+                "--no-part",
                 "--downloader",
                 "native",
                 "--no-playlist",
@@ -158,6 +161,12 @@ class MediaAcquirer:
         except Exception:
             _remove_unregistered_target(
                 download_path,
+                work_dir,
+                self._private_work_root,
+                work_identity,
+            )
+            _remove_unregistered_target(
+                download_part_path,
                 work_dir,
                 self._private_work_root,
                 work_identity,
@@ -466,7 +475,8 @@ def _remove_unregistered_target(
             verified_work != work_dir
             or _directory_identity(verified_work) != expected_work_identity
             or target.parent != verified_work
-            or target.name not in {"source.media", "normalized.wav"}
+            or target.name
+            not in {"source.media", "source.media.part", "normalized.wav"}
         ):
             return
         target_stat = os.lstat(target)

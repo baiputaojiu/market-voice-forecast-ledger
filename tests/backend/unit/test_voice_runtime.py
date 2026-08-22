@@ -7,7 +7,11 @@ import pytest
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.voice import runtime
-from market_voice_forecast_ledger.voice.runtime import RuntimeAllowlists, attest_runtime
+from market_voice_forecast_ledger.voice.runtime import (
+    RuntimeAllowlists,
+    attest_runtime,
+    verify_runtime_startup,
+)
 
 
 def _write(path: Path, contents: bytes) -> str:
@@ -300,6 +304,39 @@ def test_runtime_rejects_private_python_startup_hooks(
 
     with pytest.raises(DomainError, match="voice runtime is invalid"):
         attest_runtime(settings, version_probe=probe, allowlists=allowlists)
+
+
+@pytest.mark.parametrize(
+    "hook_name", ("python._pth", "python314._pth", "PYTHON314._PTH")
+)
+def test_runtime_rejects_windows_python_path_override_before_probes(
+    tmp_path: Path, hook_name: str
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    (settings.voice_runtime_dir / hook_name).write_text(
+        "C:/private-alternate-import-root\nimport site\n", encoding="utf-8"
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid"):
+        attest_runtime(settings, version_probe=probe, allowlists=allowlists)
+
+    assert probe.calls == []
+
+
+@pytest.mark.parametrize("hook_name", ("python._pth", "PYTHON314._PTH"))
+def test_verify_runtime_startup_rejects_late_windows_python_path_override(
+    tmp_path: Path, hook_name: str
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+    (settings.voice_runtime_dir / hook_name).write_text(
+        "C:/private-alternate-import-root\nimport site\n", encoding="utf-8"
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid"):
+        verify_runtime_startup(attestation, settings.data_dir)
 
 
 def test_runtime_rejects_system_site_packages_in_pyvenv_config(

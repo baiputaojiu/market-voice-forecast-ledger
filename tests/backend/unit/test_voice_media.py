@@ -79,6 +79,25 @@ class _FakePopen:
         self.killed = True
 
 
+class _PartialYtDlpRunner:
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(
+        self, argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        self.calls.append(tuple(argv))
+        output = Path(argv[argv.index("-o") + 1])
+        if len(self.calls) == 1:
+            Path(f"{output}.part").write_bytes(b"realistic-partial-media")
+            if self.failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, 1)
+            return subprocess.CompletedProcess(argv, 7)
+        output.write_bytes(b"complete-media")
+        return subprocess.CompletedProcess(argv, 0)
+
+
 def test_downloader_uses_fixed_attested_argv_hidden_window_and_discarded_output(
     tmp_path: Path,
 ) -> None:
@@ -113,6 +132,7 @@ def test_downloader_uses_fixed_attested_argv_hidden_window_and_discarded_output(
             "--no-config-locations",
             "--no-plugin-dirs",
             "--no-cache-dir",
+            "--no-part",
             "--downloader",
             "native",
             "--no-playlist",
@@ -263,6 +283,40 @@ def test_acquisition_removes_only_its_partial_target_and_can_retry(
     result = acquirer.acquire("abcdefghijk", job_dir)
     assert result.path.read_bytes() == b"complete"
     assert registered.read_bytes() == b"registered-private-artifact"
+
+
+@pytest.mark.parametrize("failure", ("timeout", "nonzero"))
+def test_acquisition_removes_known_yt_dlp_part_and_retry_reaches_runner(
+    tmp_path: Path, failure: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "job-1"
+    job_dir.mkdir()
+    other_job = work_root / "other-job"
+    other_job.mkdir()
+    unrelated = other_job / "source.media.part"
+    unrelated.write_bytes(b"preserve-unrelated")
+    runner = _PartialYtDlpRunner(failure)
+    acquirer = MediaAcquirer(
+        runner, attestation, work_root, source_environment={}
+    )
+
+    with pytest.raises(DomainError, match="media acquisition failed"):
+        acquirer.acquire("abcdefghijk", job_dir)
+
+    retry_error: DomainError | None = None
+    result = None
+    try:
+        result = acquirer.acquire("abcdefghijk", job_dir)
+    except DomainError as error:
+        retry_error = error
+
+    assert len(runner.calls) == 2
+    assert retry_error is None
+    assert result is not None
+    assert result.path.read_bytes() == b"complete-media"
+    assert not (job_dir / "source.media.part").exists()
+    assert unrelated.read_bytes() == b"preserve-unrelated"
 
 
 @pytest.mark.parametrize("failure", ("timeout", "nonzero"))
@@ -817,6 +871,23 @@ def test_process_rejects_private_startup_hook_before_spawn(tmp_path: Path) -> No
     site_packages.mkdir(parents=True, exist_ok=True)
     (site_packages / "attacker.pth").write_text(
         "import private_startup_hook", encoding="utf-8"
+    )
+    runner = FakeAdapterRunner()
+
+    with pytest.raises(DomainError, match="voice adapter process failed"):
+        VoiceAdapterProcess(runner, attestation, work_root).score(request)
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("hook_name", ("python._pth", "python314._pth"))
+def test_process_rejects_windows_python_path_override_before_spawn(
+    tmp_path: Path, hook_name: str
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    request = valid_adapter_request(attestation, work_root)
+    (attestation.python_path.parent / hook_name).write_text(
+        "C:/private-alternate-import-root\nimport site\n", encoding="utf-8"
     )
     runner = FakeAdapterRunner()
 
