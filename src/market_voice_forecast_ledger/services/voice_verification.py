@@ -1,10 +1,11 @@
 import re
 import sqlite3
+import unicodedata
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
-from typing import Final
+from typing import Final, Literal
 
 from market_voice_forecast_ledger.db.connection import transaction
 from market_voice_forecast_ledger.domain.common import (
@@ -20,7 +21,9 @@ from market_voice_forecast_ledger.domain.discovery import (
 from market_voice_forecast_ledger.domain.enums import JobStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import (
+    ReviewAction,
     VoiceManifestSnapshot,
+    VoiceProposal,
     build_presence_job_manifest,
 )
 from market_voice_forecast_ledger.repositories.discovery import (
@@ -30,8 +33,10 @@ from market_voice_forecast_ledger.repositories.jobs import JobRepository
 from market_voice_forecast_ledger.repositories.voice_verification import (
     ReferenceBundle,
     StoredCalibrationIdentity,
+    StoredVoiceRun,
     VoiceVerificationRepository,
 )
+from market_voice_forecast_ledger.services.audit import validate_audit_reason
 from market_voice_forecast_ledger.services.job_state import JobStateService
 
 
@@ -41,6 +46,12 @@ _CALIBRATION_VERSION_PREFIX = "voice-calibration-"
 _SQLITE_INT_MAX = 2**63 - 1
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
+_YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?:(?<![A-Za-z0-9])[a-z]:[\\/]"
+    r"|(?<![\\/])(?:\\\\|//)[^\\/\s]"
+    r"|(?<![A-Za-z0-9/])/(?!/)[^/\s])"
+)
 _INACTIVE_BOUND_JOB_STATUSES = frozenset(
     {JobStatus.STOPPED, JobStatus.SUCCEEDED}
 )
@@ -109,6 +120,43 @@ class PilotCreation:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewCommand:
+    run_id: int
+    action: ReviewAction
+    reason: str
+    actor: Literal["local_user"]
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSegmentDetail:
+    start_ms: int
+    end_ms: int
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewDetail:
+    person_display_name: str
+    watch_url: str
+    youtube_video_id: str
+    segments: tuple[ReviewSegmentDetail, ...]
+    proposal: VoiceProposal
+    model_name: str
+    model_version: str
+    adapter_version: str
+    threshold_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewResult:
+    review_id: int
+    run_id: int
+    action: ReviewAction
+    current_presence_decision_id: int
+    current_state: PresenceState
+
+
 class PresenceVerificationService:
     def __init__(
         self,
@@ -136,6 +184,281 @@ class PresenceVerificationService:
         self._jobs = JobRepository(conn)
         self._job_state = JobStateService(conn, clock=self._clock)
         self._voice = VoiceVerificationRepository(conn, clock=self._clock)
+
+    def list_pending_reviews(self) -> tuple[ReviewDetail, ...]:
+        error: DomainError | None = None
+        try:
+            owns_transaction = not self._conn.in_transaction
+            if owns_transaction:
+                self._conn.execute("BEGIN")
+            try:
+                runs = self._voice.list_pending_reviews()
+                return tuple(self._review_detail(run.id) for run in runs)
+            finally:
+                if owns_transaction:
+                    self._conn.rollback()
+        except Exception:
+            error = _review_unavailable_error()
+        if error is not None:
+            raise error
+        raise _review_unavailable_error()
+
+    def show_review(self, run_id: int) -> ReviewDetail:
+        if not _positive_sqlite_int(run_id):
+            raise _review_invalid_error()
+        error: DomainError | None = None
+        try:
+            owns_transaction = not self._conn.in_transaction
+            if owns_transaction:
+                self._conn.execute("BEGIN")
+            try:
+                return self._review_detail(run_id)
+            finally:
+                if owns_transaction:
+                    self._conn.rollback()
+        except Exception:
+            error = _review_unavailable_error()
+        if error is not None:
+            raise error
+        raise _review_unavailable_error()
+
+    def review(self, command: ReviewCommand) -> ReviewResult:
+        validation_error: DomainError | None = None
+        try:
+            self._validate_review_command(command)
+        except Exception:
+            validation_error = _review_invalid_error()
+        if validation_error is not None:
+            raise validation_error
+        if self._conn.in_transaction:
+            raise DomainError(
+                "PRESENCE_REVIEW_TRANSACTION_ACTIVE",
+                "presence review owns its transaction",
+            )
+
+        result: ReviewResult | None = None
+        storage_error: DomainError | None = None
+        try:
+            with transaction(self._conn):
+                self._require_pending_review(command.run_id)
+                self._review_detail(command.run_id)
+                review_id = self._voice.add_review_and_decision(command)
+                result = self._review_result(command, review_id)
+        except DomainError as cause:
+            if cause.code == "PRESENCE_REVIEW_STALE":
+                storage_error = _review_stale_error()
+            else:
+                storage_error = _review_failed_error()
+        except Exception:
+            storage_error = _review_failed_error()
+        if storage_error is not None:
+            raise storage_error
+        if result is None:
+            raise _review_failed_error()
+        return result
+
+    def _validate_review_command(self, command: object) -> None:
+        if (
+            type(command) is not ReviewCommand
+            or not _positive_sqlite_int(command.run_id)
+            or type(command.action) is not ReviewAction
+            or type(command.reason) is not str
+            or not 1 <= len(command.reason) <= 240
+            or type(command.actor) is not str
+            or command.actor != "local_user"
+        ):
+            raise _review_invalid_error()
+        validate_audit_reason(self._conn, command.reason)
+
+    def _require_pending_review(self, run_id: int) -> None:
+        row = self._conn.execute(
+            """
+            SELECT run.job_id, run.candidate_id AS run_candidate_id,
+                   manifest.candidate_id AS manifest_candidate_id,
+                   manifest.presence_decision_id,
+                   candidate.current_presence_decision_id,
+                   typeof(run.job_id) AS type_job_id,
+                   typeof(run.candidate_id) AS type_run_candidate_id,
+                   typeof(manifest.candidate_id) AS type_manifest_candidate_id,
+                   typeof(manifest.presence_decision_id) AS type_prior_id,
+                   typeof(candidate.current_presence_decision_id)
+                       AS type_current_id
+            FROM voice_verification_runs AS run
+            JOIN voice_verification_manifests AS manifest
+              ON manifest.job_id=run.job_id
+            JOIN subject_video_candidates AS candidate
+              ON candidate.id=run.candidate_id
+            WHERE run.id=?
+            """,
+            (run_id,),
+        ).fetchone()
+        if (
+            row is None
+            or any(
+                row[key] != "integer"
+                for key in (
+                    "type_job_id",
+                    "type_run_candidate_id",
+                    "type_manifest_candidate_id",
+                    "type_prior_id",
+                    "type_current_id",
+                )
+            )
+            or not _positive_sqlite_int(row["job_id"])
+            or not _positive_sqlite_int(row["run_candidate_id"])
+            or row["run_candidate_id"] != row["manifest_candidate_id"]
+        ):
+            raise ValueError("presence review identity is invalid")
+        review_rows = tuple(
+            self._conn.execute(
+                """
+                SELECT id, typeof(id) AS type_id
+                FROM voice_verification_reviews
+                WHERE run_id=? ORDER BY id
+                """,
+                (run_id,),
+            )
+        )
+        if review_rows:
+            raise _review_stale_error()
+        if row["current_presence_decision_id"] != row["presence_decision_id"]:
+            raise _review_stale_error()
+
+    def _review_detail(self, run_id: int) -> ReviewDetail:
+        run = self._voice.get_run(run_id)
+        artifacts = self._voice.require_job_artifacts(run.job_id)
+        job = self._job_state.require_canonical_video_pipeline_job(run.job_id)
+        if (
+            job.status is not JobStatus.SUCCEEDED
+            or artifacts.run is None
+            or artifacts.run != run
+        ):
+            raise ValueError("presence review job is incomplete")
+        frozen = self._discovery.get_presence_decision(
+            artifacts.manifest.snapshot.presence_decision_id
+        )
+        if (
+            frozen.candidate_id != run.candidate_id
+            or frozen.state is not PresenceState.UNVERIFIED
+            or frozen.decision_hash
+            != artifacts.manifest.snapshot.presence_decision_hash
+        ):
+            raise ValueError("presence review prior decision is invalid")
+        identity = self._review_public_identity(run)
+        rounded_segments = tuple(
+            ReviewSegmentDetail(
+                start_ms=segment.start_ms,
+                end_ms=segment.end_ms,
+                score=_round_public_score(segment.raw_match_score),
+            )
+            for segment in run.segments
+        )
+        if not rounded_segments:
+            raise ValueError("presence review segments are unavailable")
+        snapshot = artifacts.manifest.snapshot
+        return ReviewDetail(
+            person_display_name=identity["canonical_name"],
+            watch_url=(
+                "https://www.youtube.com/watch?v="
+                f"{identity['youtube_video_id']}"
+            ),
+            youtube_video_id=identity["youtube_video_id"],
+            segments=rounded_segments,
+            proposal=run.proposal,
+            model_name=snapshot.model_name,
+            model_version=snapshot.model_version,
+            adapter_version=snapshot.adapter_version,
+            threshold_version=snapshot.threshold_config_version,
+        )
+
+    def _review_public_identity(self, run: StoredVoiceRun) -> sqlite3.Row:
+        row = self._conn.execute(
+            """
+            SELECT subject.id AS subject_id, subject.canonical_name,
+                   video.youtube_video_id,
+                   typeof(subject.id) AS type_subject_id,
+                   typeof(subject.canonical_name) AS type_canonical_name,
+                   typeof(video.youtube_video_id) AS type_youtube_video_id
+            FROM voice_verification_runs AS run
+            JOIN voice_verification_manifests AS manifest
+              ON manifest.job_id=run.job_id
+            JOIN subject_video_candidates AS candidate
+              ON candidate.id=manifest.candidate_id
+             AND candidate.profile_id=manifest.profile_id
+             AND candidate.video_id=manifest.video_id
+            JOIN discovery_profiles AS profile ON profile.id=candidate.profile_id
+            JOIN analysis_subjects AS subject ON subject.id=profile.subject_id
+            JOIN videos AS video ON video.id=candidate.video_id
+            WHERE run.id=? AND run.candidate_id=candidate.id
+            """,
+            (run.id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["type_subject_id"] != "integer"
+            or row["type_canonical_name"] != "text"
+            or row["type_youtube_video_id"] != "text"
+            or not _positive_sqlite_int(row["subject_id"])
+            or row["subject_id"]
+            != self._voice.require_job_artifacts(run.job_id).reference.subject_id
+            or not _is_public_display_name(row["canonical_name"])
+            or type(row["youtube_video_id"]) is not str
+            or _YOUTUBE_VIDEO_ID.fullmatch(row["youtube_video_id"]) is None
+        ):
+            raise ValueError("presence review public identity is invalid")
+        return row
+
+    def _review_result(
+        self,
+        command: ReviewCommand,
+        review_id: int,
+    ) -> ReviewResult:
+        if not _positive_sqlite_int(review_id):
+            raise ValueError("presence review result identity is invalid")
+        run = self._voice.get_run(command.run_id)
+        artifacts = self._voice.require_job_artifacts(run.job_id)
+        job = self._job_state.require_canonical_video_pipeline_job(run.job_id)
+        row = self._conn.execute(
+            """
+            SELECT current_presence_decision_id,
+                   typeof(current_presence_decision_id) AS type_current_id
+            FROM subject_video_candidates WHERE id=?
+            """,
+            (run.candidate_id,),
+        ).fetchone()
+        if (
+            job.status is not JobStatus.SUCCEEDED
+            or artifacts.run != run
+            or row is None
+            or row["type_current_id"] != "integer"
+            or not _positive_sqlite_int(row["current_presence_decision_id"])
+        ):
+            raise ValueError("presence review result is invalid")
+        decision = self._discovery.get_presence_decision(
+            row["current_presence_decision_id"]
+        )
+        expected_state = {
+            ReviewAction.CONFIRM: PresenceState.CONFIRMED,
+            ReviewAction.REJECT: PresenceState.REJECTED,
+            ReviewAction.HOLD: PresenceState.UNVERIFIED,
+        }[command.action]
+        if (
+            decision.candidate_id != run.candidate_id
+            or decision.state is not expected_state
+            or (
+                command.action is ReviewAction.HOLD
+                and decision.id
+                != artifacts.manifest.snapshot.presence_decision_id
+            )
+        ):
+            raise ValueError("presence review result is invalid")
+        return ReviewResult(
+            review_id=review_id,
+            run_id=command.run_id,
+            action=command.action,
+            current_presence_decision_id=decision.id,
+            current_state=decision.state,
+        )
 
     def preview_pilot(self) -> PilotPreview:
         owns_transaction = not self._conn.in_transaction
@@ -782,6 +1105,53 @@ def _is_exact_utc(value: object) -> bool:
 
 def _positive_sqlite_int(value: object) -> bool:
     return type(value) is int and 0 < value <= _SQLITE_INT_MAX
+
+
+def _is_public_display_name(value: object) -> bool:
+    return (
+        type(value) is str
+        and 1 <= len(value) <= 200
+        and value == value.strip()
+        and not any(
+            unicodedata.category(character).startswith("C")
+            for character in value
+        )
+        and _ABSOLUTE_PATH.search(value) is None
+        and "file://" not in value.casefold()
+    )
+
+
+def _round_public_score(value: float) -> float:
+    rounded = round(value, 4)
+    return 0.0 if rounded == 0.0 else rounded
+
+
+def _review_invalid_error() -> DomainError:
+    return DomainError(
+        "PRESENCE_REVIEW_INVALID",
+        "presence review input is invalid",
+    )
+
+
+def _review_stale_error() -> DomainError:
+    return DomainError(
+        "PRESENCE_REVIEW_STALE",
+        "presence review is stale",
+    )
+
+
+def _review_unavailable_error() -> DomainError:
+    return DomainError(
+        "PRESENCE_REVIEW_UNAVAILABLE",
+        "presence review detail is unavailable",
+    )
+
+
+def _review_failed_error() -> DomainError:
+    return DomainError(
+        "PRESENCE_REVIEW_FAILED",
+        "presence review could not be saved",
+    )
 
 
 def _raise_insufficient() -> None:
