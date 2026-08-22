@@ -1,7 +1,9 @@
 import os
 import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +12,7 @@ from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.repositories.retention import RetentionRepository
+from market_voice_forecast_ledger.services import retention as retention_service
 from market_voice_forecast_ledger.services.retention import (
     AudioDeletionResult,
     RetentionService,
@@ -36,6 +39,80 @@ def settings(tmp_path):
     value = Settings.for_data_dir(tmp_path / "runtime")
     value.temp_audio_dir.mkdir(parents=True)
     return value
+
+
+def _install_synthetic_reparse(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reparse_path: Path,
+    candidate: Path,
+    followed_target: Path,
+    directory: bool = False,
+) -> None:
+    original_resolve = Path.resolve
+    original_lstat = os.lstat
+    reparse_stat = original_lstat(reparse_path)
+
+    def resolve(path: Path, *, strict: bool = False) -> Path:
+        if Path(path) == candidate:
+            return followed_target
+        return original_resolve(path, strict=strict)
+
+    def lstat(path: Path):
+        value = original_lstat(path)
+        if Path(path) != reparse_path:
+            return value
+        return SimpleNamespace(
+            st_dev=reparse_stat.st_dev,
+            st_file_attributes=getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+            ),
+            st_ino=reparse_stat.st_ino,
+            st_mode=(stat.S_IFDIR if directory else stat.S_IFLNK) | 0o700,
+        )
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(
+        retention_service,
+        "_lstat_retained_audio_path",
+        lstat,
+        raising=False,
+    )
+
+
+def _seed_synthetic_reparse_artifact(
+    db: sqlite3.Connection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    directory: bool = False,
+) -> tuple[RetentionRepository, int, Path, Path]:
+    link_job = settings.temp_audio_dir / "link-job"
+    target_job = settings.temp_audio_dir / "unrelated-job"
+    link_job.mkdir()
+    target_job.mkdir()
+    if directory:
+        followed_target = target_job / "keep"
+        followed_target.mkdir()
+        target_file = followed_target / "keep.wav"
+        link = link_job / "retained-junction"
+        link.mkdir()
+    else:
+        target_file = target_job / "keep.wav"
+        followed_target = target_file
+        link = link_job / "retained-link.wav"
+        link.write_bytes(b"synthetic-reparse-entry")
+    target_file.write_bytes(b"unrelated-private-audio")
+    _install_synthetic_reparse(
+        monkeypatch,
+        reparse_path=link,
+        candidate=link,
+        followed_target=followed_target,
+        directory=directory,
+    )
+    repository = RetentionRepository(db)
+    artifact_id = repository.add_audio_artifact(link, created_at=NOW)
+    return repository, artifact_id, link, target_file
 
 
 def test_audio_path_outside_dedicated_folder_is_refused_without_path_leak(
@@ -308,12 +385,162 @@ def test_plain_sqlite_replace_cannot_forge_audio_artifact_success(
     assert audio.exists()
 
 
-def test_symlink_escape_is_refused_where_supported(db, settings, tmp_path):
-    outside = tmp_path / "outside-target.wav"
-    outside.write_bytes(b"synthetic-audio")
-    link = settings.temp_audio_dir / "escape.wav"
+def test_retained_synthetic_reparse_unlinks_entry_without_following_target(
+    db, settings, monkeypatch
+):
+    repository, artifact_id, link, target = _seed_synthetic_reparse_artifact(
+        db, settings, monkeypatch
+    )
+
+    result = RetentionService(db, settings, clock=lambda: NOW).delete_audio(
+        artifact_id
+    )
+
+    assert result.deleted is True
+    assert result.already_absent is False
+    assert target.read_bytes() == b"unrelated-private-audio"
+    assert os.path.lexists(link) is False
+    assert repository.get_audio_artifact(artifact_id).status == "deleted"
+
+
+def test_retained_directory_reparse_uses_directory_removal_primitive(
+    db, settings, monkeypatch
+):
+    repository, artifact_id, link, target = _seed_synthetic_reparse_artifact(
+        db, settings, monkeypatch, directory=True
+    )
+
+    result = RetentionService(db, settings, clock=lambda: NOW).delete_audio(
+        artifact_id
+    )
+
+    assert result.deleted is True
+    assert target.read_bytes() == b"unrelated-private-audio"
+    assert os.path.lexists(link) is False
+    assert repository.get_audio_artifact(artifact_id).status == "deleted"
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_code"),
+    [
+        (PermissionError("private reparse detail"), "AUDIO_DELETE_PERMISSION"),
+        (OSError("private reparse detail"), "AUDIO_DELETE_OS_ERROR"),
+    ],
+)
+def test_retained_reparse_unlink_failure_remains_retryable(
+    db, settings, monkeypatch, failure, error_code
+):
+    repository, artifact_id, link, target = _seed_synthetic_reparse_artifact(
+        db, settings, monkeypatch
+    )
+
+    def fail_unlink(path: Path) -> None:
+        del path
+        raise failure
+
+    monkeypatch.setattr(
+        retention_service,
+        "_unlink_retained_audio_path",
+        fail_unlink,
+        raising=False,
+    )
+    result = RetentionService(db, settings, clock=lambda: NOW).delete_audio(
+        artifact_id
+    )
+
+    assert result.deleted is False
+    assert result.retryable is True
+    assert result.error_code == error_code
+    assert result.retry_count == 1
+    assert target.read_bytes() == b"unrelated-private-audio"
+    assert os.path.lexists(link) is True
+    stored = repository.get_audio_artifact(artifact_id)
+    assert stored.status == "delete_failed"
+    assert stored.safe_error_code == error_code
+
+
+def test_retained_audio_rejects_reparse_ancestor_without_following_it(
+    db, settings, monkeypatch
+):
+    link_job = settings.temp_audio_dir / "link-job"
+    target_job = settings.temp_audio_dir / "unrelated-job"
+    link_job.mkdir()
+    target_job.mkdir()
+    link = link_job / "retained.wav"
+    link.write_bytes(b"synthetic-entry")
+    target = target_job / "keep.wav"
+    target.write_bytes(b"unrelated-private-audio")
+    _install_synthetic_reparse(
+        monkeypatch,
+        reparse_path=link_job,
+        candidate=link,
+        followed_target=target,
+        directory=True,
+    )
+    repository = RetentionRepository(db)
+    artifact_id = repository.add_audio_artifact(link, created_at=NOW)
+
+    result = RetentionService(db, settings, clock=lambda: NOW).delete_audio(
+        artifact_id
+    )
+
+    assert result.deleted is False
+    assert result.retryable is True
+    assert result.error_code == "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
+    assert target.read_bytes() == b"unrelated-private-audio"
+    assert link.read_bytes() == b"synthetic-entry"
+    assert repository.get_audio_artifact(artifact_id).status == "delete_failed"
+
+
+def test_retained_audio_revalidates_final_entry_identity_before_unlink(
+    db, settings, monkeypatch
+):
+    repository, artifact_id, link, target = _seed_synthetic_reparse_artifact(
+        db, settings, monkeypatch
+    )
+    original_lstat = retention_service._lstat_retained_audio_path
+    observations = 0
+
+    def swapped_lstat(path: Path):
+        nonlocal observations
+        value = original_lstat(path)
+        if Path(path) != link:
+            return value
+        observations += 1
+        if observations == 1:
+            return value
+        return SimpleNamespace(
+            st_dev=value.st_dev,
+            st_file_attributes=value.st_file_attributes,
+            st_ino=value.st_ino + 1,
+            st_mode=value.st_mode,
+        )
+
+    monkeypatch.setattr(
+        retention_service, "_lstat_retained_audio_path", swapped_lstat
+    )
+    result = RetentionService(db, settings, clock=lambda: NOW).delete_audio(
+        artifact_id
+    )
+
+    assert result.deleted is False
+    assert result.retryable is True
+    assert result.error_code == "AUDIO_DELETE_OS_ERROR"
+    assert target.read_bytes() == b"unrelated-private-audio"
+    assert os.path.lexists(link) is True
+    assert repository.get_audio_artifact(artifact_id).status == "delete_failed"
+
+
+def test_symlink_entry_is_unlinked_without_following_target_where_supported(
+    db, settings
+):
+    target_job = settings.temp_audio_dir / "unrelated-job"
+    target_job.mkdir()
+    target = target_job / "keep.wav"
+    target.write_bytes(b"unrelated-private-audio")
+    link = settings.temp_audio_dir / "retained-link.wav"
     try:
-        link.symlink_to(outside)
+        link.symlink_to(target)
     except (NotImplementedError, OSError) as cause:
         pytest.skip(f"symlink creation unavailable: {type(cause).__name__}")
     artifact_id = RetentionRepository(db).add_audio_artifact(link, created_at=NOW)
@@ -322,9 +549,9 @@ def test_symlink_escape_is_refused_where_supported(db, settings, tmp_path):
         artifact_id
     )
 
-    assert result.error_code == "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
-    assert outside.exists()
-    assert link.exists()
+    assert result.deleted is True
+    assert target.read_bytes() == b"unrelated-private-audio"
+    assert os.path.lexists(link) is False
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows case semantics")
@@ -390,7 +617,7 @@ def test_generic_os_failure_is_safe_retryable_and_path_free(
         (OSError("private resolution detail"), "AUDIO_DELETE_OS_ERROR"),
     ],
 )
-def test_path_resolution_os_failures_keep_distinct_safe_retry_codes(
+def test_path_inventory_os_failures_keep_distinct_safe_retry_codes(
     db, settings, monkeypatch, failure, expected_code
 ):
     audio = settings.temp_audio_dir / "resolution-failure.wav"
@@ -398,18 +625,19 @@ def test_path_resolution_os_failures_keep_distinct_safe_retry_codes(
     artifact_id = RetentionRepository(db).add_audio_artifact(
         audio, created_at=NOW
     )
-    original_resolve = Path.resolve
+    original_lstat = os.lstat
 
-    def fail_candidate_resolution(path, *, strict=False):
+    def fail_candidate_inventory(path):
         if path == audio:
             raise failure
-        return original_resolve(path, strict=strict)
+        return original_lstat(path)
 
-    def forbidden_unlink(*args, **kwargs):
-        raise AssertionError("unlink must not run after resolution failure")
-
-    monkeypatch.setattr(Path, "resolve", fail_candidate_resolution)
-    monkeypatch.setattr(Path, "unlink", forbidden_unlink)
+    monkeypatch.setattr(
+        retention_service,
+        "_lstat_retained_audio_path",
+        fail_candidate_inventory,
+        raising=False,
+    )
 
     result = RetentionService(db, settings, clock=lambda: NOW).delete_audio(
         artifact_id

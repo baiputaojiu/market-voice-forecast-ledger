@@ -73,6 +73,25 @@ class AudioDeletionResult:
     deleted_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RetainedAudioIdentity:
+    device: int
+    inode: int
+    mode: int
+    reparse: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedAudioEntry:
+    path: Path
+    ancestors: tuple[tuple[Path, _RetainedAudioIdentity], ...]
+    identity: _RetainedAudioIdentity | None
+
+
+class _AudioPathOutsideError(ValueError):
+    pass
+
+
 def expiry_for(created_at: datetime, days: int | None) -> datetime | None:
     _validate_retention_days(days)
     created_at_utc = _require_utc_datetime(created_at)
@@ -270,20 +289,17 @@ class RetentionService:
                 deleted_at=artifact.deleted_at,
             )
 
-        resolved, resolution_error = _resolve_audio_path(
+        entry, resolution_error = _resolve_audio_path(
             self._settings.temp_audio_dir, artifact.local_path
         )
-        if resolved is None:
+        if entry is None:
             return self._record_audio_failure(
                 artifact.id,
                 resolution_error or "AUDIO_PATH_OUTSIDE_TEMP_ROOT",
             )
 
-        already_absent = False
         try:
-            resolved.unlink()
-        except FileNotFoundError:
-            already_absent = True
+            already_absent = _delete_retained_audio_entry(entry)
         except PermissionError:
             return self._record_audio_failure(
                 artifact.id, "AUDIO_DELETE_PERMISSION"
@@ -574,13 +590,13 @@ def _preview_token(
 
 
 def _resolved_safe_audio_path(root: object, candidate: object) -> Path | None:
-    resolved, _ = _resolve_audio_path(root, candidate)
-    return resolved
+    entry, _ = _resolve_audio_path(root, candidate)
+    return None if entry is None else entry.path
 
 
 def _resolve_audio_path(
     root: object, candidate: object
-) -> tuple[Path | None, str | None]:
+) -> tuple[_RetainedAudioEntry | None, str | None]:
     if not isinstance(root, Path) or not isinstance(candidate, Path):
         return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
     if "\x00" in str(root) or "\x00" in str(candidate):
@@ -588,41 +604,137 @@ def _resolve_audio_path(
     if not root.is_absolute() or not candidate.is_absolute():
         return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
     try:
-        resolved_root = root.resolve(strict=True)
-        root_stat = resolved_root.stat()
+        lexical_root = Path(os.path.abspath(root))
+        lexical_candidate = Path(os.path.abspath(candidate))
+        root_text = os.path.normcase(os.path.normpath(str(lexical_root)))
+        candidate_text = os.path.normcase(
+            os.path.normpath(str(lexical_candidate))
+        )
+        if candidate_text == root_text:
+            raise _AudioPathOutsideError
+        try:
+            common_path = os.path.commonpath((root_text, candidate_text))
+        except ValueError:
+            raise _AudioPathOutsideError from None
+        if common_path != root_text:
+            raise _AudioPathOutsideError
+        resolved_root = lexical_root.resolve(strict=True)
+        if os.path.normcase(os.path.normpath(str(resolved_root))) != root_text:
+            raise _AudioPathOutsideError
+        root_identity = _retained_audio_identity(lexical_root)
+        if root_identity.reparse or not stat.S_ISDIR(root_identity.mode):
+            raise _AudioPathOutsideError
+        relative = Path(os.path.relpath(lexical_candidate, lexical_root))
+        if not relative.parts or any(part == ".." for part in relative.parts):
+            raise _AudioPathOutsideError
+        ancestors: list[tuple[Path, _RetainedAudioIdentity]] = [
+            (lexical_root, root_identity)
+        ]
+        current = lexical_root
+        missing_ancestor = False
+        for part in relative.parts[:-1]:
+            current = current / part
+            try:
+                identity = _retained_audio_identity(current)
+            except FileNotFoundError:
+                missing_ancestor = True
+                break
+            if identity.reparse or not stat.S_ISDIR(identity.mode):
+                raise _AudioPathOutsideError
+            ancestors.append((current, identity))
+        identity = None
+        if not missing_ancestor:
+            try:
+                identity = _retained_audio_identity(lexical_candidate)
+            except FileNotFoundError:
+                pass
+            if identity is not None and not (
+                stat.S_ISREG(identity.mode) or identity.reparse
+            ):
+                raise OSError("retained audio entry is not unlinkable")
+        _require_retained_audio_ancestors(tuple(ancestors))
     except FileNotFoundError:
         return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
     except PermissionError:
         return None, "AUDIO_DELETE_PERMISSION"
     except OSError:
         return None, "AUDIO_DELETE_OS_ERROR"
+    except _AudioPathOutsideError:
+        return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
     except ValueError:
         return None, "AUDIO_DELETE_OS_ERROR"
     except RuntimeError:
         return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
-    if not stat.S_ISDIR(root_stat.st_mode):
-        return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
-    try:
-        resolved_candidate = candidate.resolve(strict=False)
-    except PermissionError:
-        return None, "AUDIO_DELETE_PERMISSION"
-    except OSError:
-        return None, "AUDIO_DELETE_OS_ERROR"
-    except ValueError:
-        return None, "AUDIO_DELETE_OS_ERROR"
-    except RuntimeError:
-        return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
-    root_text = os.path.normcase(os.path.normpath(str(resolved_root)))
-    candidate_text = os.path.normcase(
-        os.path.normpath(str(resolved_candidate))
+    return (
+        _RetainedAudioEntry(
+            path=lexical_candidate,
+            ancestors=tuple(ancestors),
+            identity=identity,
+        ),
+        None,
     )
-    if candidate_text == root_text:
-        return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
+
+
+def _retained_audio_identity(path: Path) -> _RetainedAudioIdentity:
+    value = _lstat_retained_audio_path(path)
+    attributes = getattr(value, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return _RetainedAudioIdentity(
+        device=value.st_dev,
+        inode=value.st_ino,
+        mode=value.st_mode,
+        reparse=stat.S_ISLNK(value.st_mode)
+        or bool(attributes & reparse_flag),
+    )
+
+
+def _require_retained_audio_ancestors(
+    ancestors: tuple[tuple[Path, _RetainedAudioIdentity], ...]
+) -> None:
+    for path, expected in ancestors:
+        current = _retained_audio_identity(path)
+        if (
+            current != expected
+            or current.reparse
+            or not stat.S_ISDIR(current.mode)
+        ):
+            raise OSError("retained audio ancestor identity changed")
+
+
+def _delete_retained_audio_entry(entry: _RetainedAudioEntry) -> bool:
+    _require_retained_audio_ancestors(entry.ancestors)
+    if entry.identity is None:
+        try:
+            _retained_audio_identity(entry.path)
+        except FileNotFoundError:
+            _require_retained_audio_ancestors(entry.ancestors)
+            return True
+        raise OSError("retained audio entry appeared before deletion")
+    current = _retained_audio_identity(entry.path)
+    if current != entry.identity:
+        raise OSError("retained audio entry identity changed")
+    _require_retained_audio_ancestors(entry.ancestors)
+    if current.reparse and stat.S_ISDIR(current.mode):
+        _remove_retained_audio_directory_reparse(entry.path)
+    else:
+        _unlink_retained_audio_path(entry.path)
     try:
-        if os.path.commonpath((root_text, candidate_text)) != root_text:
-            return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
-    except OSError:
-        return None, "AUDIO_DELETE_OS_ERROR"
-    except ValueError:
-        return None, "AUDIO_PATH_OUTSIDE_TEMP_ROOT"
-    return resolved_candidate, None
+        _retained_audio_identity(entry.path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError("retained audio entry deletion did not complete")
+    _require_retained_audio_ancestors(entry.ancestors)
+    return False
+
+
+def _lstat_retained_audio_path(path: Path):
+    return os.lstat(path)
+
+
+def _unlink_retained_audio_path(path: Path) -> None:
+    path.unlink()
+
+
+def _remove_retained_audio_directory_reparse(path: Path) -> None:
+    path.rmdir()
