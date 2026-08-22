@@ -892,6 +892,51 @@ def test_isolated_reference_media_resolves_video_and_uses_registered_targets(
     assert calls[2] == ("normalize", plan.source_path, plan.normalized_path)
 
 
+def test_isolated_reference_media_retry_uses_atomic_fresh_private_directory(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "private-media").resolve()
+    root.mkdir()
+    model = calibration_models(tmp_path / "model")[0]
+    approval = ApprovedReferenceClip(
+        subject_id=1,
+        video_id=17,
+        start_ms=0,
+        end_ms=3_000,
+        ordinal=1,
+        clip_kind="enrollment",
+        actor="operator",
+        reason="approved-reference",
+        approved_at=NOW,
+        approval_hash="a" * 64,
+    )
+
+    class Resolver:
+        def youtube_video_id(self, video_id: int) -> str:
+            del video_id
+            return "abcdefghijk"
+
+    class Acquirer:
+        def acquire_registered(self, *args, **kwargs):
+            raise AssertionError("producer is not used while planning")
+
+    class Normalizer:
+        def normalize_registered(self, *args, **kwargs):
+            raise AssertionError("producer is not used while planning")
+
+    first = IsolatedReferenceMedia(Resolver(), Acquirer(), Normalizer(), root)
+    retry = IsolatedReferenceMedia(Resolver(), Acquirer(), Normalizer(), root)
+
+    first_plan = first.plan(model, approval)
+    retry_plan = retry.plan(model, approval)
+
+    assert first_plan.source_path.parent != retry_plan.source_path.parent
+    assert first_plan.source_path.parent.parent == root
+    assert retry_plan.source_path.parent.parent == root
+    assert first_plan.source_path.parent.is_dir()
+    assert retry_plan.source_path.parent.is_dir()
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -1200,6 +1245,65 @@ def test_calibration_preregisters_all_targets_and_cleans_files_produced_on_failu
     assert len(rows) == 3
     assert retention.calls == [1, 2, 3]
     assert all(not Path(row["local_path"]).exists() for row in rows)
+
+
+def test_calibration_rejects_ambient_transaction_before_private_production(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    seed = seed_calibration_candidates(db)
+    models = calibration_models(tmp_path / "models")
+
+    class ProducingFailureMedia(FakeReferenceMedia):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.plan_calls = 0
+
+        def plan(self, model, approval):
+            self.plan_calls += 1
+            return super().plan(model, approval)
+
+        def prepare(self, model, approval, plan):
+            del model, approval
+            for path in plan.artifact_paths:
+                path.write_bytes(b"private-producer-output")
+            raise RuntimeError("C:/private/producer-failure")
+
+    private_root = tmp_path / "private"
+    media = ProducingFailureMedia(private_root)
+    retention = FakeRetention(
+        db=db,
+        fail_ids=frozenset(range(1, 1_000)),
+    )
+    scorer = FakeReferenceScorer(
+        db,
+        {model.model_name: (0.8, 0.2) for model in models},
+        elapsed_ms={model.model_name: 100 for model in models},
+    )
+    service = VoiceReferenceService(
+        db,
+        media=media,
+        scorer=scorer,
+        retention=retention,
+        clock=lambda: NOW,
+    )
+    approve_complete_reference_set(service, seed)
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(DomainError) as caught:
+            service.calibrate(models)
+    finally:
+        db.rollback()
+
+    assert caught.value.code == "VOICE_REFERENCE_CALIBRATION_FAILED"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert media.plan_calls == 0
+    assert retention.calls == []
+    assert db.execute("SELECT COUNT(*) FROM local_artifacts").fetchone()[0] == 0
+    assert tuple(
+        path for path in private_root.rglob("*") if path.is_file()
+    ) == ()
 
 
 def test_calibration_tie_breaks_by_cpu_then_lexicographic_model_name(
@@ -1514,6 +1618,101 @@ def test_activation_replay_is_idempotent_and_stale_calibration_is_rejected(
             "SELECT id FROM voice_reference_profiles WHERE is_active=1 ORDER BY id"
         )
     ) == tuple(profile_id for _, profile_id in first_activation.reference_profile_ids)
+
+
+def test_activation_replay_rejects_canonical_threshold_corruption_without_heal(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    activation = service.activate_calibration(result)
+    version = activation.threshold_config_version
+    original = db.execute(
+        "SELECT model_name, model_version, subject_operator, "
+        "subject_boundary, interviewer_operator, interviewer_boundary "
+        "FROM speaker_threshold_configs WHERE version=?",
+        (version,),
+    ).fetchone()
+    assert original is not None
+    db.execute("DROP TRIGGER speaker_threshold_configs_limited_update")
+    db.execute("PRAGMA ignore_check_constraints=ON")
+    mutations = (
+        ("model_name", "other-model.onnx"),
+        ("model_version", "other-v1"),
+        ("subject_operator", "lte"),
+        ("subject_boundary", 0.76),
+        ("interviewer_operator", "gte"),
+        ("interviewer_boundary", 0.11),
+    )
+    counts = tuple(
+        db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "speaker_threshold_configs",
+            "voice_reference_profiles",
+            "voice_reference_clips",
+            "voice_reference_features",
+            "voice_reference_calibrations",
+        )
+    )
+
+    for column, corrupt_value in mutations:
+        db.execute(
+            f"UPDATE speaker_threshold_configs SET {column}=? WHERE version=?",
+            (corrupt_value, version),
+        )
+        with pytest.raises(DomainError) as caught:
+            service.activate_calibration(result)
+        assert caught.value.code in {
+            "VOICE_REFERENCE_ACTIVATION_FAILED",
+            "VOICE_REFERENCE_ACTIVATION_STALE",
+        }
+        assert db.execute(
+            f"SELECT {column} FROM speaker_threshold_configs WHERE version=?",
+            (version,),
+        ).fetchone()[0] == corrupt_value
+        assert tuple(
+            db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "speaker_threshold_configs",
+                "voice_reference_profiles",
+                "voice_reference_clips",
+                "voice_reference_features",
+                "voice_reference_calibrations",
+            )
+        ) == counts
+        db.execute(
+            f"UPDATE speaker_threshold_configs SET {column}=? WHERE version=?",
+            (original[column], version),
+        )
+
+
+def test_reference_bundle_rejects_feature_contract_metadata_corruption(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    activation = service.activate_calibration(result)
+    profile_id = activation.reference_profile_ids[0][1]
+    db.execute("DROP TRIGGER voice_reference_features_no_update")
+    db.execute(
+        "UPDATE voice_reference_features SET encoding_version=? "
+        "WHERE reference_profile_id=?",
+        ("sherpa-speaker-embedding-v2", profile_id),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        VoiceVerificationRepository(db).get_reference_bundle(profile_id)
+
+    assert caught.value.code == "VOICE_REFERENCE_STORED_INVALID"
+    assert db.execute(
+        "SELECT encoding_version FROM voice_reference_features "
+        "WHERE reference_profile_id=?",
+        (profile_id,),
+    ).fetchone()[0] == "sherpa-speaker-embedding-v2"
 
 
 def test_activation_rereads_complete_existing_bundles_before_mutation(

@@ -341,6 +341,65 @@ def test_registered_media_failures_leave_every_target_for_retention(
     assert normalized.read_bytes() == b"partial-normalized"
 
 
+def test_registered_acquisition_removes_only_unexpected_regular_output(
+    tmp_path: Path,
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "registered-acquire"
+    job_dir.mkdir()
+    source = job_dir / "source.media"
+    part = job_dir / "source.media.part"
+    other_job = work_root / "unrelated-job"
+    other_job.mkdir()
+    unrelated = other_job / "unexpected.bin"
+    unrelated.write_bytes(b"preserve-unrelated")
+
+    with pytest.raises(DomainError, match="media acquisition failed"):
+        MediaAcquirer(
+            FakeMediaRunner(extra_name="unexpected.bin"),
+            attestation,
+            work_root,
+            source_environment={},
+        ).acquire_registered(
+            "abcdefghijk",
+            job_dir,
+            source_path=source,
+            part_path=part,
+        )
+
+    assert source.read_bytes() == b"synthetic-media"
+    assert not (job_dir / "unexpected.bin").exists()
+    assert unrelated.read_bytes() == b"preserve-unrelated"
+
+
+def test_registered_normalization_removes_only_unexpected_regular_output(
+    tmp_path: Path,
+) -> None:
+    attestation, work_root = fake_runtime_attestation(tmp_path)
+    job_dir = work_root / "registered-normalize"
+    job_dir.mkdir()
+    source = job_dir / "source.media"
+    source.write_bytes(b"registered-source")
+    target = job_dir / "normalized.wav"
+    other_job = work_root / "unrelated-job"
+    other_job.mkdir()
+    unrelated = other_job / "unexpected.bin"
+    unrelated.write_bytes(b"preserve-unrelated")
+
+    with pytest.raises(DomainError, match="media normalization failed"):
+        MediaNormalizer(
+            FakeMediaRunner(extra_name="unexpected.bin"),
+            attestation,
+            work_root,
+            source_environment={},
+        ).normalize_registered(source, target)
+
+    assert source.read_bytes() == b"registered-source"
+    assert target.read_bytes() == b"synthetic-media"
+    assert not (job_dir / "unexpected.bin").exists()
+    assert unrelated.read_bytes() == b"preserve-unrelated"
+
+
 @pytest.mark.parametrize("failure", ("timeout", "nonzero"))
 def test_acquisition_removes_known_yt_dlp_part_and_retry_reaches_runner(
     tmp_path: Path, failure: str

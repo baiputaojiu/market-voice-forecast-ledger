@@ -891,3 +891,12 @@ def test_reference_entrypoint_denies_network_and_reports_child_cpu() -> None:
     response = decode_reference_response(output, expected_request=request)
     assert response.raw_score == 0.5
     assert response.cpu_time_ms == 23
+
+
+def test_reference_cosine_clamps_identical_and_opposite_roundoff() -> None:
+    vector = tuple((index + 1) / 10 for index in range(12))
+
+    assert adapter_main._cosine(vector, vector) == 1.0
+    assert adapter_main._cosine(
+        vector, tuple(-value for value in vector)
+    ) == -1.0

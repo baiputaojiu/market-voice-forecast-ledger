@@ -34,6 +34,7 @@ from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
 from market_voice_forecast_ledger.repositories.voice_verification import (
     StoredCalibrationIdentity,
     VoiceVerificationRepository,
+    canonical_reference_feature_contract_hash,
 )
 from market_voice_forecast_ledger.services.audit import validate_audit_reason
 from market_voice_forecast_ledger.services.retention import AudioDeletionResult
@@ -41,6 +42,7 @@ from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
 from market_voice_forecast_ledger.voice.media import (
     AcquiredMedia,
     NormalizedAudio,
+    create_private_job_directory,
     normalized_wav_duration_ms,
 )
 from market_voice_forecast_ledger.voice.process import ReferenceAdapterProcess
@@ -205,7 +207,6 @@ class IsolatedReferenceMedia:
         self._acquirer = acquirer
         self._normalizer = normalizer
         self._root = private_work_root
-        self._ordinal = 0
 
     def plan(
         self,
@@ -222,18 +223,7 @@ class IsolatedReferenceMedia:
             root = self._root.absolute().resolve(strict=True)
             if not root.is_dir() or root != self._root.absolute():
                 raise ValueError("reference media root is invalid")
-            self._ordinal += 1
-            job_token = sha256_text(
-                canonical_json(
-                    {
-                        "approval_hash": approval.approval_hash,
-                        "model_sha256": model.model_sha256,
-                        "ordinal": self._ordinal,
-                    }
-                )
-            )[:32]
-            job = root / f"reference-{job_token}"
-            job.mkdir(mode=0o700)
+            job = create_private_job_directory(root)
             return ReferenceMediaPlan(
                 model_sha256=model.model_sha256,
                 approval_hash=approval.approval_hash,
@@ -593,6 +583,11 @@ class VoiceReferenceService:
     def calibrate(
         self, model_candidates: Sequence[RuntimeAttestation]
     ) -> CalibrationResult:
+        if self._conn.in_transaction:
+            raise DomainError(
+                "VOICE_REFERENCE_CALIBRATION_FAILED",
+                "voice reference calibration failed",
+            )
         candidates = self._model_candidates(model_candidates)
         approvals_by_subject = self._complete_approval_set()
         try:
@@ -1453,7 +1448,10 @@ class VoiceReferenceService:
         threshold_version = identity.threshold_config_version
         active_thresholds = tuple(
             self._conn.execute(
-                "SELECT version FROM speaker_threshold_configs "
+                "SELECT version, model_name, model_version, subject_operator, "
+                "subject_boundary, interviewer_operator, "
+                "interviewer_boundary, created_at, is_active "
+                "FROM speaker_threshold_configs "
                 "WHERE is_active=1 ORDER BY version"
             )
         )
@@ -1469,6 +1467,19 @@ class VoiceReferenceService:
         if (
             len(active_thresholds) != 1
             or active_thresholds[0]["version"] != threshold_version
+            or threshold_version
+            != f"voice-calibration-{result.calibration_hash}"
+            or active_thresholds[0]["model_name"] != result.model_name
+            or active_thresholds[0]["model_version"] != result.model_version
+            or active_thresholds[0]["subject_operator"] != "gte"
+            or active_thresholds[0]["subject_boundary"]
+            != result.subject_boundary
+            or active_thresholds[0]["interviewer_operator"] != "lte"
+            or active_thresholds[0]["interviewer_boundary"]
+            != result.interviewer_boundary
+            or active_thresholds[0]["created_at"]
+            != utc_iso(identity.activated_at)
+            or active_thresholds[0]["is_active"] != 1
             or len(active) != 4
             or active_ids != self._voice.list_active_reference_profile_ids()
         ):
@@ -1667,21 +1678,17 @@ def _reference_model_identity(model: RuntimeAttestation) -> dict[str, object]:
 
 
 def _feature_contract_hash(subjects: tuple[CalibratedSubject, ...]) -> str:
-    return sha256_text(
-        canonical_json(
-            {
-                "features": [
-                    {
-                        "dimension": item.feature.dimension,
-                        "encoding_version": item.feature.encoding_version,
-                        "feature_sha256": item.feature.feature_sha256,
-                        "float_dtype": item.feature.float_dtype,
-                        "subject_id": item.feature.subject_id,
-                    }
-                    for item in subjects
-                ],
-                "schema": "voice-reference-feature-contract.v1",
-            }
+    return canonical_reference_feature_contract_hash(
+        tuple(
+            (
+                item.feature.subject_id,
+                item.feature.encoding_version,
+                item.feature.float_dtype,
+                item.feature.dimension,
+                item.feature.embedding_blob,
+                item.feature.feature_sha256,
+            )
+            for item in subjects
         )
     )
 

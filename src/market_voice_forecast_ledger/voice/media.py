@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import wave
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -180,6 +181,11 @@ class MediaAcquirer:
             digest = _nonempty_file_sha256(output)
             return AcquiredMedia(path=output, sha256=digest, video_id=video_id)
         except Exception:
+            _remove_unregistered_inventory(
+                work_dir,
+                self._private_work_root,
+                work_identity,
+            )
             if not registered:
                 _remove_unregistered_target(
                     download_path,
@@ -305,6 +311,11 @@ class MediaNormalizer:
                 source_sha256=source_sha256,
             )
         except Exception:
+            _remove_unregistered_inventory(
+                work_dir,
+                self._private_work_root,
+                work_identity,
+            )
             if not registered:
                 _remove_unregistered_target(
                     target_path,
@@ -329,6 +340,26 @@ def normalized_wav_duration_ms(path: Path) -> int:
         return _normalized_wav_duration_ms(path)
     except Exception:
         raise _normalization_failed() from None
+
+
+def create_private_job_directory(configured_root: Path) -> Path:
+    try:
+        root = _private_root(configured_root)
+        raw = Path(tempfile.mkdtemp(prefix="reference-", dir=root)).absolute()
+        _require_no_reparse(raw)
+        resolved = raw.resolve(strict=True)
+        identity = _directory_identity(resolved)
+        if (
+            raw != resolved
+            or resolved.parent != root
+            or _is_reparse(resolved)
+            or _private_work_dir(resolved, root) != resolved
+            or _directory_identity(resolved) != identity
+        ):
+            raise ValueError("private job directory is invalid")
+        return resolved
+    except Exception:
+        raise _acquisition_failed() from None
 
 
 def _canonical_watch_url(video_id: object) -> str:
@@ -524,6 +555,38 @@ def _remove_unregistered_target(
         target_stat = os.lstat(target)
         if stat.S_ISREG(target_stat.st_mode) or stat.S_ISLNK(target_stat.st_mode):
             os.unlink(target)
+    except OSError:
+        return
+    except ValueError:
+        return
+
+
+def _remove_unregistered_inventory(
+    work_dir: Path | None,
+    configured_root: Path,
+    expected_work_identity: _DirectoryIdentity | None,
+) -> None:
+    if work_dir is None or expected_work_identity is None:
+        return
+    try:
+        verified_work = _private_work_dir(work_dir, configured_root)
+        if (
+            verified_work != work_dir
+            or _directory_identity(verified_work) != expected_work_identity
+        ):
+            return
+        for candidate in tuple(verified_work.iterdir()):
+            if candidate.name in {
+                "source.media",
+                "source.media.part",
+                "normalized.wav",
+            }:
+                continue
+            candidate_stat = os.lstat(candidate)
+            if stat.S_ISREG(candidate_stat.st_mode) or stat.S_ISLNK(
+                candidate_stat.st_mode
+            ):
+                os.unlink(candidate)
     except OSError:
         return
     except ValueError:

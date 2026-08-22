@@ -109,6 +109,56 @@ class StoredCalibrationIdentity:
     activated_at: datetime
 
 
+def canonical_reference_feature_contract_hash(
+    features: tuple[tuple[int, str, str, int, bytes, str], ...],
+) -> str:
+    if (
+        not features
+        or tuple(item[0] for item in features)
+        != tuple(sorted({item[0] for item in features}))
+    ):
+        raise ValueError("reference feature contract subjects are invalid")
+    values: list[dict[str, object]] = []
+    for (
+        subject_id,
+        encoding_version,
+        float_dtype,
+        dimension,
+        embedding_blob,
+        feature_sha256,
+    ) in features:
+        width = 4 if float_dtype in {"float32", "float32-le"} else 8
+        if (
+            not _positive_sqlite_int(subject_id)
+            or not _is_token(encoding_version)
+            or float_dtype not in {"float32", "float32-le", "float64"}
+            or type(dimension) is not int
+            or dimension <= 0
+            or type(embedding_blob) is not bytes
+            or len(embedding_blob) != dimension * width
+            or not _is_hash(feature_sha256)
+            or hashlib.sha256(embedding_blob).hexdigest() != feature_sha256
+        ):
+            raise ValueError("reference feature contract is invalid")
+        values.append(
+            {
+                "dimension": dimension,
+                "encoding_version": encoding_version,
+                "feature_sha256": feature_sha256,
+                "float_dtype": float_dtype,
+                "subject_id": subject_id,
+            }
+        )
+    return sha256_text(
+        canonical_json(
+            {
+                "features": values,
+                "schema": "voice-reference-feature-contract.v1",
+            }
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StoredVoiceManifest:
     id: int
@@ -531,6 +581,9 @@ class VoiceVerificationRepository:
             clips = self._read_reference_clips(profile)
             if not clips:
                 raise ValueError("clips missing")
+            self._validate_calibration_feature_contract(
+                profile["threshold_config_version"]
+            )
         except (DomainError, LookupError, TypeError, ValueError) as cause:
             if (
                 isinstance(cause, DomainError)
@@ -554,6 +607,62 @@ class VoiceVerificationRepository:
             clips=clips,
             feature=feature,
         )
+
+    def _validate_calibration_feature_contract(
+        self, threshold_config_version: str
+    ) -> None:
+        identity = self._conn.execute(
+            "SELECT feature_contract_hash FROM voice_reference_calibrations "
+            "WHERE threshold_config_version=?",
+            (threshold_config_version,),
+        ).fetchone()
+        if identity is None:
+            return
+        profile_rows = tuple(
+            self._conn.execute(
+                "SELECT id FROM voice_reference_profiles "
+                "WHERE threshold_config_version=? ORDER BY subject_id, id",
+                (threshold_config_version,),
+            )
+        )
+        if len(profile_rows) != 4:
+            raise ValueError("calibrated reference profile count is invalid")
+        features: list[tuple[int, str, str, int, bytes, str]] = []
+        for profile_id in (row["id"] for row in profile_rows):
+            profile = self._read_reference_profile(profile_id)
+            feature_row = self._conn.execute(
+                """
+                SELECT *,
+                       typeof(id) AS type_id,
+                       typeof(reference_profile_id) AS type_reference_profile_id,
+                       typeof(encoding_version) AS type_encoding_version,
+                       typeof(float_dtype) AS type_float_dtype,
+                       typeof(dimension) AS type_dimension,
+                       typeof(embedding_blob) AS type_embedding_blob,
+                       typeof(feature_sha256) AS type_feature_sha256,
+                       typeof(created_at) AS type_created_at
+                FROM voice_reference_features
+                WHERE reference_profile_id=?
+                """,
+                (profile_id,),
+            ).fetchone()
+            if feature_row is None:
+                raise ValueError("calibrated reference feature is missing")
+            feature = self._feature_from_row(feature_row, profile)
+            features.append(
+                (
+                    profile["subject_id"],
+                    feature.encoding_version,
+                    feature.float_dtype,
+                    feature.dimension,
+                    feature.embedding_blob,
+                    feature.feature_sha256,
+                )
+            )
+        if canonical_reference_feature_contract_hash(tuple(features)) != identity[
+            "feature_contract_hash"
+        ]:
+            raise ValueError("calibrated reference feature contract changed")
 
     def add_manifest(
         self,

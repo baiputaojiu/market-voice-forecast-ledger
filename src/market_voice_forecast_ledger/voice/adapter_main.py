@@ -539,6 +539,7 @@ def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
     score = numerator / (left_norm * right_norm)
     if not math.isfinite(score):
         raise ValueError("speaker score is invalid")
+    score = max(-1.0, min(1.0, score))
     return 0.0 if score == 0.0 else score
 
 
