@@ -24,7 +24,11 @@ from market_voice_forecast_ledger.domain.enums import (
     UnitStatus,
 )
 from market_voice_forecast_ledger.domain.errors import DomainError
-from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
+from market_voice_forecast_ledger.domain.jobs import (
+    JobManifest,
+    ManifestUnit,
+    effective_input_hash,
+)
 from market_voice_forecast_ledger.domain.voice_verification import (
     ReferenceClipCommand,
     ReviewAction,
@@ -692,18 +696,31 @@ class VoiceVerificationRepository:
         manifest = self.get_manifest_for_job(job_id)
         reference = self.get_reference_bundle(manifest.snapshot.reference_profile_id)
         job = self._conn.execute(
-            "SELECT status, typeof(status) AS type_status FROM jobs WHERE id=?",
+            """
+            SELECT status, source_job_id,
+                   typeof(status) AS type_status,
+                   typeof(source_job_id) AS type_source_job_id
+            FROM jobs WHERE id=?
+            """,
             (job_id,),
         ).fetchone()
         if (
             job is None
             or job["type_status"] != "text"
+            or job["type_source_job_id"] not in {"null", "integer"}
             or job["status"] not in _JOB_STATUSES
+            or (
+                job["source_job_id"] is not None
+                and job["source_job_id"] <= 0
+            )
         ):
             _job_artifacts_invalid()
         job_status = JobStatus(job["status"])
         _, unit_rows = self._validate_unit_rows(
-            job_id, build_presence_job_manifest(manifest.snapshot), job_status
+            job_id,
+            build_presence_job_manifest(manifest.snapshot),
+            job_status,
+            source_job_id=job["source_job_id"],
         )
         run_row = self._conn.execute(
             "SELECT id FROM voice_verification_runs WHERE job_id=?", (job_id,)
@@ -1201,6 +1218,7 @@ class VoiceVerificationRepository:
         job = self._conn.execute(
             """
             SELECT *, typeof(id) AS type_id, typeof(job_kind) AS type_kind,
+                   typeof(source_job_id) AS type_source_job_id,
                    typeof(manifest_hash) AS type_hash,
                    typeof(total_units) AS type_total, typeof(status) AS type_status,
                    typeof(created_at) AS type_created,
@@ -1212,6 +1230,7 @@ class VoiceVerificationRepository:
         if (
             job is None
             or job["type_id"] != "integer"
+            or job["type_source_job_id"] not in {"null", "integer"}
             or job["type_kind"] != "text"
             or job["type_hash"] != "text"
             or job["type_total"] != "integer"
@@ -1222,12 +1241,19 @@ class VoiceVerificationRepository:
             or job["manifest_hash"] != expected_manifest.manifest_hash
             or job["total_units"] != len(expected_manifest.units)
             or job["status"] not in _JOB_STATUSES
+            or (
+                job["source_job_id"] is not None
+                and job["source_job_id"] <= 0
+            )
         ):
             raise ValueError("job manifest")
         _parse_utc(job["created_at"])
         _parse_utc(job["updated_at"])
         units, _ = self._validate_unit_rows(
-            job_id, expected_manifest, JobStatus(job["status"])
+            job_id,
+            expected_manifest,
+            JobStatus(job["status"]),
+            source_job_id=job["source_job_id"],
         )
         rebuilt = JobManifest.build(JobKind.VIDEO_PIPELINE, units)
         if rebuilt != expected_manifest:
@@ -1238,6 +1264,8 @@ class VoiceVerificationRepository:
         job_id: int,
         expected_manifest: JobManifest,
         job_status: JobStatus,
+        *,
+        source_job_id: int | None,
     ) -> tuple[tuple[ManifestUnit, ...], tuple[sqlite3.Row, ...]]:
         rows = tuple(
             self._conn.execute(
@@ -1332,9 +1360,20 @@ class VoiceVerificationRepository:
                 and _SAFE_ERROR_CODE.fullmatch(row["error_code"]) is None
             ):
                 raise ValueError("job unit error code")
-            for timestamp in (row["started_at"], row["finished_at"]):
-                if timestamp is not None:
-                    _parse_utc(timestamp)
+            started_at = (
+                None if row["started_at"] is None else _parse_utc(row["started_at"])
+            )
+            finished_at = (
+                None
+                if row["finished_at"] is None
+                else _parse_utc(row["finished_at"])
+            )
+            if (
+                started_at is not None
+                and finished_at is not None
+                and finished_at < started_at
+            ):
+                raise ValueError("job unit timestamp order")
             if (
                 row["external_input_hash"] is not None
                 and row["bound_input_hash"] is None
@@ -1351,6 +1390,11 @@ class VoiceVerificationRepository:
                     )
                 ):
                     raise ValueError("pending job unit state")
+                if row["bound_input_hash"] is None:
+                    if row["attempt_count"] != 0:
+                        raise ValueError("unbound pending job unit attempt")
+                elif row["attempt_count"] == 0 and source_job_id is None:
+                    raise ValueError("pending reused job unit source")
             elif status is UnitStatus.RUNNING:
                 if (
                     row["bound_input_hash"] is None
@@ -1369,6 +1413,11 @@ class VoiceVerificationRepository:
                     or row["finished_at"] is None
                 ):
                     raise ValueError("successful job unit state")
+                if row["attempt_count"] == 0:
+                    if source_job_id is None or row["started_at"] is not None:
+                        raise ValueError("reused successful job unit attempt")
+                elif row["started_at"] is None:
+                    raise ValueError("successful job unit attempt")
             elif (
                 row["bound_input_hash"] is None
                 or row["output_hash"] is not None
@@ -1389,9 +1438,64 @@ class VoiceVerificationRepository:
                     execution_contract_hash=row["execution_contract_hash"],
                 )
             )
-        if job_status is JobStatus.SUCCEEDED and any(
-            status is not UnitStatus.SUCCESS for status in statuses
-        ):
+        rows_by_key = {
+            expected.unit_key: row
+            for expected, row in zip(expected_manifest.units, rows, strict=True)
+        }
+        for expected, row in zip(expected_manifest.units, rows, strict=True):
+            status = UnitStatus(row["status"])
+            dependencies = tuple(
+                sorted(
+                    (rows_by_key[key] for key in expected.dependency_keys),
+                    key=lambda dependency: dependency["ordinal"],
+                )
+            )
+            dependencies_complete = all(
+                dependency["status"] == UnitStatus.SUCCESS.value
+                and dependency["output_hash"] is not None
+                for dependency in dependencies
+            )
+            if status is not UnitStatus.PENDING and not dependencies_complete:
+                raise ValueError("job unit dependency state")
+            if row["bound_input_hash"] is not None and (
+                not dependencies or dependencies_complete
+            ):
+                expected_bound_input = effective_input_hash(
+                    row["declared_input_hash"],
+                    tuple(dependency["output_hash"] for dependency in dependencies),
+                    row["external_input_hash"],
+                )
+                if row["bound_input_hash"] != expected_bound_input:
+                    raise ValueError("job unit bound input lineage")
+        phase = "success"
+        for status in statuses:
+            if status is UnitStatus.SUCCESS:
+                if phase != "success":
+                    raise ValueError("job unit status order")
+            elif status in {UnitStatus.RUNNING, UnitStatus.FAILED}:
+                if phase != "success":
+                    raise ValueError("job unit active status order")
+                phase = "active"
+            else:
+                phase = "pending"
+        running_count = statuses.count(UnitStatus.RUNNING)
+        failed_count = statuses.count(UnitStatus.FAILED)
+        if job_status in {JobStatus.QUEUED, JobStatus.PAUSED, JobStatus.RETRYING}:
+            if running_count or failed_count:
+                raise ValueError("inactive job unit state")
+        elif job_status is JobStatus.RUNNING:
+            if running_count > 1 or failed_count:
+                raise ValueError("running job unit state")
+        elif job_status in {
+            JobStatus.PAUSE_REQUESTED,
+            JobStatus.CANCEL_REQUESTED,
+        }:
+            if running_count != 1 or failed_count:
+                raise ValueError("requested job unit state")
+        elif job_status in {JobStatus.STOPPED, JobStatus.FAILED}:
+            if running_count or failed_count > 1:
+                raise ValueError("quiescent job unit state")
+        elif any(status is not UnitStatus.SUCCESS for status in statuses):
             raise ValueError("succeeded job unit state")
         return tuple(units), rows
 

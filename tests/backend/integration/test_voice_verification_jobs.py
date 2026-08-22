@@ -1,3 +1,4 @@
+import json
 import math
 import sqlite3
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from market_voice_forecast_ledger.domain.discovery import (
 from market_voice_forecast_ledger.domain.enums import JobStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import (
+    PRESENCE_UNITS,
     ReviewAction,
     VoiceManifestSnapshot,
     VoiceProposal,
@@ -43,6 +45,7 @@ from tests.backend.integration.test_voice_reference_enrollment import (
 
 
 REVIEWED_AT = datetime(2026, 8, 22, 5, 0, tzinfo=timezone.utc)
+VOICE_UNIT_KEYS = tuple(unit_key for unit_key, _ in PRESENCE_UNITS)
 
 
 @dataclass(frozen=True)
@@ -181,34 +184,79 @@ def mark_job_succeeded(db: sqlite3.Connection, job_id: int) -> None:
         "SELECT output_hash FROM voice_verification_runs WHERE job_id=?", (job_id,)
     ).fetchone()
     rows = db.execute(
-        "SELECT unit_key, ordinal FROM job_units WHERE job_id=? ORDER BY ordinal",
+        """
+        SELECT unit_key, ordinal, declared_input_hash, dependency_keys_json
+        FROM job_units WHERE job_id=? ORDER BY ordinal
+        """,
         (job_id,),
     ).fetchall()
+    outputs: dict[str, str] = {}
     for row in rows:
+        dependencies = tuple(json.loads(row["dependency_keys_json"]))
+        dependency_outputs = tuple(outputs[key] for key in dependencies)
+        external_input_hash = (
+            sha256_text(f"external-{row['ordinal']}")
+            if row["ordinal"] % 2 == 0
+            else None
+        )
+        bound_input_hash = expected_bound_input_hash(
+            row["declared_input_hash"],
+            dependency_outputs,
+            external_input_hash,
+        )
+        output_hash = (
+            run["output_hash"]
+            if row["unit_key"] == "voice:proposal" and run is not None
+            else sha256_text(f"output-{row['ordinal']}")
+        )
         db.execute(
             """
             UPDATE job_units
-            SET external_input_hash=NULL, bound_input_hash=?, output_hash=?,
-                status='success', error_code=NULL, started_at=?, finished_at=?
+            SET external_input_hash=?, bound_input_hash=?, output_hash=?,
+                status='success', attempt_count=1, error_code=NULL,
+                started_at=?, finished_at=?
             WHERE job_id=? AND unit_key=?
             """,
             (
-                sha256_text(f"bound-{row['ordinal']}"),
-                (
-                    run["output_hash"]
-                    if row["unit_key"] == "voice:proposal" and run is not None
-                    else sha256_text(f"output-{row['ordinal']}")
-                ),
+                external_input_hash,
+                bound_input_hash,
+                output_hash,
                 utc_iso(NOW),
                 utc_iso(NOW),
                 job_id,
                 row["unit_key"],
             ),
         )
+        outputs[row["unit_key"]] = output_hash
     db.execute(
         "UPDATE jobs SET status='succeeded', updated_at=? WHERE id=?",
         (utc_iso(NOW), job_id),
     )
+
+
+def expected_bound_input_hash(
+    declared_input_hash: str | None,
+    dependency_outputs: tuple[str, ...],
+    external_input_hash: str | None,
+) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "declared_input_hash": declared_input_hash,
+                "dependency_outputs": list(dependency_outputs),
+                "external_input_hash": external_input_hash,
+            }
+        )
+    )
+
+
+def canonical_root_bound_input(db: sqlite3.Connection, job_id: int) -> str:
+    row = db.execute(
+        "SELECT declared_input_hash FROM job_units "
+        "WHERE job_id=? AND ordinal=1",
+        (job_id,),
+    ).fetchone()
+    return expected_bound_input_hash(row["declared_input_hash"], (), None)
 
 
 def valid_review(run_id: int, action: ReviewAction) -> ReviewCommand:
@@ -534,6 +582,205 @@ def test_artifact_read_validates_pending_unit_external_input_binding(db) -> None
         VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
 
 
+def test_succeeded_artifacts_accept_canonical_lineage_for_all_voice_units(db) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+
+    artifacts = VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+    rows = db.execute(
+        """
+        SELECT unit_key, ordinal, declared_input_hash, dependency_keys_json,
+               external_input_hash, bound_input_hash, output_hash
+        FROM job_units WHERE job_id=? ORDER BY ordinal
+        """,
+        (job.job_id,),
+    ).fetchall()
+    by_key = {row["unit_key"]: row for row in rows}
+    for row in rows:
+        dependencies = sorted(
+            (by_key[key] for key in json.loads(row["dependency_keys_json"])),
+            key=lambda dependency: dependency["ordinal"],
+        )
+        assert row["bound_input_hash"] == expected_bound_input_hash(
+            row["declared_input_hash"],
+            tuple(dependency["output_hash"] for dependency in dependencies),
+            row["external_input_hash"],
+        )
+    assert tuple(row["external_input_hash"] is None for row in rows) == (
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+    )
+    assert artifacts.run is not None and artifacts.run.id == run_id
+
+
+@pytest.mark.parametrize("unit_key", VOICE_UNIT_KEYS)
+def test_artifact_read_rejects_bound_input_lineage_drift_for_every_voice_unit(
+    db, unit_key: str
+) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute("DROP TRIGGER job_units_input_binding_immutable")
+    db.execute(
+        "UPDATE job_units SET bound_input_hash=? WHERE job_id=? AND unit_key=?",
+        ("0" * 64, job.job_id, unit_key),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
+@pytest.mark.parametrize("unit_key", VOICE_UNIT_KEYS)
+def test_artifact_read_rejects_external_input_lineage_drift_for_every_voice_unit(
+    db, unit_key: str
+) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute("DROP TRIGGER job_units_input_binding_immutable")
+    row = db.execute(
+        "SELECT external_input_hash FROM job_units WHERE job_id=? AND unit_key=?",
+        (job.job_id, unit_key),
+    ).fetchone()
+    mutated_external = None if row["external_input_hash"] is not None else "e" * 64
+    db.execute(
+        "UPDATE job_units SET external_input_hash=? WHERE job_id=? AND unit_key=?",
+        (mutated_external, job.job_id, unit_key),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
+def test_artifact_read_rejects_bound_hash_without_declared_input(db) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute("DROP TRIGGER job_units_input_binding_immutable")
+    db.execute(
+        "UPDATE job_units SET bound_input_hash=? WHERE job_id=? AND ordinal=1",
+        (expected_bound_input_hash(None, (), None), job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
+def test_artifact_read_rejects_dependency_output_lineage_drift(db) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute(
+        "UPDATE job_units SET output_hash=? WHERE job_id=? AND ordinal=2",
+        ("f" * 64, job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
+@pytest.mark.parametrize(
+    ("job_status", "unit_status"),
+    (
+        (JobStatus.QUEUED, "running"),
+        (JobStatus.QUEUED, "failed"),
+        (JobStatus.RUNNING, "failed"),
+        (JobStatus.PAUSED, "running"),
+        (JobStatus.STOPPED, "running"),
+        (JobStatus.RETRYING, "running"),
+        (JobStatus.RETRYING, "failed"),
+    ),
+)
+def test_job_read_rejects_impossible_job_and_active_unit_relationship(
+    db, job_status: JobStatus, unit_status: str
+) -> None:
+    job = seed_job(db)
+    bound_input_hash = canonical_root_bound_input(db, job.job_id)
+    if unit_status == "running":
+        db.execute(
+            """
+            UPDATE job_units
+            SET status='running', attempt_count=1, external_input_hash=NULL,
+                bound_input_hash=?, output_hash=NULL, error_code=NULL,
+                started_at=?, finished_at=NULL
+            WHERE job_id=? AND ordinal=1
+            """,
+            (bound_input_hash, utc_iso(NOW), job.job_id),
+        )
+    else:
+        db.execute(
+            """
+            UPDATE job_units
+            SET status='failed', attempt_count=1, external_input_hash=NULL,
+                bound_input_hash=?, output_hash=NULL, error_code='VOICE_FAILED',
+                started_at=?, finished_at=?
+            WHERE job_id=? AND ordinal=1
+            """,
+            (bound_input_hash, utc_iso(NOW), utc_iso(NOW), job.job_id),
+        )
+    db.execute(
+        "UPDATE jobs SET status=?, updated_at=? WHERE id=?",
+        (job_status.value, utc_iso(NOW), job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).list_runnable_job_ids()
+
+
+@pytest.mark.parametrize(
+    "job_status", (JobStatus.PAUSE_REQUESTED, JobStatus.CANCEL_REQUESTED)
+)
+def test_job_read_rejects_request_state_without_running_unit(
+    db, job_status: JobStatus
+) -> None:
+    job = seed_job(db)
+    db.execute(
+        "UPDATE jobs SET status=?, updated_at=? WHERE id=?",
+        (job_status.value, utc_iso(NOW), job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).list_runnable_job_ids()
+
+
+@pytest.mark.parametrize(
+    ("attempt_count", "started_at", "finished_at"),
+    (
+        (0, utc_iso(NOW), utc_iso(NOW)),
+        (1, None, utc_iso(NOW)),
+        (
+            1,
+            "2026-08-22T06:00:00.000000Z",
+            "2026-08-22T04:00:00.000000Z",
+        ),
+        (0, None, utc_iso(NOW)),
+    ),
+)
+def test_succeeded_artifact_read_rejects_impossible_attempt_timestamps(
+    db, attempt_count: int, started_at: str | None, finished_at: str
+) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute(
+        """
+        UPDATE job_units
+        SET attempt_count=?, started_at=?, finished_at=?
+        WHERE job_id=? AND unit_key='voice:score'
+        """,
+        (attempt_count, started_at, finished_at, job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
 def test_require_job_artifacts_does_not_trust_succeeded_status_without_run(db) -> None:
     job = seed_job(db)
     mark_job_succeeded(db, job.job_id)
@@ -552,7 +799,7 @@ def test_require_job_artifacts_rejects_voice_proposal_status_hash_drift(db) -> N
         ("f" * 64, job.job_id),
     )
 
-    with pytest.raises(DomainError, match="VOICE_JOB_ARTIFACTS_INVALID"):
+    with pytest.raises(DomainError, match="INVALID"):
         VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
 
 
@@ -656,6 +903,21 @@ def test_review_write_requires_succeeded_job_before_any_write(
 ) -> None:
     job = seed_job(db)
     run_id = canonical_run(db, job)
+    if job_status in {JobStatus.PAUSE_REQUESTED, JobStatus.CANCEL_REQUESTED}:
+        db.execute(
+            """
+            UPDATE job_units
+            SET status='running', attempt_count=1, external_input_hash=NULL,
+                bound_input_hash=?, output_hash=NULL, error_code=NULL,
+                started_at=?, finished_at=NULL
+            WHERE job_id=? AND ordinal=1
+            """,
+            (
+                canonical_root_bound_input(db, job.job_id),
+                utc_iso(NOW),
+                job.job_id,
+            ),
+        )
     db.execute(
         "UPDATE jobs SET status=?, updated_at=? WHERE id=?",
         (job_status.value, utc_iso(NOW), job.job_id),
@@ -698,6 +960,52 @@ def test_review_write_requires_fully_verified_success_units_before_any_write(
         "WHERE job_id=? AND ordinal=1",
         (sqlite3.Binary(b"external"), job.job_id),
     )
+    before_decisions = db.execute(
+        "SELECT COUNT(*) FROM presence_decisions"
+    ).fetchone()[0]
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        with transaction(db):
+            VoiceVerificationRepository(
+                db, clock=lambda: REVIEWED_AT
+            ).add_review_and_decision(
+                valid_review(run_id, ReviewAction.CONFIRM)
+            )
+
+    assert (
+        db.execute("SELECT COUNT(*) FROM voice_verification_reviews").fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute("SELECT COUNT(*) FROM presence_decisions").fetchone()[0]
+        == before_decisions
+    )
+    assert db.execute(
+        "SELECT current_presence_decision_id FROM subject_video_candidates WHERE id=?",
+        (job.reference.candidate_id,),
+    ).fetchone()[0] == job.reference.decision_id
+
+
+@pytest.mark.parametrize("mutation", ("bound_lineage", "attempt_timestamps"))
+def test_review_write_rejects_impossible_success_evidence_before_any_write(
+    db, mutation: str
+) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    if mutation == "bound_lineage":
+        db.execute("DROP TRIGGER job_units_input_binding_immutable")
+        db.execute(
+            "UPDATE job_units SET bound_input_hash=? "
+            "WHERE job_id=? AND unit_key='audio:cleanup'",
+            ("0" * 64, job.job_id),
+        )
+    else:
+        db.execute(
+            "UPDATE job_units SET attempt_count=0, started_at=NULL "
+            "WHERE job_id=? AND unit_key='voice:score'",
+            (job.job_id,),
+        )
     before_decisions = db.execute(
         "SELECT COUNT(*) FROM presence_decisions"
     ).fetchone()[0]
