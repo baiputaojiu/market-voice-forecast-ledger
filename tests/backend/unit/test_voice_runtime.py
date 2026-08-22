@@ -152,3 +152,71 @@ def test_runtime_rejects_unknown_lock_shape_without_running_probes(tmp_path: Pat
         attest_runtime(settings, version_probe=probe, allowlists=allowlists)
 
     assert probe.calls == []
+
+
+@pytest.mark.parametrize(
+    ("lock_key", "version", "probe_prefix"),
+    (
+        ("python", "3.14.7", "Python "),
+        ("yt_dlp", "2026.08.20", ""),
+        ("deno", "2.9.6", "deno "),
+        ("ffmpeg", "9.0.2", "ffmpeg version "),
+    ),
+)
+def test_runtime_rejects_coordinated_lock_and_probe_version_drift(
+    tmp_path: Path, lock_key: str, version: str, probe_prefix: str
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    lock_path = settings.voice_runtime_dir / "runtime-lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock[lock_key]["version"] = version
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    path = Path(lock[lock_key]["path"]).resolve()
+    argument = "-version" if lock_key == "ffmpeg" else "--version"
+    probe.outputs[(str(path), argument)] = f"{probe_prefix}{version}"
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        attest_runtime(settings, version_probe=probe, allowlists=allowlists)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+
+
+@pytest.mark.parametrize(
+    "reparse_name", ("private-data", "voice-runtime", "voice-models", "runtime-lock.json")
+)
+def test_runtime_rejects_private_root_or_lock_reparse_before_lock_read(
+    tmp_path: Path, reparse_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    reads: list[Path] = []
+    original_read = runtime._read_lock
+
+    def _read_spy(path: Path) -> dict[str, object]:
+        reads.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(runtime, "_read_lock", _read_spy)
+    original_reparse = runtime._is_reparse
+    monkeypatch.setattr(
+        runtime,
+        "_is_reparse",
+        lambda path: path.name == reparse_name or original_reparse(path),
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid"):
+        attest_runtime(settings, version_probe=probe, allowlists=allowlists)
+
+    assert reads == []
+
+
+def test_runtime_maps_injected_domain_error_without_private_text(tmp_path: Path) -> None:
+    settings, _, allowlists = _runtime_fixture(tmp_path)
+
+    def _private_failure(argv: tuple[str, ...]) -> str:
+        raise DomainError("PRIVATE_CODE", f"private sentinel {argv[0]}")
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        attest_runtime(settings, version_probe=_private_failure, allowlists=allowlists)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+    assert "private sentinel" not in caught.value.message

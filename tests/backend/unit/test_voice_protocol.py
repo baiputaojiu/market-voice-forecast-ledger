@@ -9,6 +9,8 @@ from market_voice_forecast_ledger.domain.common import canonical_json, sha256_te
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import VoiceProposal
 from market_voice_forecast_ledger.voice.protocol import (
+    AdapterResponse,
+    AdapterSegment,
     MAX_ADAPTER_RESPONSE_BYTES,
     MAX_ADAPTER_SEGMENTS,
     AdapterRequest,
@@ -17,6 +19,7 @@ from market_voice_forecast_ledger.voice.protocol import (
     encode_request,
     wipe_reference_feature,
 )
+from market_voice_forecast_ledger.voice import protocol
 
 
 def _request() -> AdapterRequest:
@@ -29,6 +32,7 @@ def _request() -> AdapterRequest:
         "model_name": "model.onnx",
         "model_path": "C:/private/models/model.onnx",
         "model_sha256": "b" * 64,
+        "model_version": "model-v1",
         "reference_feature_b64": base64.b64encode(feature).decode("ascii"),
         "reference_feature_length": len(feature),
         "reference_feature_sha256": hashlib.sha256(feature).hexdigest(),
@@ -46,7 +50,7 @@ def _response_payload(request: AdapterRequest) -> bytes:
         "adapter_contract_version": request.adapter_contract_version,
         "input_hash": request.input_hash,
         "model_name": request.model_name,
-        "model_version": "model-v1",
+        "model_version": request.model_version,
         "proposal": VoiceProposal.LIKELY_PRESENT.value,
         "segments": [
             {
@@ -190,3 +194,99 @@ def test_request_rejects_invalid_reference_feature_without_leaking_contents() ->
         AdapterRequest.with_canonical_hash(**values)
 
     assert "private-feature" not in caught.value.message
+
+
+def test_request_and_response_bind_the_exact_model_version_and_absolute_paths() -> None:
+    values = _request().model_dump(mode="python")
+    values["model_version"] = "model-v1"
+    request = AdapterRequest.with_canonical_hash(**values)
+    response = json.loads(_response_payload(_request()))
+    response["model_version"] = "model-v1"
+    response["output_hash"] = sha256_text(
+        canonical_json({key: value for key, value in response.items() if key != "output_hash"})
+    )
+
+    assert request.model_version == "model-v1"
+    assert decode_response(canonical_json(response).encode("utf-8"), expected_request=request)
+
+    response["model_version"] = "other-v1"
+    response["output_hash"] = sha256_text(
+        canonical_json({key: value for key, value in response.items() if key != "output_hash"})
+    )
+    with pytest.raises(DomainError, match="adapter response is invalid"):
+        decode_response(canonical_json(response).encode("utf-8"), expected_request=request)
+
+    for field, path in (
+        ("audio_path", "relative.wav"),
+        ("model_path", "C:/private/models/../model.onnx"),
+        ("vad_model_path", "vad.onnx"),
+    ):
+        values[field] = path
+        with pytest.raises(DomainError, match="adapter request is invalid"):
+            AdapterRequest.with_canonical_hash(**values)
+        values[field] = _request().model_dump(mode="python")[field]
+
+
+def test_reference_feature_rejects_oversized_encoded_input_before_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = _request().model_dump(mode="python")
+    values["reference_feature_b64"] = base64.b64encode(b"x" * 16).decode("ascii")
+    values["reference_feature_length"] = 1
+    decoded = False
+
+    def _unexpected_decode(*args: object, **kwargs: object) -> bytes:
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("encoded input was decoded")
+
+    monkeypatch.setattr(protocol.base64, "b64decode", _unexpected_decode)
+    with pytest.raises(DomainError, match="adapter request is invalid"):
+        AdapterRequest.with_canonical_hash(**values)
+    assert not decoded
+
+
+def test_internal_reference_feature_buffers_are_wiped_on_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = _request().model_dump(mode="python")
+    wiped: list[bytes] = []
+    original_wipe = protocol.wipe_reference_feature
+
+    def _spy_wipe(value: bytearray) -> None:
+        wiped.append(bytes(value))
+        original_wipe(value)
+
+    monkeypatch.setattr(protocol, "wipe_reference_feature", _spy_wipe)
+    request = AdapterRequest.with_canonical_hash(**values)
+    encode_request(request)
+    assert wiped == [b"reference-feature", b"reference-feature"]
+
+    broken = request.model_copy(update={"reference_feature_sha256": "0" * 64})
+    with pytest.raises(DomainError, match="adapter request is invalid"):
+        encode_request(broken)
+    assert wiped[-1] == b"reference-feature"
+
+
+def test_response_segment_count_guard_is_not_hidden_by_the_byte_limit() -> None:
+    segment = AdapterSegment(
+        end_ms=1,
+        evidence_hash="d" * 64,
+        ordinal=1,
+        raw_score=0.5,
+        start_ms=0,
+    )
+    values = {
+        "adapter_contract_version": "voice-adapter-v1",
+        "input_hash": "a" * 64,
+        "model_name": "model.onnx",
+        "model_version": "model-v1",
+        "output_hash": "b" * 64,
+        "proposal": VoiceProposal.LIKELY_PRESENT,
+        "segments": tuple(segment for _ in range(MAX_ADAPTER_SEGMENTS + 1)),
+        "vad_contract_version": "vad-v1",
+    }
+
+    compact_response = AdapterResponse.model_construct(**values)
+    with pytest.raises(ValueError, match="invalid adapter response"):
+        compact_response._validate_shape()

@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import hashlib
 import json
 import math
 import re
@@ -34,6 +35,7 @@ class AdapterRequest(_StrictModel):
     model_name: str
     model_path: str
     model_sha256: str
+    model_version: str
     reference_feature_b64: str
     reference_feature_length: int
     reference_feature_sha256: str
@@ -48,11 +50,12 @@ class AdapterRequest(_StrictModel):
         if (
             not _safe_token(self.adapter_contract_version)
             or not _safe_token(self.model_name)
+            or not _safe_token(self.model_version)
             or not _safe_token(self.threshold_config_version)
             or not _safe_token(self.vad_contract_version)
-            or not _safe_path(self.audio_path)
-            or not _safe_path(self.model_path)
-            or not _safe_path(self.vad_model_path)
+            or not _absolute_resolved_path(self.audio_path)
+            or not _absolute_resolved_path(self.model_path)
+            or not _absolute_resolved_path(self.vad_model_path)
             or not all(
                 _sha256(value)
                 for value in (
@@ -74,16 +77,20 @@ class AdapterRequest(_StrictModel):
 
     @classmethod
     def with_canonical_hash(cls, **values: object) -> "AdapterRequest":
+        feature: bytearray | None = None
         try:
             input_values = dict(values)
             input_values.pop("input_hash", None)
             request = cls(input_hash="0" * 64, **input_values)
-            _validated_feature(request)
+            feature = _validated_feature(request)
             return request.model_copy(
                 update={"input_hash": sha256_text(_request_canonical_json(request))}
             )
         except (TypeError, ValidationError, ValueError):
             raise _request_invalid() from None
+        finally:
+            if feature is not None:
+                wipe_reference_feature(feature)
 
 
 class AdapterSegment(_StrictModel):
@@ -140,27 +147,37 @@ class AdapterResponse(_StrictModel):
 
 
 def encode_request(request: AdapterRequest) -> bytes:
+    feature: bytearray | None = None
     if not isinstance(request, AdapterRequest):
         raise _request_invalid()
     try:
-        _validated_feature(request)
+        feature = _validated_feature(request)
         if request.input_hash != sha256_text(_request_canonical_json(request)):
             raise ValueError("request hash mismatch")
         return canonical_json(request.model_dump(mode="json")).encode("utf-8")
     except (TypeError, ValidationError, ValueError):
         raise _request_invalid() from None
+    finally:
+        if feature is not None:
+            wipe_reference_feature(feature)
 
 
 def decode_reference_feature(request: AdapterRequest, *, max_bytes: int) -> bytearray:
     if type(max_bytes) is not int or max_bytes < 1:
         raise _request_invalid()
+    feature: bytearray | None = None
+    succeeded = False
     try:
         feature = _validated_feature(request)
         if len(feature) != max_bytes:
             raise ValueError("reference feature length mismatch")
+        succeeded = True
         return feature
     except (TypeError, ValidationError, ValueError):
         raise _request_invalid() from None
+    finally:
+        if feature is not None and not succeeded:
+            wipe_reference_feature(feature)
 
 
 def wipe_reference_feature(feature: bytearray) -> None:
@@ -185,6 +202,7 @@ def decode_response(payload: object, *, expected_request: AdapterRequest) -> Ada
         if (
             response.input_hash != expected_request.input_hash
             or response.model_name != expected_request.model_name
+            or response.model_version != expected_request.model_version
             or response.adapter_contract_version != expected_request.adapter_contract_version
             or response.vad_contract_version != expected_request.vad_contract_version
         ):
@@ -224,23 +242,33 @@ def _request_canonical_json(request: AdapterRequest) -> str:
 def _validated_feature(request: AdapterRequest) -> bytearray:
     if not isinstance(request, AdapterRequest):
         raise ValueError("invalid request")
+    encoded = request.reference_feature_b64
+    expected_length = request.reference_feature_length
+    if (
+        type(encoded) is not str
+        or type(expected_length) is not int
+        or expected_length < 1
+        or expected_length > MAX_ADAPTER_RESPONSE_BYTES
+        or not encoded.isascii()
+        or len(encoded) != 4 * ((expected_length + 2) // 3)
+    ):
+        raise ValueError("invalid feature encoding")
+    decoded: bytearray | None = None
+    succeeded = False
     try:
-        decoded = bytearray(base64.b64decode(request.reference_feature_b64, validate=True))
+        decoded = bytearray(base64.b64decode(encoded, validate=True))
+        if (
+            len(decoded) != expected_length
+            or hashlib.sha256(decoded).hexdigest() != request.reference_feature_sha256
+        ):
+            raise ValueError("invalid feature identity")
+        succeeded = True
+        return decoded
     except (binascii.Error, ValueError):
         raise ValueError("invalid feature encoding") from None
-    if (
-        len(decoded) != request.reference_feature_length
-        or hashlib_sha256(decoded) != request.reference_feature_sha256
-    ):
-        wipe_reference_feature(decoded)
-        raise ValueError("invalid feature identity")
-    return decoded
-
-
-def hashlib_sha256(value: bytearray) -> str:
-    import hashlib
-
-    return hashlib.sha256(value).hexdigest()
+    finally:
+        if decoded is not None and not succeeded:
+            wipe_reference_feature(decoded)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -256,13 +284,21 @@ def _safe_token(value: object) -> bool:
     return type(value) is str and _SAFE_TOKEN.fullmatch(value) is not None
 
 
-def _safe_path(value: object) -> bool:
+def _absolute_resolved_path(value: object) -> bool:
     return (
         type(value) is str
         and bool(value)
         and len(value) <= 4_096
         and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+        and _is_absolute_resolved(value)
     )
+
+
+def _is_absolute_resolved(value: str) -> bool:
+    from pathlib import Path
+
+    path = Path(value)
+    return path.is_absolute() and path == path.resolve(strict=False)
 
 
 def _sha256(value: object) -> bool:

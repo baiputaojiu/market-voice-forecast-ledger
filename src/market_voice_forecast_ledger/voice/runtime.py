@@ -33,6 +33,10 @@ _SHERPA_VERSION = "1.13.4"
 _SHERPA_WHEEL_SHA256 = "cb1834182c4047b8edb1dceeed8d5cf7d6e10295a4079e5e0fea674b4314db06"
 _YT_DLP_SHA256 = "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a"
 _DENO_SHA256 = "98f8c2a2d470e4ccb04c935c86ff8050817d877762aec5eaee9e409ccb3b9fd"
+_PYTHON_VERSION = "3.14.6"
+_YT_DLP_VERSION = "2026.08.19"
+_DENO_VERSION = "2.9.5"
+_FFMPEG_VERSION = "9.0.1"
 
 VersionProbe = Callable[[tuple[str, ...]], str]
 
@@ -82,9 +86,11 @@ def attest_runtime(
         if not isinstance(settings, Settings) or not isinstance(allowlists, RuntimeAllowlists):
             raise ValueError("invalid runtime inputs")
         _validate_allowlists(allowlists)
-        lock = _read_lock(settings.voice_runtime_dir / "runtime-lock.json")
-        runtime_root = _private_root(settings.voice_runtime_dir)
-        model_root = _private_root(settings.voice_model_dir)
+        data_root = _private_root(settings.data_dir)
+        runtime_root = _private_child_root(settings.voice_runtime_dir, data_root)
+        model_root = _private_child_root(settings.voice_model_dir, data_root)
+        lock_path = _private_file(settings.voice_runtime_dir / "runtime-lock.json", runtime_root)
+        lock = _read_lock(lock_path)
         python = _artifact(lock["python"], runtime_root, {"path", "sha256", "version"})
         yt_dlp = _artifact(lock["yt_dlp"], runtime_root, {"path", "sha256", "version"})
         deno = _artifact(lock["deno"], runtime_root, {"path", "sha256", "version"})
@@ -101,6 +107,10 @@ def attest_runtime(
             or not _token(vad_contract_version)
             or not isinstance(sherpa, dict)
             or set(sherpa) != {"version", "wheel_sha256"}
+            or python["version"] != _PYTHON_VERSION
+            or yt_dlp["version"] != _YT_DLP_VERSION
+            or deno["version"] != _DENO_VERSION
+            or ffmpeg["version"] != _FFMPEG_VERSION
             or sherpa["version"] != _SHERPA_VERSION
             or sherpa["wheel_sha256"] != allowlists.sherpa_wheel_sha256
             or yt_dlp["sha256"] != allowlists.yt_dlp_sha256
@@ -137,8 +147,6 @@ def attest_runtime(
             sherpa_onnx_version=sherpa["version"],
             sherpa_wheel_sha256=sherpa["wheel_sha256"],
         )
-    except DomainError:
-        raise
     except Exception:
         raise _runtime_invalid() from None
 
@@ -186,17 +194,31 @@ def _artifact(value: object, root: Path, expected_keys: set[str]) -> dict[str, A
 
 
 def _private_root(path: Path) -> Path:
-    root = path.resolve(strict=True)
-    if not root.is_absolute() or _is_reparse(path) or _is_reparse(root):
+    raw = path.absolute()
+    if not raw.is_absolute():
+        raise ValueError("invalid private root")
+    _require_no_reparse(raw)
+    root = raw.resolve(strict=True)
+    if not root.is_dir():
         raise ValueError("invalid private root")
     return root
 
 
+def _private_child_root(path: Path, parent: Path) -> Path:
+    root = _private_root(path)
+    try:
+        root.relative_to(parent)
+    except ValueError:
+        raise ValueError("private root escaped data directory") from None
+    return root
+
+
 def _private_file(path: Path, root: Path) -> Path:
-    if not path.is_absolute():
+    raw = path.absolute()
+    if not raw.is_absolute():
         raise ValueError("private artifact must be absolute")
     try:
-        relative = path.relative_to(root)
+        relative = raw.relative_to(root)
     except ValueError:
         raise ValueError("private artifact escaped root") from None
     current = root
@@ -204,7 +226,7 @@ def _private_file(path: Path, root: Path) -> Path:
         current = current / component
         if _is_reparse(current):
             raise ValueError("private artifact reparse point")
-    resolved = path.resolve(strict=True)
+    resolved = raw.resolve(strict=True)
     try:
         resolved.relative_to(root)
     except ValueError:
@@ -212,6 +234,19 @@ def _private_file(path: Path, root: Path) -> Path:
     if not resolved.is_file():
         raise ValueError("private artifact is not a file")
     return resolved
+
+
+def _require_no_reparse(path: Path) -> None:
+    anchor = Path(path.anchor)
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError:
+        raise ValueError("invalid private path") from None
+    current = anchor
+    for component in relative.parts:
+        current = current / component
+        if _is_reparse(current):
+            raise ValueError("private path reparse point")
 
 
 def _is_reparse(path: Path) -> bool:
