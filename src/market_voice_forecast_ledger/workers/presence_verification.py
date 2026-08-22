@@ -12,6 +12,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
+try:
+    import _winapi
+except ImportError:  # pragma: no cover - the supported runtime is Windows
+    _winapi = None
+
 from market_voice_forecast_ledger.db.connection import transaction
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.enums import JobStatus, UnitStatus
@@ -76,7 +81,14 @@ _RECOVERABLE_STATUSES = frozenset(
         JobStatus.CANCEL_REQUESTED.value,
     }
 )
+_CANDIDATE_STATUSES = _RECOVERABLE_STATUSES | frozenset(
+    {JobStatus.QUEUED.value, JobStatus.RETRYING.value}
+)
+_JOB_STATUSES = frozenset(status.value for status in JobStatus)
 _WAKE_LOCK = Lock()
+_WAIT_OBJECT_0 = 0
+_WAIT_ABANDONED = 0x00000080
+_WAIT_TIMEOUT = 0x00000102
 
 
 class MediaAcquirer(Protocol):
@@ -129,6 +141,19 @@ class _AudioPaths:
         return (self.source, self.part, self.normalized)
 
 
+@dataclass(slots=True)
+class _WakeOwnership:
+    mutex_handle: int
+
+    def release(self) -> None:
+        try:
+            _release_windows_mutex(self.mutex_handle)
+        except Exception:
+            pass
+        finally:
+            _WAKE_LOCK.release()
+
+
 class PresenceVerificationWorker:
     def __init__(
         self,
@@ -169,6 +194,7 @@ class PresenceVerificationWorker:
                 after_unit_committed
             ):
                 raise ValueError("invalid unit observer")
+            wake_mutex_name = _database_wake_mutex_name(conn)
         except Exception:
             raise DomainError(
                 "VOICE_WORKER_CONFIG_INVALID",
@@ -189,19 +215,20 @@ class PresenceVerificationWorker:
         self._voice = VoiceVerificationRepository(conn, clock=self._clock)
         self._retention = RetentionRepository(conn)
         self._responses: dict[int, AdapterResponse] = {}
+        self._wake_mutex_name = wake_mutex_name
 
     def run_once(self) -> PresenceWorkerSummary:
-        acquired = False
+        ownership = None
         try:
-            acquired = _WAKE_LOCK.acquire(blocking=False)
-            if not acquired:
+            ownership = self._try_acquire_wake()
+            if ownership is None:
                 return _empty_summary()
             return self._run_once_unlocked()
         except Exception as cause:
             return _failed_summary(None, _safe_failure_code(cause))
         finally:
-            if acquired:
-                _WAKE_LOCK.release()
+            if ownership is not None:
+                ownership.release()
 
     def _run_once_unlocked(self) -> PresenceWorkerSummary:
         try:
@@ -227,10 +254,10 @@ class PresenceVerificationWorker:
         return self._execute_job(job_id)
 
     def recover_job(self, job_id: int) -> ResumePlan:
-        acquired = False
+        ownership = None
         try:
-            acquired = _WAKE_LOCK.acquire(blocking=False)
-            if not acquired:
+            ownership = self._try_acquire_wake()
+            if ownership is None:
                 raise DomainError(
                     "VOICE_PROCESSING_FAILED",
                     "presence worker is unavailable",
@@ -239,8 +266,21 @@ class PresenceVerificationWorker:
         except Exception as cause:
             raise _safe_domain_error(cause) from None
         finally:
-            if acquired:
-                _WAKE_LOCK.release()
+            if ownership is not None:
+                ownership.release()
+
+    def _try_acquire_wake(self) -> _WakeOwnership | None:
+        if not _WAKE_LOCK.acquire(blocking=False):
+            return None
+        try:
+            handle = _try_acquire_windows_mutex(self._wake_mutex_name)
+        except Exception:
+            _WAKE_LOCK.release()
+            raise
+        if handle is None:
+            _WAKE_LOCK.release()
+            return None
+        return _WakeOwnership(handle)
 
     def _recover_job(self, job_id: int) -> ResumePlan:
         boundary_plan = self._settle_requested_boundary(job_id)
@@ -282,7 +322,6 @@ class PresenceVerificationWorker:
     def _settle_requested_boundary(self, job_id: int) -> ResumePlan | None:
         with transaction(self._conn):
             self._jobs.require_canonical_video_pipeline_job(job_id)
-            self._voice.require_job_artifacts(job_id)
             status = self._jobs.status(job_id)
             if status not in {
                 JobStatus.PAUSE_REQUESTED,
@@ -299,7 +338,6 @@ class PresenceVerificationWorker:
                 ):
                     raise
                 plan = self._resume_plan_from_state(job_id)
-            self._voice.require_job_artifacts(job_id)
             return plan
 
     def _resume_plan_from_state(self, job_id: int) -> ResumePlan:
@@ -503,14 +541,18 @@ class PresenceVerificationWorker:
 
     def _claim_next_fifo(self) -> tuple[int, bool] | None:
         with transaction(self._conn):
-            runnable = self._voice.list_runnable_job_ids()
-            recoverable = self._recoverable_job_ids_in_transaction()
-            candidates = tuple(sorted((*runnable, *recoverable)))
+            candidates = self._candidate_jobs_in_transaction()
             if not candidates:
                 return None
-            job_id = candidates[0]
-            if job_id in recoverable:
+            job_id, status = candidates[0]
+            if status in _RECOVERABLE_STATUSES:
                 return job_id, True
+            runnable = self._voice.list_runnable_job_ids()
+            if job_id not in runnable:
+                raise DomainError(
+                    "VOICE_PROCESSING_FAILED",
+                    "presence job inventory is invalid",
+                )
             self._jobs.require_canonical_video_pipeline_job(job_id)
             artifacts = self._voice.require_job_artifacts(job_id)
             self._require_frozen_current(artifacts)
@@ -529,30 +571,31 @@ class PresenceVerificationWorker:
             self._voice.require_job_artifacts(job_id)
             return job_id, False
 
-    def _recoverable_job_ids_in_transaction(self) -> tuple[int, ...]:
+    def _candidate_jobs_in_transaction(self) -> tuple[tuple[int, str], ...]:
         rows = tuple(
             self._conn.execute(
                 "SELECT job.id, job.status, typeof(job.id) AS type_id, "
                 "typeof(job.status) AS type_status "
                 "FROM voice_verification_manifests AS manifest "
                 "JOIN jobs AS job ON job.id=manifest.job_id "
-                "WHERE job.status IN ('running', 'failed', "
-                "'pause_requested', 'cancel_requested') ORDER BY job.id"
+                "ORDER BY job.id"
             )
         )
-        result: list[int] = []
+        result: list[tuple[int, str]] = []
         for row in rows:
             if (
                 row["type_id"] != "integer"
                 or row["type_status"] != "text"
-                or row["status"] not in _RECOVERABLE_STATUSES
+                or row["status"] not in _JOB_STATUSES
             ):
                 raise DomainError(
                     "VOICE_PROCESSING_FAILED",
                     "presence job inventory is invalid",
                 )
-            self._canonical_artifacts(row["id"])
-            result.append(row["id"])
+            if row["status"] not in _CANDIDATE_STATUSES:
+                continue
+            self._jobs.require_canonical_video_pipeline_job(row["id"])
+            result.append((row["id"], row["status"]))
         return tuple(result)
 
     def _canonical_artifacts(self, job_id: int) -> VoiceJobArtifacts:
@@ -1207,6 +1250,45 @@ def _file_sha256(path: Path) -> str:
         raise DomainError(
             "VOICE_PROCESSING_FAILED", "presence artifact is unavailable"
         ) from None
+
+
+def _database_wake_mutex_name(conn: sqlite3.Connection) -> str:
+    rows = tuple(conn.execute("PRAGMA database_list"))
+    main_rows = tuple(row for row in rows if row[1] == "main")
+    if len(main_rows) != 1 or type(main_rows[0][2]) is not str:
+        raise ValueError("invalid main database identity")
+    database_path = Path(main_rows[0][2]).resolve(strict=True)
+    if not database_path.is_file():
+        raise ValueError("invalid main database identity")
+    canonical_identity = os.path.normcase(str(database_path))
+    digest = hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()
+    return f"Local\\MarketVoiceForecastLedger-PresenceWake-{digest}"
+
+
+def _windows_mutex_api():
+    if os.name != "nt" or _winapi is None:
+        raise OSError("presence wake ownership is unavailable")
+    return _winapi
+
+
+def _try_acquire_windows_mutex(name: str) -> int | None:
+    kernel32 = _windows_mutex_api()
+    handle = kernel32.CreateMutexW(0, False, name)
+    outcome = kernel32.WaitForSingleObject(handle, 0)
+    if outcome in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
+        return handle
+    kernel32.CloseHandle(handle)
+    if outcome == _WAIT_TIMEOUT:
+        return None
+    raise OSError("wake ownership failed")
+
+
+def _release_windows_mutex(handle: int) -> None:
+    kernel32 = _windows_mutex_api()
+    try:
+        kernel32.ReleaseMutex(handle)
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _hash_payload(value: object) -> str:

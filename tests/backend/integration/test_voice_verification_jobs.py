@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import multiprocessing
 import sqlite3
 import struct
 from dataclasses import dataclass, replace
@@ -1216,6 +1217,21 @@ class ReentrantPresenceMediaNormalizer(FakePresenceMediaNormalizer):
         return super().normalize_registered(source, target)
 
 
+class BlockingPresenceMediaNormalizer(FakePresenceMediaNormalizer):
+    def __init__(self, db: sqlite3.Connection, entered, release) -> None:
+        super().__init__(db)
+        self._entered = entered
+        self._release = release
+
+    def normalize_registered(
+        self, source: Path, target: Path
+    ) -> NormalizedAudio:
+        self._entered.set()
+        if not self._release.poll(30) or self._release.recv() is not True:
+            raise RuntimeError("test normalization release was not signaled")
+        return super().normalize_registered(source, target)
+
+
 class MutatingPresenceMediaNormalizer(FakePresenceMediaNormalizer):
     def __init__(self, db: sqlite3.Connection, mutation: str) -> None:
         super().__init__(db)
@@ -1371,6 +1387,46 @@ def presence_worker_harness(
     )
 
 
+def _run_presence_worker_process(
+    database_path: str,
+    temp_path: str,
+    job: JobSeed,
+    runtime: RuntimeAttestation,
+    result_queue,
+    entered=None,
+    release=None,
+) -> None:
+    connection = open_database(Path(database_path))
+    try:
+        normalizer = (
+            BlockingPresenceMediaNormalizer(connection, entered, release)
+            if entered is not None and release is not None
+            else FakePresenceMediaNormalizer(connection)
+        )
+        harness = presence_worker_harness(
+            connection,
+            Path(temp_path),
+            job,
+            normalizer=normalizer,
+            runtime=runtime,
+        )
+        summary = harness.worker.run_once()
+        result_queue.put(
+            {
+                "adapter_calls": len(harness.adapter.calls),
+                "acquirer_calls": len(harness.acquirer.calls),
+                "failed_jobs": summary.failed_jobs,
+                "job_id": summary.job_id,
+                "normalizer_calls": len(harness.normalizer.calls),
+                "succeeded_jobs": summary.succeeded_jobs,
+            }
+        )
+    except BaseException as cause:
+        result_queue.put({"error_type": type(cause).__name__})
+    finally:
+        connection.close()
+
+
 def _assert_current_presence_unverified(
     db: sqlite3.Connection, candidate_id: int
 ) -> None:
@@ -1475,6 +1531,127 @@ def test_second_connection_does_not_recover_a_live_external_unit(
         assert all(row["attempt_count"] == 1 for row in rows)
     finally:
         competing_db.close()
+
+
+def test_second_process_cannot_recover_live_work_and_owner_crash_releases_wake(
+    db, tmp_path: Path
+) -> None:
+    job = seed_job(db)
+    runtime = presence_worker_harness(db, tmp_path, job).runtime
+    database_path = db.execute("PRAGMA database_list").fetchone()["file"]
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release_reader, release_writer = context.Pipe(duplex=False)
+    owner_results = context.Queue()
+    competitor_results = context.Queue()
+    recovery_results = context.Queue()
+    owner = context.Process(
+        target=_run_presence_worker_process,
+        args=(
+            database_path,
+            str(tmp_path),
+            job,
+            runtime,
+            owner_results,
+            entered,
+            release_reader,
+        ),
+    )
+    competitor = context.Process(
+        target=_run_presence_worker_process,
+        args=(
+            database_path,
+            str(tmp_path),
+            job,
+            runtime,
+            competitor_results,
+        ),
+    )
+    recovery = context.Process(
+        target=_run_presence_worker_process,
+        args=(
+            database_path,
+            str(tmp_path),
+            job,
+            runtime,
+            recovery_results,
+        ),
+    )
+    try:
+        owner.start()
+        assert entered.wait(30), "owner did not reach normalization"
+
+        competitor.start()
+        competitor.join(30)
+        assert not competitor.is_alive(), "competing wake did not finish"
+        competitor_result = competitor_results.get(timeout=5)
+
+        owner.terminate()
+        owner.join(30)
+        assert not owner.is_alive(), "crashed owner did not exit"
+        assert owner.exitcode not in {None, 0}
+
+        recovery.start()
+        recovery.join(30)
+        assert not recovery.is_alive(), "recovery wake did not finish"
+        recovery_result = recovery_results.get(timeout=5)
+    finally:
+        try:
+            release_writer.send(True)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        for process in (owner, competitor, recovery):
+            if process.pid is None:
+                continue
+            if process.is_alive():
+                process.terminate()
+            process.join(30)
+        release_reader.close()
+        release_writer.close()
+        for result_queue in (
+            owner_results,
+            competitor_results,
+            recovery_results,
+        ):
+            result_queue.close()
+            result_queue.join_thread()
+
+    assert competitor.exitcode == 0
+    assert competitor_result == {
+        "adapter_calls": 0,
+        "acquirer_calls": 0,
+        "failed_jobs": 0,
+        "job_id": None,
+        "normalizer_calls": 0,
+        "succeeded_jobs": 0,
+    }
+    assert recovery.exitcode == 0
+    assert recovery_result == {
+        "adapter_calls": 1,
+        "acquirer_calls": 0,
+        "failed_jobs": 0,
+        "job_id": job.job_id,
+        "normalizer_calls": 1,
+        "succeeded_jobs": 1,
+    }
+    rows = tuple(
+        db.execute(
+            "SELECT status, attempt_count FROM job_units "
+            "WHERE job_id=? ORDER BY ordinal",
+            (job.job_id,),
+        )
+    )
+    assert tuple(row["status"] for row in rows) == ("success",) * 7
+    assert tuple(row["attempt_count"] for row in rows) == (
+        1,
+        1,
+        2,
+        1,
+        1,
+        1,
+        1,
+    )
+    _assert_current_presence_unverified(db, job.reference.candidate_id)
 
 
 @pytest.mark.parametrize("crash_after", VOICE_UNIT_KEYS)
@@ -1795,14 +1972,25 @@ def test_worker_honors_pause_and_stop_at_committed_unit_boundary(
         ("stop", JobStatus.STOPPED, "stopped_jobs"),
     ),
 )
-def test_requested_boundary_settles_before_adapter_verification(
+def test_requested_boundary_settles_before_artifact_verification(
     db,
     tmp_path: Path,
+    monkeypatch,
     boundary_action: str,
     expected_status: JobStatus,
     summary_field: str,
 ) -> None:
-    job = seed_job(db)
+    seed_pilot_environment(db)
+    service = pilot_service(db)
+    preview = service.preview_pilot()
+    creation = service.create_pilot(preview.preview_hash)
+    job_id, higher_id = creation.job_ids[:2]
+    manifest = VoiceVerificationRepository(db).get_manifest_for_job(job_id)
+    job = SimpleNamespace(
+        job_id=job_id,
+        snapshot=manifest.snapshot,
+        reference=SimpleNamespace(candidate_id=manifest.snapshot.candidate_id),
+    )
     crashing = FakePresenceAdapter(
         failure=cast(Exception, SimulatedCrash("voice:vad"))
     )
@@ -1819,9 +2007,19 @@ def test_requested_boundary_settles_before_adapter_verification(
         jobs.request_stop(job.job_id)
     replacement = presence_worker_harness(db, tmp_path, job)
 
+    def reject_artifact_verification(_job_id: int):
+        raise RuntimeError("PRIVATE_ARTIFACT_VERIFICATION_SENTINEL")
+
+    monkeypatch.setattr(
+        replacement.worker._voice,
+        "require_job_artifacts",
+        reject_artifact_verification,
+    )
+
     summary = replacement.worker.run_once()
 
     assert JobStateService(db).status(job.job_id) is expected_status
+    assert JobStateService(db).status(higher_id) is JobStatus.QUEUED
     assert getattr(summary, summary_field) == 1
     assert replacement.acquirer.calls == []
     assert replacement.normalizer.calls == []
