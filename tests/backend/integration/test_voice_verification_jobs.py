@@ -48,6 +48,9 @@ from market_voice_forecast_ledger.voice.protocol import (
     AdapterResponse,
 )
 from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
+from market_voice_forecast_ledger.workers import (
+    presence_verification as presence_worker_module,
+)
 from market_voice_forecast_ledger.workers.presence_verification import (
     PresenceVerificationWorker,
 )
@@ -1256,6 +1259,51 @@ class MutatingPresenceMediaNormalizer(FakePresenceMediaNormalizer):
         return normalized
 
 
+class FakeWindowsMutexApi:
+    def __init__(
+        self,
+        *,
+        outcome: int | None = None,
+        wait_failure: Exception | None = None,
+    ) -> None:
+        self._outcome = outcome
+        self._wait_failure = wait_failure
+        self.created: list[int] = []
+        self.waited: list[int] = []
+        self.released: list[int] = []
+        self.closed: list[int] = []
+        self.events: list[tuple[str, int]] = []
+
+    def CreateMutexW(
+        self, security_attributes: int, initial_owner: bool, name: str
+    ) -> int:
+        assert security_attributes == 0
+        assert initial_owner is False
+        assert isinstance(name, str)
+        handle = 4242
+        self.created.append(handle)
+        self.events.append(("create", handle))
+        return handle
+
+    def WaitForSingleObject(self, handle: int, timeout_ms: int) -> int:
+        assert handle == 4242
+        assert timeout_ms == 0
+        self.waited.append(handle)
+        self.events.append(("wait", handle))
+        if self._wait_failure is not None:
+            raise self._wait_failure
+        assert self._outcome is not None
+        return self._outcome
+
+    def ReleaseMutex(self, handle: int) -> None:
+        self.released.append(handle)
+        self.events.append(("release", handle))
+
+    def CloseHandle(self, handle: int) -> None:
+        self.closed.append(handle)
+        self.events.append(("close", handle))
+
+
 class FakePresenceAdapter:
     def __init__(
         self,
@@ -1531,6 +1579,102 @@ def test_second_connection_does_not_recover_a_live_external_unit(
         assert all(row["attempt_count"] == 1 for row in rows)
     finally:
         competing_db.close()
+
+
+def test_native_wake_closes_created_handle_when_wait_raises_and_sanitizes(
+    db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = seed_job(db)
+    native = FakeWindowsMutexApi(
+        wait_failure=RuntimeError("PRIVATE_NATIVE_WAIT_SENTINEL")
+    )
+    monkeypatch.setattr(presence_worker_module, "_winapi", native)
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    summary = harness.worker.run_once()
+
+    assert summary.job_id is None
+    assert summary.failed_jobs == 1
+    assert summary.failed_code == "VOICE_PROCESSING_FAILED"
+    assert "PRIVATE_NATIVE_WAIT_SENTINEL" not in repr(summary)
+    assert native.created == [4242]
+    assert native.waited == [4242]
+    assert native.released == []
+    assert native.closed == [4242]
+    assert harness.acquirer.calls == []
+    assert harness.normalizer.calls == []
+    assert harness.adapter.calls == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_failed_code"),
+    (
+        (0x00000102, None),
+        (0xFFFFFFFF, "VOICE_PROCESSING_FAILED"),
+    ),
+)
+def test_native_wake_closes_every_nonowned_handle_exactly_once(
+    db,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: int,
+    expected_failed_code: str | None,
+) -> None:
+    job = seed_job(db)
+    native = FakeWindowsMutexApi(outcome=outcome)
+    monkeypatch.setattr(presence_worker_module, "_winapi", native)
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    summary = harness.worker.run_once()
+
+    assert summary.job_id is None
+    assert summary.failed_code == expected_failed_code
+    assert summary.failed_jobs == int(expected_failed_code is not None)
+    assert native.created == [4242]
+    assert native.waited == [4242]
+    assert native.released == []
+    assert native.closed == [4242]
+    assert native.events == [
+        ("create", 4242),
+        ("wait", 4242),
+        ("close", 4242),
+    ]
+    assert harness.acquirer.calls == []
+    assert harness.normalizer.calls == []
+    assert harness.adapter.calls == []
+
+
+@pytest.mark.parametrize("outcome", (0x00000000, 0x00000080))
+def test_native_wake_keeps_owned_handle_until_context_release_exactly_once(
+    db,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: int,
+) -> None:
+    job = seed_job(db)
+    JobStateService(db, clock=lambda: NOW).request_stop(job.job_id)
+    native = FakeWindowsMutexApi(outcome=outcome)
+    monkeypatch.setattr(presence_worker_module, "_winapi", native)
+    harness = presence_worker_harness(db, tmp_path, job)
+
+    summary = harness.worker.run_once()
+
+    assert summary.job_id is None
+    assert summary.failed_jobs == 0
+    assert summary.failed_code is None
+    assert native.created == [4242]
+    assert native.waited == [4242]
+    assert native.released == [4242]
+    assert native.closed == [4242]
+    assert native.events == [
+        ("create", 4242),
+        ("wait", 4242),
+        ("release", 4242),
+        ("close", 4242),
+    ]
+    assert harness.acquirer.calls == []
+    assert harness.normalizer.calls == []
+    assert harness.adapter.calls == []
 
 
 def test_second_process_cannot_recover_live_work_and_owner_crash_releases_wake(

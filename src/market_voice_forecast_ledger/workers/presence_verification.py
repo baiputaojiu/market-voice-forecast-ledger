@@ -1274,13 +1274,18 @@ def _windows_mutex_api():
 def _try_acquire_windows_mutex(name: str) -> int | None:
     kernel32 = _windows_mutex_api()
     handle = kernel32.CreateMutexW(0, False, name)
-    outcome = kernel32.WaitForSingleObject(handle, 0)
-    if outcome in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
-        return handle
-    kernel32.CloseHandle(handle)
-    if outcome == _WAIT_TIMEOUT:
-        return None
-    raise OSError("wake ownership failed")
+    ownership_transferred = False
+    try:
+        outcome = kernel32.WaitForSingleObject(handle, 0)
+        if outcome in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
+            ownership_transferred = True
+            return handle
+        if outcome == _WAIT_TIMEOUT:
+            return None
+        raise OSError("wake ownership failed")
+    finally:
+        if not ownership_transferred:
+            kernel32.CloseHandle(handle)
 
 
 def _release_windows_mutex(handle: int) -> None:
