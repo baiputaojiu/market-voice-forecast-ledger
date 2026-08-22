@@ -287,3 +287,28 @@ def test_reference_read_rejects_non_integer_storage_type(db) -> None:
 
     with pytest.raises(DomainError, match="VOICE_REFERENCE_STORED_INVALID"):
         repository.get_reference_bundle(seed.reference_profile_id)
+
+
+def test_reference_clip_append_rejects_corrupt_existing_clip_before_insert(
+    db,
+) -> None:
+    seed = seed_reference_profile(db)
+    add_valid_clip(db, seed)
+    db.execute("DROP TRIGGER voice_reference_clips_no_update")
+    db.execute(
+        "UPDATE voice_reference_clips SET clip_hash=? "
+        "WHERE reference_profile_id=? AND ordinal=1",
+        ("b" * 64, seed.reference_profile_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_REFERENCE_STORED_INVALID"):
+        add_valid_clip(db, seed, ordinal=2)
+
+    rows = db.execute(
+        "SELECT ordinal, clip_hash FROM voice_reference_clips "
+        "WHERE reference_profile_id=? ORDER BY ordinal",
+        (seed.reference_profile_id,),
+    ).fetchall()
+    assert tuple((row["ordinal"], row["clip_hash"]) for row in rows) == (
+        (1, "b" * 64),
+    )

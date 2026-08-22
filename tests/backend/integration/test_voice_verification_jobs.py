@@ -1,3 +1,4 @@
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,7 +11,11 @@ from market_voice_forecast_ledger.domain.common import (
     sha256_text,
     utc_iso,
 )
-from market_voice_forecast_ledger.domain.discovery import PresenceState
+from market_voice_forecast_ledger.domain.discovery import (
+    PresenceOrigin,
+    PresenceState,
+    canonical_presence_decision_hash,
+)
 from market_voice_forecast_ledger.domain.enums import JobStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import (
@@ -23,6 +28,7 @@ from market_voice_forecast_ledger.domain.voice_verification import (
 )
 from market_voice_forecast_ledger.repositories.voice_verification import (
     VoiceVerificationRepository,
+    canonical_voice_segment_hash,
 )
 from market_voice_forecast_ledger.services.job_state import JobStateService
 from tests.backend.integration.test_voice_reference_enrollment import (
@@ -214,6 +220,76 @@ def valid_review(run_id: int, action: ReviewAction) -> ReviewCommand:
     )
 
 
+def move_candidate_pointer_from_frozen_decision(
+    db: sqlite3.Connection, job: JobSeed
+) -> int:
+    created_at = datetime(2026, 8, 22, 4, 30, tzinfo=timezone.utc)
+    evidence_ref = "stale-manifest-mutation"
+    evidence_hash = "9" * 64
+    decision_hash = canonical_presence_decision_hash(
+        candidate_id=job.reference.candidate_id,
+        state=PresenceState.CONFIRMED,
+        decision_origin=PresenceOrigin.VOICE_VERIFICATION,
+        evidence_ref=evidence_ref,
+        evidence_hash=evidence_hash,
+        created_at=created_at,
+    )
+    decision_id = db.execute(
+        """
+        INSERT INTO presence_decisions(
+            candidate_id, state, decision_origin, evidence_ref,
+            evidence_hash, decision_hash, created_at
+        ) VALUES (?, 'presence_confirmed', 'voice_verification', ?, ?, ?, ?)
+        """,
+        (
+            job.reference.candidate_id,
+            evidence_ref,
+            evidence_hash,
+            decision_hash,
+            utc_iso(created_at),
+        ),
+    ).lastrowid
+    db.execute(
+        "UPDATE subject_video_candidates SET current_presence_decision_id=? "
+        "WHERE id=?",
+        (decision_id, job.reference.candidate_id),
+    )
+    return decision_id
+
+
+def insert_foreign_voice_decision_for_review(
+    db: sqlite3.Connection, review_id: int, review_hash: str
+) -> None:
+    foreign_candidate_id = 999_999
+    decision_hash = canonical_presence_decision_hash(
+        candidate_id=foreign_candidate_id,
+        state=PresenceState.CONFIRMED,
+        decision_origin=PresenceOrigin.VOICE_VERIFICATION,
+        evidence_ref=str(review_id),
+        evidence_hash=review_hash,
+        created_at=REVIEWED_AT,
+    )
+    db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        db.execute(
+            """
+            INSERT INTO presence_decisions(
+                candidate_id, state, decision_origin, evidence_ref,
+                evidence_hash, decision_hash, created_at
+            ) VALUES (?, 'presence_confirmed', 'voice_verification', ?, ?, ?, ?)
+            """,
+            (
+                foreign_candidate_id,
+                str(review_id),
+                review_hash,
+                decision_hash,
+                utc_iso(REVIEWED_AT),
+            ),
+        )
+    finally:
+        db.execute("PRAGMA foreign_keys=ON")
+
+
 def test_manifest_round_trip_and_runnable_jobs_are_fifo(db) -> None:
     job = seed_job(db)
     repository = VoiceVerificationRepository(db)
@@ -305,6 +381,159 @@ def test_run_and_segments_rollback_after_second_segment_failure(db) -> None:
     )
 
 
+def test_run_write_rejects_stale_manifest_before_any_insert(db) -> None:
+    job = seed_job(db)
+    move_candidate_pointer_from_frozen_decision(db, job)
+
+    with pytest.raises(DomainError, match="VOICE_RUN_INVALID"):
+        canonical_run(db, job)
+
+    assert db.execute("SELECT COUNT(*) FROM voice_verification_runs").fetchone()[0] == 0
+    assert (
+        db.execute("SELECT COUNT(*) FROM voice_verification_segments").fetchone()[0]
+        == 0
+    )
+
+
+def test_run_write_normalizes_negative_zero_before_hash_and_round_trip(db) -> None:
+    job = seed_job(db)
+    input_hash = "c" * 64
+    normalized_segment = VoiceSegmentScore(
+        1,
+        1_000,
+        2_000,
+        0.0,
+        segment_hash(job.snapshot, input_hash, (1, 1_000, 2_000, 0.0)),
+    )
+    supplied_segment = VoiceSegmentScore(
+        normalized_segment.ordinal,
+        normalized_segment.start_ms,
+        normalized_segment.end_ms,
+        -0.0,
+        normalized_segment.evidence_hash,
+    )
+    assert canonical_voice_segment_hash(
+        job.snapshot,
+        input_hash,
+        ordinal=1,
+        start_ms=1_000,
+        end_ms=2_000,
+        raw_match_score=-0.0,
+    ) == normalized_segment.evidence_hash
+    result = VoiceRunResult(
+        job_id=job.job_id,
+        candidate_id=job.reference.candidate_id,
+        input_hash=input_hash,
+        output_hash=run_output_hash(
+            job.snapshot,
+            input_hash,
+            VoiceProposal.LIKELY_PRESENT,
+            (normalized_segment,),
+        ),
+        proposal=VoiceProposal.LIKELY_PRESENT,
+        result_code="VOICE_PROPOSAL_READY",
+    )
+
+    with transaction(db):
+        run_id = VoiceVerificationRepository(db).add_run_with_segments(
+            result, (supplied_segment,), completed_at=NOW
+        )
+
+    stored = VoiceVerificationRepository(db).get_run(run_id)
+    assert stored.segments[0].raw_match_score == 0.0
+    assert math.copysign(1.0, stored.segments[0].raw_match_score) == 1.0
+    assert stored.segments[0].evidence_hash == normalized_segment.evidence_hash
+    assert stored.output_hash == result.output_hash
+
+
+@pytest.mark.parametrize(
+    (
+        "unit_status",
+        "external_input_hash",
+        "bound_input_hash",
+        "output_hash",
+        "attempt_count",
+        "error_code",
+        "started_at",
+        "finished_at",
+    ),
+    (
+        ("pending", None, None, "a" * 64, 0, None, None, None),
+        ("running", None, "a" * 64, None, 1, None, "not-utc", None),
+        (
+            "success",
+            sqlite3.Binary(b"external"),
+            "a" * 64,
+            "b" * 64,
+            1,
+            None,
+            utc_iso(NOW),
+            utc_iso(NOW),
+        ),
+        (
+            "failed",
+            None,
+            "a" * 64,
+            None,
+            1,
+            "unsafe error",
+            utc_iso(NOW),
+            utc_iso(NOW),
+        ),
+        ("pending", None, None, None, 0.5, None, None, None),
+        ("corrupt", None, None, None, 0, None, None, None),
+    ),
+)
+def test_runnable_read_validates_exact_unit_rows_for_every_state(
+    db,
+    unit_status,
+    external_input_hash,
+    bound_input_hash,
+    output_hash,
+    attempt_count,
+    error_code,
+    started_at,
+    finished_at,
+) -> None:
+    job = seed_job(db)
+    db.execute("PRAGMA ignore_check_constraints=ON")
+    db.execute(
+        """
+        UPDATE job_units
+        SET status=?, external_input_hash=?, bound_input_hash=?, output_hash=?,
+            attempt_count=?, error_code=?, started_at=?, finished_at=?
+        WHERE job_id=? AND ordinal=1
+        """,
+        (
+            unit_status,
+            external_input_hash,
+            bound_input_hash,
+            output_hash,
+            attempt_count,
+            error_code,
+            started_at,
+            finished_at,
+            job.job_id,
+        ),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).list_runnable_job_ids()
+
+
+def test_artifact_read_validates_pending_unit_external_input_binding(db) -> None:
+    job = seed_job(db)
+    db.execute("PRAGMA ignore_check_constraints=ON")
+    db.execute(
+        "UPDATE job_units SET external_input_hash=? "
+        "WHERE job_id=? AND ordinal=1",
+        ("a" * 64, job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
 def test_require_job_artifacts_does_not_trust_succeeded_status_without_run(db) -> None:
     job = seed_job(db)
     mark_job_succeeded(db, job.job_id)
@@ -347,6 +576,66 @@ def test_pending_review_list_rejects_unknown_stored_status(db) -> None:
         VoiceVerificationRepository(db).list_pending_reviews()
 
 
+def test_pending_review_read_validates_success_unit_external_input_type(db) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute("DROP TRIGGER job_units_input_binding_immutable")
+    db.execute(
+        "UPDATE job_units SET external_input_hash=? "
+        "WHERE job_id=? AND ordinal=1",
+        (sqlite3.Binary(b"external"), job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        VoiceVerificationRepository(db).list_pending_reviews()
+
+
+def test_pending_review_read_rejects_malformed_existing_review(db) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    repository = VoiceVerificationRepository(db, clock=lambda: REVIEWED_AT)
+    with transaction(db):
+        repository.add_review_and_decision(valid_review(run_id, ReviewAction.HOLD))
+    db.execute("DROP TRIGGER voice_verification_reviews_no_update")
+    db.execute(
+        "UPDATE voice_verification_reviews SET review_hash=? WHERE run_id=?",
+        ("0" * 64, run_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        repository.list_pending_reviews()
+
+
+def test_pending_review_read_rejects_duplicate_existing_reviews(db) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    repository = VoiceVerificationRepository(db, clock=lambda: REVIEWED_AT)
+    with transaction(db):
+        repository.add_review_and_decision(valid_review(run_id, ReviewAction.HOLD))
+    db.execute(
+        "ALTER TABLE voice_verification_reviews "
+        "RENAME TO voice_verification_reviews_strict"
+    )
+    db.execute(
+        "CREATE TABLE voice_verification_reviews AS "
+        "SELECT * FROM voice_verification_reviews_strict WHERE 0"
+    )
+    db.execute(
+        "INSERT INTO voice_verification_reviews "
+        "SELECT * FROM voice_verification_reviews_strict"
+    )
+    db.execute(
+        "INSERT INTO voice_verification_reviews "
+        "SELECT * FROM voice_verification_reviews_strict"
+    )
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        repository.list_pending_reviews()
+
+
 def test_review_write_requires_caller_transaction(db) -> None:
     job = seed_job(db)
     run_id = canonical_run(db, job)
@@ -356,6 +645,83 @@ def test_review_write_requires_caller_transaction(db) -> None:
         VoiceVerificationRepository(db).add_review_and_decision(
             valid_review(run_id, ReviewAction.CONFIRM)
         )
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    tuple(status for status in JobStatus if status is not JobStatus.SUCCEEDED),
+)
+def test_review_write_requires_succeeded_job_before_any_write(
+    db, job_status: JobStatus
+) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    db.execute(
+        "UPDATE jobs SET status=?, updated_at=? WHERE id=?",
+        (job_status.value, utc_iso(NOW), job.job_id),
+    )
+    before_decisions = db.execute(
+        "SELECT COUNT(*) FROM presence_decisions"
+    ).fetchone()[0]
+
+    with pytest.raises(DomainError, match="VOICE_REVIEW_INVALID"):
+        with transaction(db):
+            VoiceVerificationRepository(
+                db, clock=lambda: REVIEWED_AT
+            ).add_review_and_decision(
+                valid_review(run_id, ReviewAction.CONFIRM)
+            )
+
+    assert (
+        db.execute("SELECT COUNT(*) FROM voice_verification_reviews").fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute("SELECT COUNT(*) FROM presence_decisions").fetchone()[0]
+        == before_decisions
+    )
+    assert db.execute(
+        "SELECT current_presence_decision_id FROM subject_video_candidates WHERE id=?",
+        (job.reference.candidate_id,),
+    ).fetchone()[0] == job.reference.decision_id
+
+
+def test_review_write_requires_fully_verified_success_units_before_any_write(
+    db,
+) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    db.execute("DROP TRIGGER job_units_input_binding_immutable")
+    db.execute(
+        "UPDATE job_units SET external_input_hash=? "
+        "WHERE job_id=? AND ordinal=1",
+        (sqlite3.Binary(b"external"), job.job_id),
+    )
+    before_decisions = db.execute(
+        "SELECT COUNT(*) FROM presence_decisions"
+    ).fetchone()[0]
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        with transaction(db):
+            VoiceVerificationRepository(
+                db, clock=lambda: REVIEWED_AT
+            ).add_review_and_decision(
+                valid_review(run_id, ReviewAction.CONFIRM)
+            )
+
+    assert (
+        db.execute("SELECT COUNT(*) FROM voice_verification_reviews").fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute("SELECT COUNT(*) FROM presence_decisions").fetchone()[0]
+        == before_decisions
+    )
+    assert db.execute(
+        "SELECT current_presence_decision_id FROM subject_video_candidates WHERE id=?",
+        (job.reference.candidate_id,),
+    ).fetchone()[0] == job.reference.decision_id
 
 
 @pytest.mark.parametrize(
@@ -413,6 +779,26 @@ def test_hold_review_creates_no_decision_and_does_not_move_pointer(db) -> None:
     assert db.execute(
         "SELECT action FROM voice_verification_reviews WHERE id=?", (review_id,)
     ).fetchone()[0] == "hold"
+
+
+@pytest.mark.parametrize("action", (ReviewAction.HOLD, ReviewAction.CONFIRM))
+def test_review_read_rejects_foreign_candidate_decision_with_same_evidence_ref(
+    db, action: ReviewAction
+) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    repository = VoiceVerificationRepository(db, clock=lambda: REVIEWED_AT)
+    with transaction(db):
+        review_id = repository.add_review_and_decision(valid_review(run_id, action))
+    review_hash = db.execute(
+        "SELECT review_hash FROM voice_verification_reviews WHERE id=?",
+        (review_id,),
+    ).fetchone()[0]
+    insert_foreign_voice_decision_for_review(db, review_id, review_hash)
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        repository.get_run(run_id)
 
 
 def test_review_and_decision_rollback_when_pointer_update_fails(db) -> None:

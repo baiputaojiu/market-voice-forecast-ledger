@@ -17,7 +17,12 @@ from market_voice_forecast_ledger.domain.discovery import (
     PresenceState,
     canonical_presence_decision_hash,
 )
-from market_voice_forecast_ledger.domain.enums import JobKind, JobStage, JobStatus
+from market_voice_forecast_ledger.domain.enums import (
+    JobKind,
+    JobStage,
+    JobStatus,
+    UnitStatus,
+)
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.jobs import JobManifest, ManifestUnit
 from market_voice_forecast_ledger.domain.voice_verification import (
@@ -37,9 +42,11 @@ _UTC_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _CANONICAL_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_RESULT_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 _CLIP_KINDS = frozenset({"enrollment", "held_out_positive", "negative"})
 _RUNNABLE_STATUSES = frozenset({JobStatus.QUEUED.value, JobStatus.RETRYING.value})
 _JOB_STATUSES = frozenset(status.value for status in JobStatus)
+_UNIT_STATUSES = frozenset(status.value for status in UnitStatus)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +193,9 @@ def canonical_voice_segment_hash(
                 "model_name": snapshot.model_name,
                 "model_version": snapshot.model_version,
                 "ordinal": ordinal,
-                "raw_match_score": raw_match_score,
+                "raw_match_score": (
+                    0.0 if raw_match_score == 0.0 else raw_match_score
+                ),
                 "schema": "voice-verification-segment.v1",
                 "start_ms": start_ms,
                 "threshold_config_version": snapshot.threshold_config_version,
@@ -216,7 +225,11 @@ def canonical_voice_run_output_hash(
                         "end_ms": segment.end_ms,
                         "evidence_hash": segment.evidence_hash,
                         "ordinal": segment.ordinal,
-                        "raw_match_score": segment.raw_match_score,
+                        "raw_match_score": (
+                            0.0
+                            if segment.raw_match_score == 0.0
+                            else segment.raw_match_score
+                        ),
                         "start_ms": segment.start_ms,
                     }
                     for segment in segments
@@ -278,15 +291,7 @@ class VoiceVerificationRepository:
             "SELECT 1 FROM videos WHERE id=?", (command.video_id,)
         ).fetchone() is None:
             _invalid_reference()
-        stored = tuple(
-            self._conn.execute(
-                "SELECT * FROM voice_reference_clips "
-                "WHERE reference_profile_id=? ORDER BY ordinal",
-                (reference_profile_id,),
-            )
-        )
-        if any(row["ordinal"] != index for index, row in enumerate(stored, 1)):
-            _stored_reference_invalid()
+        stored = self._read_reference_clips(profile)
         if ordinal != len(stored) + 1:
             _invalid_reference()
         clip_hash = canonical_voice_clip_hash(
@@ -402,36 +407,9 @@ class VoiceVerificationRepository:
             if feature_row is None:
                 raise ValueError("feature missing")
             feature = self._feature_from_row(feature_row, profile)
-            clip_rows = tuple(
-                self._conn.execute(
-                    """
-                    SELECT *,
-                           typeof(id) AS type_id,
-                           typeof(reference_profile_id) AS type_reference_profile_id,
-                           typeof(ordinal) AS type_ordinal,
-                           typeof(clip_kind) AS type_clip_kind,
-                           typeof(subject_id) AS type_subject_id,
-                           typeof(video_id) AS type_video_id,
-                           typeof(start_ms) AS type_start_ms,
-                           typeof(end_ms) AS type_end_ms,
-                           typeof(normalized_audio_sha256) AS type_audio_hash,
-                           typeof(approval_actor) AS type_approval_actor,
-                           typeof(approval_reason) AS type_approval_reason,
-                           typeof(approved_at) AS type_approved_at,
-                           typeof(clip_hash) AS type_clip_hash
-                    FROM voice_reference_clips
-                    WHERE reference_profile_id=?
-                    ORDER BY ordinal
-                    """,
-                    (reference_profile_id,),
-                )
-            )
-            if not clip_rows:
+            clips = self._read_reference_clips(profile)
+            if not clips:
                 raise ValueError("clips missing")
-            clips = tuple(
-                self._clip_from_row(row, profile, expected_ordinal=ordinal)
-                for ordinal, row in enumerate(clip_rows, start=1)
-            )
         except (DomainError, LookupError, TypeError, ValueError) as cause:
             if (
                 isinstance(cause, DomainError)
@@ -642,20 +620,18 @@ class VoiceVerificationRepository:
         rows = tuple(
             self._conn.execute(
                 """
-                SELECT run.id
+                SELECT run.id, typeof(run.id) AS type_id
                 FROM voice_verification_runs AS run
-                JOIN jobs AS job ON job.id=run.job_id
-                LEFT JOIN voice_verification_reviews AS review ON review.run_id=run.id
-                WHERE review.id IS NULL
                 ORDER BY run.id
                 """
             )
         )
         pending: list[StoredVoiceRun] = []
         for row in rows:
-            if type(row["id"]) is not int:
+            if row["type_id"] != "integer" or type(row["id"]) is not int:
                 _stored_run_invalid()
             run = self.get_run(row["id"])
+            artifacts = self.require_job_artifacts(run.job_id)
             job = self._conn.execute(
                 "SELECT status, typeof(status) AS type_status FROM jobs WHERE id=?",
                 (run.job_id,),
@@ -666,14 +642,18 @@ class VoiceVerificationRepository:
                 or job["status"] not in _JOB_STATUSES
             ):
                 _stored_run_invalid()
+            review_count = self._conn.execute(
+                "SELECT COUNT(*) FROM voice_verification_reviews WHERE run_id=?",
+                (run.id,),
+            ).fetchone()[0]
             if job["status"] != JobStatus.SUCCEEDED.value:
+                if review_count != 0:
+                    _stored_run_invalid()
                 continue
-            artifacts = self.require_job_artifacts(
-                run.job_id
-            )
             if artifacts.run is None or artifacts.run.id != row["id"]:
                 _stored_run_invalid()
-            pending.append(artifacts.run)
+            if review_count == 0:
+                pending.append(artifacts.run)
         return tuple(pending)
 
     def list_runnable_job_ids(self) -> tuple[int, ...]:
@@ -721,42 +701,20 @@ class VoiceVerificationRepository:
             or job["status"] not in _JOB_STATUSES
         ):
             _job_artifacts_invalid()
+        job_status = JobStatus(job["status"])
+        _, unit_rows = self._validate_unit_rows(
+            job_id, build_presence_job_manifest(manifest.snapshot), job_status
+        )
         run_row = self._conn.execute(
             "SELECT id FROM voice_verification_runs WHERE job_id=?", (job_id,)
         ).fetchone()
         run = None if run_row is None else self.get_run(run_row["id"])
-        if job["status"] == JobStatus.SUCCEEDED.value:
-            unit_rows = tuple(
-                self._conn.execute(
-                    """
-                    SELECT unit_key, status, output_hash, bound_input_hash,
-                           typeof(unit_key) AS type_unit_key,
-                           typeof(status) AS type_status,
-                           typeof(output_hash) AS type_output_hash,
-                           typeof(bound_input_hash) AS type_bound_input_hash
-                    FROM job_units
-                    WHERE job_id=?
-                    ORDER BY ordinal
-                    """,
-                    (job_id,),
-                )
-            )
+        if job_status is JobStatus.SUCCEEDED:
             proposal_rows = tuple(
                 row for row in unit_rows if row["unit_key"] == "voice:proposal"
             )
             if (
                 run is None
-                or len(unit_rows) != 7
-                or any(
-                    row["type_unit_key"] != "text"
-                    or row["type_status"] != "text"
-                    or row["type_output_hash"] != "text"
-                    or row["type_bound_input_hash"] != "text"
-                    or row["status"] != "success"
-                    or not _is_hash(row["output_hash"])
-                    or not _is_hash(row["bound_input_hash"])
-                    for row in unit_rows
-                )
                 or len(proposal_rows) != 1
                 or proposal_rows[0]["output_hash"] != run.output_hash
             ):
@@ -791,6 +749,16 @@ class VoiceVerificationRepository:
         manifest = self.get_manifest_for_job(run.job_id)
         artifacts = self.require_job_artifacts(run.job_id)
         if artifacts.run is None or artifacts.run.id != run_id:
+            _invalid_review()
+        job = self._conn.execute(
+            "SELECT status, typeof(status) AS type_status FROM jobs WHERE id=?",
+            (run.job_id,),
+        ).fetchone()
+        if (
+            job is None
+            or job["type_status"] != "text"
+            or job["status"] != JobStatus.SUCCEEDED.value
+        ):
             _invalid_review()
         if self._conn.execute(
             "SELECT 1 FROM voice_verification_reviews WHERE run_id=?", (run_id,)
@@ -1011,7 +979,18 @@ class VoiceVerificationRepository:
             raise DomainError(
                 "VOICE_RUN_INVALID", "VOICE_RUN_INVALID: voice run is invalid"
             ) from cause
-        if result.candidate_id != manifest.snapshot.candidate_id:
+        try:
+            current_matches_frozen = (
+                stored
+                or self._candidate_current_decision_id(result.candidate_id)
+                == manifest.snapshot.presence_decision_id
+            )
+        except (TypeError, ValueError):
+            invalid()
+        if (
+            result.candidate_id != manifest.snapshot.candidate_id
+            or not current_matches_frozen
+        ):
             invalid()
         previous_end = -1
         canonical_segments: list[VoiceSegmentScore] = []
@@ -1031,17 +1010,28 @@ class VoiceVerificationRepository:
                 or not _is_hash(segment.evidence_hash)
             ):
                 invalid()
+            normalized_score = (
+                0.0 if segment.raw_match_score == 0.0 else segment.raw_match_score
+            )
             expected_hash = canonical_voice_segment_hash(
                 manifest.snapshot,
                 result.input_hash,
                 ordinal=segment.ordinal,
                 start_ms=segment.start_ms,
                 end_ms=segment.end_ms,
-                raw_match_score=segment.raw_match_score,
+                raw_match_score=normalized_score,
             )
             if segment.evidence_hash != expected_hash:
                 invalid()
-            canonical_segments.append(segment)
+            canonical_segments.append(
+                VoiceSegmentScore(
+                    ordinal=segment.ordinal,
+                    start_ms=segment.start_ms,
+                    end_ms=segment.end_ms,
+                    raw_match_score=normalized_score,
+                    evidence_hash=segment.evidence_hash,
+                )
+            )
             previous_end = segment.end_ms
         canonical_tuple = tuple(canonical_segments)
         expected_output = canonical_voice_run_output_hash(
@@ -1236,36 +1226,174 @@ class VoiceVerificationRepository:
             raise ValueError("job manifest")
         _parse_utc(job["created_at"])
         _parse_utc(job["updated_at"])
+        units, _ = self._validate_unit_rows(
+            job_id, expected_manifest, JobStatus(job["status"])
+        )
+        rebuilt = JobManifest.build(JobKind.VIDEO_PIPELINE, units)
+        if rebuilt != expected_manifest:
+            raise ValueError("job units")
+
+    def _validate_unit_rows(
+        self,
+        job_id: int,
+        expected_manifest: JobManifest,
+        job_status: JobStatus,
+    ) -> tuple[tuple[ManifestUnit, ...], tuple[sqlite3.Row, ...]]:
         rows = tuple(
             self._conn.execute(
-                "SELECT * FROM job_units WHERE job_id=? ORDER BY ordinal", (job_id,)
+                """
+                SELECT *,
+                       typeof(job_id) AS type_job_id,
+                       typeof(unit_key) AS type_unit_key,
+                       typeof(stage) AS type_stage,
+                       typeof(ordinal) AS type_ordinal,
+                       typeof(declared_input_hash) AS type_declared_input_hash,
+                       typeof(dependency_keys_json) AS type_dependencies,
+                       typeof(execution_contract_hash) AS type_contract_hash,
+                       typeof(external_input_hash) AS type_external_input_hash,
+                       typeof(bound_input_hash) AS type_bound_input_hash,
+                       typeof(output_hash) AS type_output_hash,
+                       typeof(status) AS type_status,
+                       typeof(attempt_count) AS type_attempt_count,
+                       typeof(error_code) AS type_error_code,
+                       typeof(started_at) AS type_started_at,
+                       typeof(finished_at) AS type_finished_at
+                FROM job_units
+                WHERE job_id=?
+                ORDER BY ordinal
+                """,
+                (job_id,),
             )
         )
+        if len(rows) != len(expected_manifest.units):
+            raise ValueError("job unit count")
         units: list[ManifestUnit] = []
-        for row in rows:
+        statuses: list[UnitStatus] = []
+        for row, expected in zip(rows, expected_manifest.units, strict=True):
+            if any(
+                row[key] != expected_type
+                for key, expected_type in (
+                    ("type_job_id", "integer"),
+                    ("type_unit_key", "text"),
+                    ("type_stage", "text"),
+                    ("type_ordinal", "integer"),
+                    ("type_dependencies", "text"),
+                    ("type_contract_hash", "text"),
+                    ("type_status", "text"),
+                    ("type_attempt_count", "integer"),
+                )
+            ):
+                raise ValueError("job unit storage type")
+            for column, type_column in (
+                ("declared_input_hash", "type_declared_input_hash"),
+                ("external_input_hash", "type_external_input_hash"),
+                ("bound_input_hash", "type_bound_input_hash"),
+                ("output_hash", "type_output_hash"),
+                ("error_code", "type_error_code"),
+                ("started_at", "type_started_at"),
+                ("finished_at", "type_finished_at"),
+            ):
+                expected_type = "null" if row[column] is None else "text"
+                if row[type_column] != expected_type:
+                    raise ValueError("job unit optional storage type")
             dependencies = json.loads(row["dependency_keys_json"])
+            try:
+                status = UnitStatus(row["status"])
+                stage = JobStage(row["stage"])
+            except ValueError as cause:
+                raise ValueError("job unit enum") from cause
             if (
-                type(row["ordinal"]) is not int
-                or type(row["unit_key"]) is not str
-                or type(row["stage"]) is not str
+                row["job_id"] != job_id
+                or row["unit_key"] != expected.unit_key
+                or stage is not expected.stage
+                or row["ordinal"] != expected.ordinal
+                or row["declared_input_hash"] != expected.declared_input_hash
                 or type(dependencies) is not list
                 or any(type(item) is not str for item in dependencies)
                 or canonical_json(dependencies) != row["dependency_keys_json"]
+                or tuple(dependencies) != expected.dependency_keys
+                or row["execution_contract_hash"]
+                != expected.execution_contract_hash
+                or row["status"] not in _UNIT_STATUSES
+                or row["attempt_count"] < 0
             ):
-                raise ValueError("job unit")
+                raise ValueError("job unit canonical fields")
+            for hash_value in (
+                row["declared_input_hash"],
+                row["execution_contract_hash"],
+                row["external_input_hash"],
+                row["bound_input_hash"],
+                row["output_hash"],
+            ):
+                if hash_value is not None and not _is_hash(hash_value):
+                    raise ValueError("job unit hash")
+            if (
+                row["error_code"] is not None
+                and _SAFE_ERROR_CODE.fullmatch(row["error_code"]) is None
+            ):
+                raise ValueError("job unit error code")
+            for timestamp in (row["started_at"], row["finished_at"]):
+                if timestamp is not None:
+                    _parse_utc(timestamp)
+            if (
+                row["external_input_hash"] is not None
+                and row["bound_input_hash"] is None
+            ):
+                raise ValueError("job unit external input binding")
+            if status is UnitStatus.PENDING:
+                if any(
+                    value is not None
+                    for value in (
+                        row["output_hash"],
+                        row["error_code"],
+                        row["started_at"],
+                        row["finished_at"],
+                    )
+                ):
+                    raise ValueError("pending job unit state")
+            elif status is UnitStatus.RUNNING:
+                if (
+                    row["bound_input_hash"] is None
+                    or row["output_hash"] is not None
+                    or row["error_code"] is not None
+                    or row["started_at"] is None
+                    or row["finished_at"] is not None
+                    or row["attempt_count"] < 1
+                ):
+                    raise ValueError("running job unit state")
+            elif status is UnitStatus.SUCCESS:
+                if (
+                    row["bound_input_hash"] is None
+                    or row["output_hash"] is None
+                    or row["error_code"] is not None
+                    or row["finished_at"] is None
+                ):
+                    raise ValueError("successful job unit state")
+            elif (
+                row["bound_input_hash"] is None
+                or row["output_hash"] is not None
+                or row["error_code"] is None
+                or row["started_at"] is None
+                or row["finished_at"] is None
+                or row["attempt_count"] < 1
+            ):
+                raise ValueError("failed job unit state")
+            statuses.append(status)
             units.append(
                 ManifestUnit(
                     unit_key=row["unit_key"],
-                    stage=JobStage(row["stage"]),
+                    stage=stage,
                     ordinal=row["ordinal"],
                     declared_input_hash=row["declared_input_hash"],
                     dependency_keys=tuple(dependencies),
                     execution_contract_hash=row["execution_contract_hash"],
                 )
             )
-        rebuilt = JobManifest.build(JobKind.VIDEO_PIPELINE, tuple(units))
-        if rebuilt != expected_manifest:
-            raise ValueError("job units")
+        if job_status is JobStatus.SUCCEEDED and any(
+            status is not UnitStatus.SUCCESS for status in statuses
+        ):
+            raise ValueError("succeeded job unit state")
+        return tuple(units), rows
 
     def _validate_snapshot(self, snapshot: object, error_code: str) -> None:
         if (
@@ -1408,6 +1536,38 @@ class VoiceVerificationRepository:
             created_at=_parse_utc(row["created_at"]),
         )
 
+    def _read_reference_clips(
+        self, profile: sqlite3.Row
+    ) -> tuple[StoredReferenceClip, ...]:
+        rows = tuple(
+            self._conn.execute(
+                """
+                SELECT *,
+                       typeof(id) AS type_id,
+                       typeof(reference_profile_id) AS type_reference_profile_id,
+                       typeof(ordinal) AS type_ordinal,
+                       typeof(clip_kind) AS type_clip_kind,
+                       typeof(subject_id) AS type_subject_id,
+                       typeof(video_id) AS type_video_id,
+                       typeof(start_ms) AS type_start_ms,
+                       typeof(end_ms) AS type_end_ms,
+                       typeof(normalized_audio_sha256) AS type_audio_hash,
+                       typeof(approval_actor) AS type_approval_actor,
+                       typeof(approval_reason) AS type_approval_reason,
+                       typeof(approved_at) AS type_approved_at,
+                       typeof(clip_hash) AS type_clip_hash
+                FROM voice_reference_clips
+                WHERE reference_profile_id=?
+                ORDER BY ordinal
+                """,
+                (profile["id"],),
+            )
+        )
+        return tuple(
+            self._clip_from_row(row, profile, expected_ordinal=ordinal)
+            for ordinal, row in enumerate(rows, start=1)
+        )
+
     def _clip_from_row(
         self, row: sqlite3.Row, profile: sqlite3.Row, *, expected_ordinal: int
     ) -> StoredReferenceClip:
@@ -1516,11 +1676,30 @@ class VoiceVerificationRepository:
     ) -> None:
         rows = tuple(
             self._conn.execute(
-                "SELECT * FROM voice_verification_reviews WHERE run_id=?",
+                """
+                SELECT *,
+                       typeof(id) AS type_id,
+                       typeof(run_id) AS type_run_id,
+                       typeof(action) AS type_action,
+                       typeof(actor) AS type_actor,
+                       typeof(reason) AS type_reason,
+                       typeof(prior_presence_decision_id) AS type_prior_id,
+                       typeof(prior_presence_decision_hash) AS type_prior_hash,
+                       typeof(review_hash) AS type_review_hash,
+                       typeof(reviewed_at) AS type_reviewed_at
+                FROM voice_verification_reviews
+                WHERE run_id=?
+                """,
                 (run.id,),
             )
         )
-        current_id = self._candidate_current_decision_id(run.candidate_id)
+        try:
+            current_id = self._candidate_current_decision_id(run.candidate_id)
+        except (TypeError, ValueError) as cause:
+            raise DomainError(
+                "VOICE_RUN_STORED_INVALID",
+                "VOICE_RUN_STORED_INVALID: stored voice verification run is invalid",
+            ) from cause
         if not rows:
             if current_id != manifest.snapshot.presence_decision_id:
                 _stored_run_invalid()
@@ -1532,8 +1711,20 @@ class VoiceVerificationRepository:
             action = ReviewAction(row["action"])
             reviewed_at = _parse_utc(row["reviewed_at"])
             if (
-                type(row["id"]) is not int
-                or type(row["run_id"]) is not int
+                any(
+                    row[key] != expected
+                    for key, expected in (
+                        ("type_id", "integer"),
+                        ("type_run_id", "integer"),
+                        ("type_action", "text"),
+                        ("type_actor", "text"),
+                        ("type_reason", "text"),
+                        ("type_prior_id", "integer"),
+                        ("type_prior_hash", "text"),
+                        ("type_review_hash", "text"),
+                        ("type_reviewed_at", "text"),
+                    )
+                )
                 or row["run_id"] != run.id
                 or row["actor"] != "local_user"
                 or type(row["reason"]) is not str
@@ -1561,14 +1752,22 @@ class VoiceVerificationRepository:
             decisions = tuple(
                 self._conn.execute(
                     """
-                    SELECT id FROM presence_decisions
-                    WHERE candidate_id=? AND decision_origin='voice_verification'
-                      AND evidence_ref=?
+                    SELECT id, candidate_id,
+                           typeof(id) AS type_id,
+                           typeof(candidate_id) AS type_candidate_id
+                    FROM presence_decisions
+                    WHERE decision_origin='voice_verification' AND evidence_ref=?
                     ORDER BY id
                     """,
-                    (run.candidate_id, str(row["id"])),
+                    (str(row["id"]),),
                 )
             )
+            if any(
+                decision_row["type_id"] != "integer"
+                or decision_row["type_candidate_id"] != "integer"
+                for decision_row in decisions
+            ):
+                raise ValueError("review decision storage type")
             if action is ReviewAction.HOLD:
                 if decisions or current_id != manifest.snapshot.presence_decision_id:
                     raise ValueError("hold decision")
@@ -1584,7 +1783,8 @@ class VoiceVerificationRepository:
                 else PresenceState.REJECTED
             )
             if (
-                decision.state is not expected_state
+                decision.candidate_id != run.candidate_id
+                or decision.state is not expected_state
                 or decision.decision_origin is not PresenceOrigin.VOICE_VERIFICATION
                 or decision.evidence_hash != row["review_hash"]
                 or decision.created_at != reviewed_at
