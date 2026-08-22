@@ -46,6 +46,19 @@ from tests.backend.integration.test_voice_reference_enrollment import (
 
 REVIEWED_AT = datetime(2026, 8, 22, 5, 0, tzinfo=timezone.utc)
 VOICE_UNIT_KEYS = tuple(unit_key for unit_key, _ in PRESENCE_UNITS)
+ATTEMPT_HISTORY_MUTATIONS = (
+    "summary_count",
+    "attempt_number",
+    "attempt_number_type",
+    "terminal_status",
+    "invalid_status",
+    "started_at",
+    "finished_at",
+    "timestamp_order",
+    "error",
+    "output",
+    "output_type",
+)
 
 
 @dataclass(frozen=True)
@@ -185,53 +198,87 @@ def mark_job_succeeded(db: sqlite3.Connection, job_id: int) -> None:
     ).fetchone()
     rows = db.execute(
         """
-        SELECT unit_key, ordinal, declared_input_hash, dependency_keys_json
+        SELECT unit_key, ordinal
         FROM job_units WHERE job_id=? ORDER BY ordinal
         """,
         (job_id,),
     ).fetchall()
-    outputs: dict[str, str] = {}
+    service = JobStateService(db, clock=lambda: NOW)
     for row in rows:
-        dependencies = tuple(json.loads(row["dependency_keys_json"]))
-        dependency_outputs = tuple(outputs[key] for key in dependencies)
         external_input_hash = (
             sha256_text(f"external-{row['ordinal']}")
             if row["ordinal"] % 2 == 0
             else None
-        )
-        bound_input_hash = expected_bound_input_hash(
-            row["declared_input_hash"],
-            dependency_outputs,
-            external_input_hash,
         )
         output_hash = (
             run["output_hash"]
             if row["unit_key"] == "voice:proposal" and run is not None
             else sha256_text(f"output-{row['ordinal']}")
         )
+        service.begin_unit(
+            job_id,
+            row["unit_key"],
+            external_input_hash=external_input_hash,
+        )
+        service.complete_unit(job_id, row["unit_key"], output_hash)
+    with transaction(db):
+        service.succeed_job_in_transaction(job_id)
+
+
+def mutate_success_attempt(
+    db: sqlite3.Connection, job_id: int, mutation: str
+) -> None:
+    unit_key = "voice:score"
+    if mutation == "summary_count":
+        db.execute(
+            "UPDATE job_units SET attempt_count=2 WHERE job_id=? AND unit_key=?",
+            (job_id, unit_key),
+        )
+        return
+    db.execute("DROP TRIGGER job_unit_attempts_no_update")
+    if mutation == "attempt_number":
+        assignment = "attempt_no=2"
+    elif mutation == "attempt_number_type":
+        assignment = "attempt_no=1.5"
+    elif mutation == "terminal_status":
+        assignment = (
+            "result_status='failed', output_hash=NULL, "
+            "error_code='VOICE_FAILED'"
+        )
+    elif mutation == "invalid_status":
+        db.execute("PRAGMA ignore_check_constraints=ON")
+        assignment = "result_status='unknown'"
+    elif mutation == "started_at":
+        assignment = "started_at='2026-08-22T03:00:00.000000Z'"
+    elif mutation == "finished_at":
+        assignment = "finished_at='2026-08-22T05:00:00.000000Z'"
+    elif mutation == "timestamp_order":
+        assignment = (
+            "started_at='2026-08-22T05:00:00.000000Z', "
+            "finished_at='2026-08-22T04:00:00.000000Z'"
+        )
+    elif mutation == "error":
+        db.execute("PRAGMA ignore_check_constraints=ON")
+        assignment = "error_code='VOICE_FAILED'"
+    elif mutation == "output":
+        assignment = f"output_hash='{'f' * 64}'"
+    elif mutation == "output_type":
         db.execute(
             """
-            UPDATE job_units
-            SET external_input_hash=?, bound_input_hash=?, output_hash=?,
-                status='success', attempt_count=1, error_code=NULL,
-                started_at=?, finished_at=?
-            WHERE job_id=? AND unit_key=?
+            UPDATE job_unit_attempts SET output_hash=?
+            WHERE job_id=? AND unit_key=? AND attempt_no=1
             """,
-            (
-                external_input_hash,
-                bound_input_hash,
-                output_hash,
-                utc_iso(NOW),
-                utc_iso(NOW),
-                job_id,
-                row["unit_key"],
-            ),
+            (sqlite3.Binary(b"not-a-hash"), job_id, unit_key),
         )
-        outputs[row["unit_key"]] = output_hash
+        return
+    else:
+        raise AssertionError(f"unknown test mutation: {mutation}")
     db.execute(
-        "UPDATE jobs SET status='succeeded', updated_at=? WHERE id=?",
-        (utc_iso(NOW), job_id),
+        f"UPDATE job_unit_attempts SET {assignment} "
+        "WHERE job_id=? AND unit_key=? AND attempt_no=1",
+        (job_id, unit_key),
     )
+    db.execute("PRAGMA ignore_check_constraints=OFF")
 
 
 def expected_bound_input_hash(
@@ -350,10 +397,11 @@ def test_manifest_round_trip_and_runnable_jobs_are_fifo(db) -> None:
     )
     assert repository.list_runnable_job_ids() == (job.job_id,)
 
-    db.execute(
-        "UPDATE jobs SET status=? WHERE id=?",
-        (JobStatus.RETRYING.value, job.job_id),
-    )
+    service = JobStateService(db, clock=lambda: NOW)
+    service.begin_unit(job.job_id, VOICE_UNIT_KEYS[0])
+    service.fail_unit(job.job_id, VOICE_UNIT_KEYS[0], "VOICE_FAILED")
+    service.resume(job.job_id, {})
+    assert service.status(job.job_id) is JobStatus.RETRYING
     assert repository.list_runnable_job_ids() == (job.job_id,)
 
 
@@ -616,7 +664,60 @@ def test_succeeded_artifacts_accept_canonical_lineage_for_all_voice_units(db) ->
         False,
         True,
     )
+    attempts = db.execute(
+        """
+        SELECT unit.unit_key, unit.attempt_count,
+               unit.output_hash AS unit_output_hash,
+               attempt.attempt_no, attempt.result_status,
+               attempt.output_hash AS attempt_output_hash,
+               attempt.error_code, attempt.started_at, attempt.finished_at
+        FROM job_units AS unit
+        JOIN job_unit_attempts AS attempt
+          ON attempt.job_id=unit.job_id AND attempt.unit_key=unit.unit_key
+        WHERE unit.job_id=?
+        ORDER BY unit.ordinal, attempt.attempt_no
+        """,
+        (job.job_id,),
+    ).fetchall()
+    assert tuple(row["unit_key"] for row in attempts) == VOICE_UNIT_KEYS
+    assert all(
+        row["attempt_count"] == 1
+        and row["attempt_no"] == 1
+        and row["result_status"] == "success"
+        and row["attempt_output_hash"] == row["unit_output_hash"]
+        and row["error_code"] is None
+        and row["started_at"] == utc_iso(NOW)
+        and row["finished_at"] == utc_iso(NOW)
+        for row in attempts
+    )
     assert artifacts.run is not None and artifacts.run.id == run_id
+
+
+@pytest.mark.parametrize("mutation", ATTEMPT_HISTORY_MUTATIONS)
+def test_artifact_read_rejects_attempt_history_drift(
+    db, mutation: str
+) -> None:
+    job = seed_job(db)
+    canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    mutate_success_attempt(db, job.job_id, mutation)
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).require_job_artifacts(job.job_id)
+
+
+def test_runnable_list_rejects_queued_job_with_completed_attempt(db) -> None:
+    job = seed_job(db)
+    service = JobStateService(db, clock=lambda: NOW)
+    service.begin_unit(job.job_id, VOICE_UNIT_KEYS[0])
+    service.complete_unit(job.job_id, VOICE_UNIT_KEYS[0], "a" * 64)
+    db.execute(
+        "UPDATE jobs SET status='queued', updated_at=? WHERE id=?",
+        (utc_iso(NOW), job.job_id),
+    )
+
+    with pytest.raises(DomainError, match="VOICE_MANIFEST_STORED_INVALID"):
+        VoiceVerificationRepository(db).list_runnable_job_ids()
 
 
 @pytest.mark.parametrize("unit_key", VOICE_UNIT_KEYS)
@@ -1006,6 +1107,40 @@ def test_review_write_rejects_impossible_success_evidence_before_any_write(
             "WHERE job_id=? AND unit_key='voice:score'",
             (job.job_id,),
         )
+    before_decisions = db.execute(
+        "SELECT COUNT(*) FROM presence_decisions"
+    ).fetchone()[0]
+
+    with pytest.raises(DomainError, match="VOICE_RUN_STORED_INVALID"):
+        with transaction(db):
+            VoiceVerificationRepository(
+                db, clock=lambda: REVIEWED_AT
+            ).add_review_and_decision(
+                valid_review(run_id, ReviewAction.CONFIRM)
+            )
+
+    assert (
+        db.execute("SELECT COUNT(*) FROM voice_verification_reviews").fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute("SELECT COUNT(*) FROM presence_decisions").fetchone()[0]
+        == before_decisions
+    )
+    assert db.execute(
+        "SELECT current_presence_decision_id FROM subject_video_candidates WHERE id=?",
+        (job.reference.candidate_id,),
+    ).fetchone()[0] == job.reference.decision_id
+
+
+@pytest.mark.parametrize("mutation", ATTEMPT_HISTORY_MUTATIONS)
+def test_review_write_rejects_attempt_history_drift_before_any_write(
+    db, mutation: str
+) -> None:
+    job = seed_job(db)
+    run_id = canonical_run(db, job)
+    mark_job_succeeded(db, job.job_id)
+    mutate_success_attempt(db, job.job_id, mutation)
     before_decisions = db.execute(
         "SELECT COUNT(*) FROM presence_decisions"
     ).fetchone()[0]

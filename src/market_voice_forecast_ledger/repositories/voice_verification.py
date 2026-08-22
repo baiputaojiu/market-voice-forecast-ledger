@@ -51,6 +51,7 @@ _CLIP_KINDS = frozenset({"enrollment", "held_out_positive", "negative"})
 _RUNNABLE_STATUSES = frozenset({JobStatus.QUEUED.value, JobStatus.RETRYING.value})
 _JOB_STATUSES = frozenset(status.value for status in JobStatus)
 _UNIT_STATUSES = frozenset(status.value for status in UnitStatus)
+_ATTEMPT_RESULT_STATUSES = frozenset({"success", "failed", "interrupted"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1442,6 +1443,7 @@ class VoiceVerificationRepository:
             expected.unit_key: row
             for expected, row in zip(expected_manifest.units, rows, strict=True)
         }
+        self._validate_unit_attempts(job_id, rows_by_key)
         for expected, row in zip(expected_manifest.units, rows, strict=True):
             status = UnitStatus(row["status"])
             dependencies = tuple(
@@ -1480,7 +1482,14 @@ class VoiceVerificationRepository:
                 phase = "pending"
         running_count = statuses.count(UnitStatus.RUNNING)
         failed_count = statuses.count(UnitStatus.FAILED)
-        if job_status in {JobStatus.QUEUED, JobStatus.PAUSED, JobStatus.RETRYING}:
+        if job_status is JobStatus.QUEUED:
+            if (
+                running_count
+                or failed_count
+                or any(row["attempt_count"] != 0 for row in rows)
+            ):
+                raise ValueError("queued job unit state")
+        elif job_status in {JobStatus.PAUSED, JobStatus.RETRYING}:
             if running_count or failed_count:
                 raise ValueError("inactive job unit state")
         elif job_status is JobStatus.RUNNING:
@@ -1498,6 +1507,136 @@ class VoiceVerificationRepository:
         elif any(status is not UnitStatus.SUCCESS for status in statuses):
             raise ValueError("succeeded job unit state")
         return tuple(units), rows
+
+    def _validate_unit_attempts(
+        self,
+        job_id: int,
+        unit_rows: dict[str, sqlite3.Row],
+    ) -> None:
+        attempts = tuple(
+            self._conn.execute(
+                """
+                SELECT *,
+                       typeof(id) AS type_id,
+                       typeof(job_id) AS type_job_id,
+                       typeof(unit_key) AS type_unit_key,
+                       typeof(attempt_no) AS type_attempt_no,
+                       typeof(result_status) AS type_result_status,
+                       typeof(output_hash) AS type_output_hash,
+                       typeof(error_code) AS type_error_code,
+                       typeof(started_at) AS type_started_at,
+                       typeof(finished_at) AS type_finished_at
+                FROM job_unit_attempts
+                WHERE job_id=?
+                ORDER BY unit_key, attempt_no, id
+                """,
+                (job_id,),
+            )
+        )
+        attempts_by_unit: dict[str, list[sqlite3.Row]] = {
+            unit_key: [] for unit_key in unit_rows
+        }
+        for attempt in attempts:
+            if any(
+                attempt[key] != expected_type
+                for key, expected_type in (
+                    ("type_id", "integer"),
+                    ("type_job_id", "integer"),
+                    ("type_unit_key", "text"),
+                    ("type_attempt_no", "integer"),
+                    ("type_result_status", "text"),
+                    ("type_started_at", "text"),
+                    ("type_finished_at", "text"),
+                )
+            ):
+                raise ValueError("job unit attempt storage type")
+            for column, type_column in (
+                ("output_hash", "type_output_hash"),
+                ("error_code", "type_error_code"),
+            ):
+                expected_type = "null" if attempt[column] is None else "text"
+                if attempt[type_column] != expected_type:
+                    raise ValueError("job unit attempt optional storage type")
+            if (
+                attempt["id"] <= 0
+                or attempt["job_id"] != job_id
+                or attempt["unit_key"] not in attempts_by_unit
+                or attempt["attempt_no"] <= 0
+                or attempt["result_status"] not in _ATTEMPT_RESULT_STATUSES
+                or (
+                    attempt["output_hash"] is not None
+                    and not _is_hash(attempt["output_hash"])
+                )
+                or (
+                    attempt["error_code"] is not None
+                    and _SAFE_ERROR_CODE.fullmatch(attempt["error_code"]) is None
+                )
+            ):
+                raise ValueError("job unit attempt canonical fields")
+            started_at = _parse_utc(attempt["started_at"])
+            finished_at = _parse_utc(attempt["finished_at"])
+            if finished_at < started_at:
+                raise ValueError("job unit attempt timestamp order")
+            if attempt["result_status"] == "success":
+                if (
+                    attempt["output_hash"] is None
+                    or attempt["error_code"] is not None
+                ):
+                    raise ValueError("successful job unit attempt")
+            elif attempt["result_status"] == "failed":
+                if (
+                    attempt["output_hash"] is not None
+                    or attempt["error_code"] is None
+                ):
+                    raise ValueError("failed job unit attempt")
+            elif (
+                attempt["output_hash"] is not None
+                or attempt["error_code"] is not None
+            ):
+                raise ValueError("interrupted job unit attempt")
+            attempts_by_unit[attempt["unit_key"]].append(attempt)
+
+        for unit_key, unit in unit_rows.items():
+            history = attempts_by_unit[unit_key]
+            status = UnitStatus(unit["status"])
+            completed_attempt_count = unit["attempt_count"]
+            if status is UnitStatus.RUNNING:
+                completed_attempt_count -= 1
+            if (
+                completed_attempt_count < 0
+                or len(history) != completed_attempt_count
+                or tuple(attempt["attempt_no"] for attempt in history)
+                != tuple(range(1, completed_attempt_count + 1))
+            ):
+                raise ValueError("job unit attempt count")
+            previous_finished_at: datetime | None = None
+            for attempt in history:
+                started_at = _parse_utc(attempt["started_at"])
+                if (
+                    previous_finished_at is not None
+                    and started_at < previous_finished_at
+                ):
+                    raise ValueError("job unit attempt sequence")
+                previous_finished_at = _parse_utc(attempt["finished_at"])
+            if status is UnitStatus.RUNNING:
+                if (
+                    previous_finished_at is not None
+                    and _parse_utc(unit["started_at"]) < previous_finished_at
+                ):
+                    raise ValueError("running job unit attempt sequence")
+            elif status in {UnitStatus.SUCCESS, UnitStatus.FAILED} and history:
+                terminal = history[-1]
+                expected_result = (
+                    "success" if status is UnitStatus.SUCCESS else "failed"
+                )
+                if (
+                    terminal["result_status"] != expected_result
+                    or terminal["output_hash"] != unit["output_hash"]
+                    or terminal["error_code"] != unit["error_code"]
+                    or terminal["started_at"] != unit["started_at"]
+                    or terminal["finished_at"] != unit["finished_at"]
+                ):
+                    raise ValueError("job unit terminal attempt")
 
     def _validate_snapshot(self, snapshot: object, error_code: str) -> None:
         if (
