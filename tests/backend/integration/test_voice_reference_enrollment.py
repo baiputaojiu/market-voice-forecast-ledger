@@ -1,8 +1,10 @@
 import hashlib
 import sqlite3
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -27,9 +29,18 @@ from market_voice_forecast_ledger.domain.speakers import (
 from market_voice_forecast_ledger.domain.voice_verification import ReferenceClipCommand
 from market_voice_forecast_ledger.repositories.discovery import DiscoveryRepository
 from market_voice_forecast_ledger.repositories.speakers import SpeakerRepository
+from market_voice_forecast_ledger.repositories.retention import RetentionRepository
 from market_voice_forecast_ledger.repositories.voice_verification import (
     VoiceVerificationRepository,
 )
+from market_voice_forecast_ledger.services.retention import AudioDeletionResult
+from market_voice_forecast_ledger.services.voice_reference import (
+    ApprovedReferenceClip,
+    PreparedReferenceAudio,
+    ReferenceFeatureData,
+    VoiceReferenceService,
+)
+from tests.backend.voice_fakes import fake_runtime_attestation
 
 
 NOW = datetime(2026, 8, 22, 4, 0, tzinfo=timezone.utc)
@@ -312,3 +323,912 @@ def test_reference_clip_append_rejects_corrupt_existing_clip_before_insert(
     assert tuple((row["ordinal"], row["clip_hash"]) for row in rows) == (
         (1, "b" * 64),
     )
+
+
+@dataclass(frozen=True)
+class CalibrationSeed:
+    subject_ids: tuple[int, ...]
+    profile_ids: tuple[int, ...]
+    video_ids: tuple[int, ...]
+
+
+class FakeReferenceMedia:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.calls: list[tuple[str, int, int]] = []
+
+    def prepare(
+        self,
+        model,
+        approval: ApprovedReferenceClip,
+    ) -> PreparedReferenceAudio:
+        call_no = len(self.calls) + 1
+        self.calls.append(
+            (model.model_name, approval.subject_id, approval.ordinal)
+        )
+        path = self.root / f"reference-{call_no:03d}.wav"
+        return PreparedReferenceAudio(
+            local_path=path.resolve(),
+            normalized_audio_sha256=hashlib.sha256(
+                f"{model.model_name}:{approval.approval_hash}".encode("ascii")
+            ).hexdigest(),
+        )
+
+
+class FakeReferenceScorer:
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        scores: dict[str, tuple[float, float]],
+        *,
+        fail_model: str | None = None,
+    ) -> None:
+        self.db = db
+        self.scores = scores
+        self.fail_model = fail_model
+        self.enrollment_calls: list[tuple[str, int, tuple[int, ...]]] = []
+        self.score_calls: list[tuple[str, int, int]] = []
+        self.dry_run_calls: list[tuple[str, int]] = []
+
+    def derive_enrollment_feature(
+        self,
+        model,
+        subject_id: int,
+        clips: tuple[tuple[ApprovedReferenceClip, PreparedReferenceAudio], ...],
+    ) -> ReferenceFeatureData:
+        if model.model_name == self.fail_model:
+            raise RuntimeError("C:/private/model-native-failure")
+        assert self.db.execute(
+            "SELECT COUNT(*) FROM local_artifacts"
+        ).fetchone()[0] >= 24
+        self.enrollment_calls.append(
+            (model.model_name, subject_id, tuple(item[0].ordinal for item in clips))
+        )
+        marker = 1.0 if "campplus" in model.model_name else 2.0
+        body = struct.pack("<2f", marker, float(subject_id))
+        return ReferenceFeatureData(
+            encoding_version="speaker-embedding-v1",
+            float_dtype="float32",
+            dimension=2,
+            embedding_blob=body,
+            feature_sha256=hashlib.sha256(body).hexdigest(),
+        )
+
+    def score(
+        self,
+        model,
+        subject_id: int,
+        feature: ReferenceFeatureData,
+        approval: ApprovedReferenceClip,
+        audio: PreparedReferenceAudio,
+    ) -> float:
+        del feature, audio
+        if model.model_name == self.fail_model:
+            raise RuntimeError("C:/private/model-native-failure")
+        self.score_calls.append(
+            (model.model_name, subject_id, approval.ordinal)
+        )
+        positive, negative = self.scores[model.model_name]
+        return positive if approval.clip_kind == "held_out_positive" else negative
+
+    def dry_run(
+        self,
+        model,
+        features: tuple[ReferenceFeatureData, ...],
+        *,
+        candidate_count: int,
+    ) -> None:
+        assert len(features) == 4
+        self.dry_run_calls.append((model.model_name, candidate_count))
+
+
+class FakeCpuTimer:
+    def __init__(self, elapsed_ms: dict[str, int]) -> None:
+        self.elapsed_ms = elapsed_ms
+        self.calls: list[str] = []
+
+    def __call__(self, model_name: str, operation: Callable[[], None]) -> int:
+        operation()
+        self.calls.append(model_name)
+        return self.elapsed_ms[model_name]
+
+
+class FakeRetention:
+    def __init__(self, *, fail_ids: frozenset[int] = frozenset()) -> None:
+        self.fail_ids = fail_ids
+        self.calls: list[int] = []
+
+    def delete_audio(self, artifact_id: int) -> AudioDeletionResult:
+        self.calls.append(artifact_id)
+        failed = artifact_id in self.fail_ids
+        return AudioDeletionResult(
+            artifact_id=artifact_id,
+            deleted=not failed,
+            already_absent=False,
+            retryable=failed,
+            error_code="AUDIO_DELETE_OS_ERROR" if failed else None,
+            retry_count=int(failed),
+            deleted_at=None if failed else NOW,
+        )
+
+
+def seed_calibration_candidates(db: sqlite3.Connection) -> CalibrationSeed:
+    profiles = db.execute(
+        """
+        SELECT profile.id, profile.subject_id
+        FROM discovery_profiles AS profile
+        JOIN analysis_subjects AS subject ON subject.id=profile.subject_id
+        WHERE profile.is_active=1 AND subject.is_active=1
+        ORDER BY profile.subject_id
+        """
+    ).fetchall()
+    assert len(profiles) == 4
+    job_id = db.execute(
+        """
+        INSERT INTO jobs(
+            job_kind, manifest_hash, total_units, status, created_at, updated_at
+        ) VALUES ('youtube_sync', 'reference-approval-source', 1,
+                  'succeeded', ?, ?)
+        """,
+        (utc_iso(NOW), utc_iso(NOW)),
+    ).lastrowid
+    video_ids: list[int] = []
+    with transaction(db):
+        for ordinal, profile in enumerate(profiles, start=1):
+            metadata = CanonicalVideoMetadata.build(
+                youtube_video_id=f"{ordinal:011d}",
+                channel_id=f"UC{ordinal:022d}",
+                channel_title=f"Synthetic channel {ordinal}",
+                title=f"Synthetic person {ordinal}",
+                description="",
+                published_at=NOW,
+                duration_seconds=600,
+                live_state=LiveState.NOT_LIVE,
+                actual_start_time=None,
+                schema_version="youtube-video-metadata.v1",
+                fetched_at=NOW,
+            )
+            candidate = DiscoveryRepository(db).create_initial_candidate(
+                profile_id=profile["id"],
+                job_id=job_id,
+                metadata=metadata,
+                source_kind=DiscoverySourceKind.CROSS_CHANNEL_SEARCH,
+                source_key=f"reference-{ordinal}",
+                observation_hash=f"{ordinal:x}" * 64,
+                idempotency_key=f"{ordinal + 4:x}" * 64,
+                observed_at=NOW,
+            )
+            video_ids.append(candidate.video_id)
+    return CalibrationSeed(
+        subject_ids=tuple(row["subject_id"] for row in profiles),
+        profile_ids=tuple(row["id"] for row in profiles),
+        video_ids=tuple(video_ids),
+    )
+
+
+def approve_complete_reference_set(
+    service: VoiceReferenceService,
+    seed: CalibrationSeed,
+) -> None:
+    for index, subject_id in enumerate(seed.subject_ids):
+        own_video = seed.video_ids[index]
+        commands = (
+            ReferenceClipCommand(
+                subject_id, own_video, 0, 15_000,
+                "local_user", "clear enrollment speech one",
+            ),
+            ReferenceClipCommand(
+                subject_id, own_video, 15_000, 30_000,
+                "local_user", "clear enrollment speech two",
+            ),
+            ReferenceClipCommand(
+                subject_id, own_video, 30_000, 40_000,
+                "local_user", "clear held out speech",
+            ),
+        )
+        for command in commands:
+            service.approve_clip(command)
+        negative_videos = tuple(
+            seed.video_ids[item]
+            for item in range(4)
+            if item != index
+        )
+        for ordinal, video_id in enumerate(negative_videos, start=1):
+            service.approve_clip(
+                ReferenceClipCommand(
+                    subject_id,
+                    video_id,
+                    ordinal * 10_000,
+                    (ordinal + 1) * 10_000,
+                    "local_user",
+                    f"confirmed negative speaker {ordinal}",
+                )
+            )
+
+
+def calibration_models(tmp_path: Path):
+    campplus, _ = fake_runtime_attestation(tmp_path / "campplus")
+    resnet, _ = fake_runtime_attestation(tmp_path / "resnet")
+    return (
+        replace(
+            campplus,
+            model_name="3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+            model_version="sherpa-onnx-1.13.4",
+        ),
+        replace(
+            resnet,
+            model_name="wespeaker_zh_cnceleb_resnet34.onnx",
+            model_version="sherpa-onnx-1.13.4",
+        ),
+    )
+
+
+def task5_service(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+    *,
+    scores: dict[str, tuple[float, float]] | None = None,
+    elapsed_ms: dict[str, int] | None = None,
+    retention: FakeRetention | None = None,
+    fail_model: str | None = None,
+):
+    models = calibration_models(tmp_path)
+    if scores is None:
+        scores = {
+            models[0].model_name: (0.80, 0.30),
+            models[1].model_name: (0.75, 0.10),
+        }
+    if elapsed_ms is None:
+        elapsed_ms = {
+            models[0].model_name: 900,
+            models[1].model_name: 1_100,
+        }
+    media = FakeReferenceMedia(tmp_path / "private-audio")
+    scorer = FakeReferenceScorer(
+        db,
+        scores,
+        fail_model=fail_model,
+    )
+    effective_retention = retention or FakeRetention()
+    timer = FakeCpuTimer(elapsed_ms)
+    service = VoiceReferenceService(
+        db,
+        media=media,
+        scorer=scorer,
+        retention=effective_retention,
+        clock=lambda: NOW,
+        cpu_timer=timer,
+    )
+    return service, models, media, scorer, effective_retention, timer
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"subject_id": True},
+        {"subject_id": 999},
+        {"video_id": True},
+        {"video_id": 999},
+        {"start_ms": -1},
+        {"start_ms": 10_000, "end_ms": 10_000},
+        {"end_ms": 2_999},
+        {"end_ms": 120_001},
+        {"actor": "system"},
+        {"reason": "C:/private/reference.wav"},
+    ),
+)
+def test_approve_clip_rejects_invalid_identity_range_actor_and_reason(
+    db,
+    tmp_path,
+    mutation,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, *_ = task5_service(db, tmp_path)
+    values = {
+        "subject_id": seed.subject_ids[0],
+        "video_id": seed.video_ids[0],
+        "start_ms": 0,
+        "end_ms": 3_000,
+        "actor": "local_user",
+        "reason": "clear solo speech",
+    }
+    values.update(mutation)
+
+    with pytest.raises(DomainError) as caught:
+        service.approve_clip(ReferenceClipCommand(**values))
+
+    assert caught.value.code == "VOICE_REFERENCE_INVALID"
+    assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
+
+
+def test_approve_clip_assigns_exact_slots_and_writes_public_audit_only(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, *_ = task5_service(db, tmp_path)
+
+    approve_complete_reference_set(service, seed)
+
+    approvals = service.list_candidates(seed.subject_ids[0])
+    assert tuple((item.ordinal, item.clip_kind) for item in approvals) == (
+        (1, "enrollment"),
+        (2, "enrollment"),
+        (3, "held_out_positive"),
+        (4, "negative"),
+        (5, "negative"),
+        (6, "negative"),
+    )
+    row = db.execute(
+        """
+        SELECT entity_type, entity_id, operation, actor_kind, reason_code,
+               before_json, after_json
+        FROM audit_events
+        WHERE entity_type='voice_reference_approval'
+          AND entity_id=?
+        ORDER BY id LIMIT 1
+        """,
+        (str(seed.subject_ids[0]),),
+    ).fetchone()
+    assert tuple(row) == (
+        "voice_reference_approval",
+        str(seed.subject_ids[0]),
+        "approve",
+        "user",
+        "VOICE_REFERENCE_CLIP_APPROVED",
+        None,
+        row["after_json"],
+    )
+    assert set(__import__("json").loads(row["after_json"])) == {
+        "approval_hash",
+        "end_ms",
+        "ordinal",
+        "role",
+        "start_ms",
+        "subject_id",
+        "video_id",
+    }
+    public_audit = "\n".join(
+        value or ""
+        for row in db.execute(
+            "SELECT before_json, after_json FROM audit_events"
+        )
+        for value in row
+    )
+    assert "audio_sha256" not in public_audit
+    assert "embedding" not in public_audit
+    assert "model" not in public_audit
+    assert str(tmp_path) not in public_audit
+
+
+def test_approve_clip_rejects_overlap_wrong_negative_and_seventh_slot(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, *_ = task5_service(db, tmp_path)
+    subject_id = seed.subject_ids[0]
+    own_video = seed.video_ids[0]
+    service.approve_clip(
+        ReferenceClipCommand(
+            subject_id, own_video, 0, 15_000,
+            "local_user", "first enrollment",
+        )
+    )
+    with pytest.raises(DomainError) as overlap:
+        service.approve_clip(
+            ReferenceClipCommand(
+                subject_id, own_video, 10_000, 25_000,
+                "local_user", "overlapping enrollment",
+            )
+        )
+    assert overlap.value.code == "VOICE_REFERENCE_INVALID"
+    service.approve_clip(
+        ReferenceClipCommand(
+            subject_id, own_video, 15_000, 30_000,
+            "local_user", "second enrollment",
+        )
+    )
+    service.approve_clip(
+        ReferenceClipCommand(
+            subject_id, own_video, 30_000, 40_000,
+            "local_user", "held out speech",
+        )
+    )
+    with pytest.raises(DomainError) as wrong_negative:
+        service.approve_clip(
+            ReferenceClipCommand(
+                subject_id, own_video, 40_000, 50_000,
+                "local_user", "not a negative person",
+            )
+        )
+    assert wrong_negative.value.code == "VOICE_REFERENCE_INVALID"
+    for ordinal, video_id in enumerate(seed.video_ids[1:], start=1):
+        service.approve_clip(
+            ReferenceClipCommand(
+                subject_id,
+                video_id,
+                ordinal * 10_000,
+                (ordinal + 1) * 10_000,
+                "local_user",
+                f"negative speaker {ordinal}",
+            )
+        )
+    count_before = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    with pytest.raises(DomainError) as seventh:
+        service.approve_clip(
+            ReferenceClipCommand(
+                subject_id, seed.video_ids[1], 50_000, 60_000,
+                "local_user", "seventh approval",
+            )
+        )
+    assert seventh.value.code == "VOICE_REFERENCE_INVALID"
+    assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == count_before
+
+
+def test_list_candidates_rejects_corrupt_approval_without_healing(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, *_ = task5_service(db, tmp_path)
+    service.approve_clip(
+        ReferenceClipCommand(
+            seed.subject_ids[0], seed.video_ids[0], 0, 15_000,
+            "local_user", "clear enrollment",
+        )
+    )
+    db.execute("DROP TRIGGER audit_events_no_update")
+    original = db.execute(
+        "SELECT after_json FROM audit_events ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    corrupted = original.replace('"approval_hash":"', '"approval_hash":"f')
+    db.execute("UPDATE audit_events SET after_json=?", (corrupted,))
+
+    with pytest.raises(DomainError) as caught:
+        service.list_candidates(seed.subject_ids[0])
+
+    assert caught.value.code == "VOICE_REFERENCE_STORED_INVALID"
+    assert db.execute(
+        "SELECT after_json FROM audit_events ORDER BY id LIMIT 1"
+    ).fetchone()[0] == corrupted
+
+
+def test_calibration_requires_complete_reference_set_and_thirty_seconds(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, models, *_ = task5_service(db, tmp_path)
+    service.approve_clip(
+        ReferenceClipCommand(
+            seed.subject_ids[0], seed.video_ids[0], 0, 14_000,
+            "local_user", "short enrollment one",
+        )
+    )
+    service.approve_clip(
+        ReferenceClipCommand(
+            seed.subject_ids[0], seed.video_ids[0], 14_000, 29_000,
+            "local_user", "short enrollment two",
+        )
+    )
+
+    with pytest.raises(DomainError) as caught:
+        service.calibrate(models)
+
+    assert caught.value.code == "VOICE_REFERENCE_INCOMPLETE"
+    assert db.execute("SELECT COUNT(*) FROM local_artifacts").fetchone()[0] == 0
+
+
+def test_calibration_selects_widest_separable_model_and_cleans_every_artifact(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, models, media, scorer, retention, timer = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+
+    result = service.calibrate(tuple(reversed(models)))
+
+    assert result.model_name == "wespeaker_zh_cnceleb_resnet34.onnx"
+    assert result.subject_boundary == 0.75
+    assert result.interviewer_boundary == 0.10
+    assert result.margin == pytest.approx(0.65)
+    assert result.dry_run_cpu_ms == 1_100
+    assert len(media.calls) == 48
+    assert len(scorer.enrollment_calls) == 8
+    assert all(call[2] == (1, 2) for call in scorer.enrollment_calls)
+    assert len(scorer.score_calls) == 32
+    assert scorer.dry_run_calls == [
+        (models[0].model_name, 20),
+        (models[1].model_name, 20),
+    ]
+    assert timer.calls == [models[0].model_name, models[1].model_name]
+    assert retention.calls == list(range(1, 49))
+    assert len(result.subjects) == 4
+    assert all(len(item.clips) == 6 for item in result.subjects)
+
+
+def test_calibration_tie_breaks_by_cpu_then_lexicographic_model_name(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    models = calibration_models(tmp_path / "models")
+    equal_scores = {model.model_name: (0.8, 0.2) for model in models}
+    service, cpu_models, *_ = task5_service(
+        db,
+        tmp_path / "cpu",
+        scores=equal_scores,
+        elapsed_ms={models[0].model_name: 700, models[1].model_name: 600},
+    )
+    approve_complete_reference_set(service, seed)
+    cpu_winner = service.calibrate(tuple(reversed(cpu_models)))
+    assert cpu_winner.model_name == models[1].model_name
+
+    db2 = open_database(tmp_path / "lexicographic.sqlite3")
+    apply_migrations(db2)
+    bootstrap_reference_data(db2)
+    try:
+        seed2 = seed_calibration_candidates(db2)
+        lexical_models = calibration_models(tmp_path / "lex-models")
+        lexical_scores = {
+            model.model_name: (0.8, 0.2) for model in lexical_models
+        }
+        lexical_service, lexical_candidates, *_ = task5_service(
+            db2,
+            tmp_path / "lex",
+            scores=lexical_scores,
+            elapsed_ms={model.model_name: 600 for model in lexical_models},
+        )
+        approve_complete_reference_set(lexical_service, seed2)
+        winner = lexical_service.calibrate(tuple(reversed(lexical_candidates)))
+        assert winner.model_name == lexical_models[0].model_name
+    finally:
+        db2.close()
+
+
+def test_calibration_discards_only_nonseparable_models_and_all_failure_is_safe(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    models = calibration_models(tmp_path / "identities")
+    scores = {
+        models[0].model_name: (0.4, 0.5),
+        models[1].model_name: (0.7, 0.1),
+    }
+    service, candidates, *_ = task5_service(
+        db,
+        tmp_path / "one-good",
+        scores=scores,
+    )
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(candidates)
+    assert result.model_name == models[1].model_name
+
+    db2 = open_database(tmp_path / "all-nonseparable.sqlite3")
+    apply_migrations(db2)
+    bootstrap_reference_data(db2)
+    try:
+        seed2 = seed_calibration_candidates(db2)
+        all_models = calibration_models(tmp_path / "all-identities")
+        all_bad = {model.model_name: (0.5, 0.5) for model in all_models}
+        bad_service, bad_candidates, _, _, cleanup, _ = task5_service(
+            db2,
+            tmp_path / "all-bad",
+            scores=all_bad,
+        )
+        approve_complete_reference_set(bad_service, seed2)
+        with pytest.raises(DomainError) as caught:
+            bad_service.calibrate(bad_candidates)
+        assert caught.value.code == "VOICE_MODEL_NOT_SEPARABLE"
+        assert len(cleanup.calls) == 48
+        assert db2.execute(
+            "SELECT COUNT(*) FROM speaker_threshold_configs"
+        ).fetchone()[0] == 0
+        assert db2.execute(
+            "SELECT COUNT(*) FROM voice_reference_profiles"
+        ).fetchone()[0] == 0
+    finally:
+        db2.close()
+
+
+def test_calibration_rejects_invalid_attestation_and_maps_native_failure(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, models, media, *_ = task5_service(db, tmp_path / "invalid")
+    approve_complete_reference_set(service, seed)
+    with pytest.raises(DomainError) as invalid:
+        service.calibrate((replace(models[0], model_sha256="bad"), models[1]))
+    assert invalid.value.code == "VOICE_MODEL_CANDIDATES_INVALID"
+    assert media.calls == []
+
+    failing_name = models[1].model_name
+    failing, candidates, _, _, cleanup, _ = task5_service(
+        db,
+        tmp_path / "failure",
+        fail_model=failing_name,
+    )
+    with pytest.raises(DomainError) as failed:
+        failing.calibrate(candidates)
+    assert failed.value.code == "VOICE_REFERENCE_CALIBRATION_FAILED"
+    assert "private" not in str(failed.value).casefold()
+    assert len(cleanup.calls) == 48
+
+
+def test_calibration_cleanup_failure_attempts_all_and_blocks_result(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    retention = FakeRetention(fail_ids=frozenset({3, 21}))
+    service, models, _, _, _, _ = task5_service(
+        db,
+        tmp_path,
+        retention=retention,
+    )
+    approve_complete_reference_set(service, seed)
+
+    with pytest.raises(DomainError) as caught:
+        service.calibrate(models)
+
+    assert caught.value.code == "VOICE_REFERENCE_CLEANUP_FAILED"
+    assert retention.calls == list(range(1, 25))
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_reference_profiles"
+    ).fetchone()[0] == 0
+
+
+def seed_old_active_calibration(
+    db: sqlite3.Connection,
+    seed: CalibrationSeed,
+) -> tuple[str, tuple[int, ...]]:
+    version = "old-threshold-v1"
+    old_ids: list[int] = []
+    with transaction(db):
+        SpeakerRepository(db).add_threshold_config(
+            SpeakerThresholdConfig(
+                version=version,
+                model_name="old-model.onnx",
+                model_version="old-v1",
+                subject_rule=ScoreRule("gte", 0.9),
+                interviewer_rule=ScoreRule("lte", 0.0),
+            ),
+            NOW,
+            True,
+        )
+        for subject_id in seed.subject_ids:
+            old_ids.append(
+                db.execute(
+                    """
+                    INSERT INTO voice_reference_profiles(
+                        subject_id, model_name, model_version, adapter_version,
+                        feature_hash, threshold_config_version, created_at,
+                        is_active
+                    ) VALUES (?, 'old-model.onnx', 'old-v1', 'adapter-v0', ?,
+                              ?, ?, 1)
+                    """,
+                    (subject_id, f"{subject_id:x}" * 64, version, utc_iso(NOW)),
+                ).lastrowid
+            )
+    return version, tuple(old_ids)
+
+
+def test_activate_calibration_atomically_replaces_exact_four_reference_bundles(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    old_version, old_profile_ids = seed_old_active_calibration(db, seed)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    audit_count = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+
+    activated = service.activate_calibration(result)
+
+    assert len(activated.reference_profile_ids) == 4
+    assert db.execute(
+        "SELECT is_active FROM speaker_threshold_configs WHERE version=?",
+        (old_version,),
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM speaker_threshold_configs WHERE is_active=1"
+    ).fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_reference_profiles WHERE is_active=1"
+    ).fetchone()[0] == 4
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_reference_profiles WHERE id IN "
+        f"({','.join('?' for _ in old_profile_ids)}) AND is_active=0",
+        old_profile_ids,
+    ).fetchone()[0] == 4
+    assert db.execute("SELECT COUNT(*) FROM voice_reference_clips").fetchone()[0] == 24
+    assert db.execute("SELECT COUNT(*) FROM voice_reference_features").fetchone()[0] == 4
+    assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == audit_count
+    for subject_id, profile_id in activated.reference_profile_ids:
+        bundle = VoiceVerificationRepository(db).get_reference_bundle(profile_id)
+        subject_result = next(
+            item for item in result.subjects if item.subject_id == subject_id
+        )
+        assert bundle.subject_id == subject_id
+        assert bundle.model_name == result.model_name
+        assert bundle.feature.feature_sha256 == subject_result.feature.feature_sha256
+        assert bundle.feature.embedding_blob == subject_result.feature.embedding_blob
+        assert tuple(clip.ordinal for clip in bundle.clips) == tuple(range(1, 7))
+        assert tuple(clip.normalized_audio_sha256 for clip in bundle.clips) == tuple(
+            item.normalized_audio_sha256 for item in subject_result.clips
+        )
+
+
+def test_activate_calibration_rejects_corrupt_feature_before_mutation(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    old_version, old_ids = seed_old_active_calibration(db, seed)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    first = result.subjects[0]
+    corrupt_feature = replace(first.feature, embedding_blob=b"corrupt!")
+    corrupt = replace(
+        result,
+        subjects=(replace(first, feature=corrupt_feature), *result.subjects[1:]),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        service.activate_calibration(corrupt)
+
+    assert caught.value.code == "VOICE_REFERENCE_ACTIVATION_INVALID"
+    assert db.execute(
+        "SELECT is_active FROM speaker_threshold_configs WHERE version=?",
+        (old_version,),
+    ).fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_reference_profiles WHERE id IN "
+        f"({','.join('?' for _ in old_ids)}) AND is_active=1",
+        old_ids,
+    ).fetchone()[0] == 4
+    assert db.execute("SELECT COUNT(*) FROM voice_reference_clips").fetchone()[0] == 0
+
+
+def test_activate_calibration_rejects_mutated_identity_clip_and_result_hash(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    old_version, old_ids = seed_old_active_calibration(db, seed)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    first = result.subjects[0]
+    first_clip = first.clips[0]
+    mutations = (
+        replace(result, model_sha256="f" * 64),
+        replace(
+            result,
+            subjects=(
+                replace(
+                    first,
+                    clips=(
+                        replace(first_clip, normalized_audio_sha256="f" * 64),
+                        *first.clips[1:],
+                    ),
+                ),
+                *result.subjects[1:],
+            ),
+        ),
+        replace(result, calibration_hash="f" * 64),
+        replace(
+            result,
+            subject_boundary=result.interviewer_boundary,
+        ),
+    )
+    before_counts = tuple(
+        db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "speaker_threshold_configs",
+            "voice_reference_profiles",
+            "voice_reference_clips",
+            "voice_reference_features",
+        )
+    )
+
+    for mutation in mutations:
+        with pytest.raises(DomainError) as caught:
+            service.activate_calibration(mutation)
+        assert caught.value.code == "VOICE_REFERENCE_ACTIVATION_INVALID"
+        assert tuple(
+            db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "speaker_threshold_configs",
+                "voice_reference_profiles",
+                "voice_reference_clips",
+                "voice_reference_features",
+            )
+        ) == before_counts
+
+    assert db.execute(
+        "SELECT is_active FROM speaker_threshold_configs WHERE version=?",
+        (old_version,),
+    ).fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_reference_profiles WHERE id IN "
+        f"({','.join('?' for _ in old_ids)}) AND is_active=1",
+        old_ids,
+    ).fetchone()[0] == 4
+
+
+def test_activate_calibration_rolls_back_and_resets_transition_authority(
+    db,
+    tmp_path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    old_version, old_ids = seed_old_active_calibration(db, seed)
+    service, models, *_ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    result = service.calibrate(models)
+    before_counts = tuple(
+        db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "audit_events",
+            "speaker_threshold_configs",
+            "voice_reference_profiles",
+            "voice_reference_clips",
+            "voice_reference_features",
+        )
+    )
+    db.executescript(
+        """
+        CREATE TEMP TRIGGER task5_threshold_authority
+        BEFORE UPDATE OF is_active ON speaker_threshold_configs
+        WHEN voice_reference_threshold_transition_authorized(
+            OLD.version, OLD.is_active, NEW.is_active
+        ) != 1
+        BEGIN SELECT RAISE(ABORT, 'ACTIVATION_NOT_AUTHORIZED'); END;
+        CREATE TEMP TRIGGER task5_profile_authority
+        BEFORE UPDATE OF is_active ON voice_reference_profiles
+        WHEN voice_reference_profile_transition_authorized(
+            OLD.id, OLD.subject_id, OLD.is_active, NEW.is_active
+        ) != 1
+        BEGIN SELECT RAISE(ABORT, 'ACTIVATION_NOT_AUTHORIZED'); END;
+        CREATE TEMP TRIGGER task5_injected_failure
+        BEFORE INSERT ON voice_reference_features
+        WHEN (SELECT COUNT(*) FROM voice_reference_features) = 3
+        BEGIN SELECT RAISE(ABORT, 'PRIVATE_INJECTED_FAILURE'); END;
+        """
+    )
+
+    with pytest.raises(DomainError) as caught:
+        service.activate_calibration(result)
+
+    assert caught.value.code == "VOICE_REFERENCE_ACTIVATION_FAILED"
+    assert "injected" not in str(caught.value).casefold()
+    assert tuple(
+        db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "audit_events",
+            "speaker_threshold_configs",
+            "voice_reference_profiles",
+            "voice_reference_clips",
+            "voice_reference_features",
+        )
+    ) == before_counts
+    assert db.execute(
+        "SELECT is_active FROM speaker_threshold_configs WHERE version=?",
+        (old_version,),
+    ).fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM voice_reference_profiles WHERE id IN "
+        f"({','.join('?' for _ in old_ids)}) AND is_active=1",
+        old_ids,
+    ).fetchone()[0] == 4
+    with pytest.raises(sqlite3.IntegrityError, match="ACTIVATION_NOT_AUTHORIZED"):
+        db.execute(
+            "UPDATE speaker_threshold_configs SET is_active=0 WHERE version=?",
+            (old_version,),
+        )

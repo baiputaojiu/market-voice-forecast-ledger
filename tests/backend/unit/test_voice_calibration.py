@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from math import nan
 
 import pytest
@@ -16,6 +17,10 @@ from market_voice_forecast_ledger.domain.voice_verification import (
     build_presence_job_manifest,
     calibrate_thresholds,
     classify_presence_score,
+)
+from market_voice_forecast_ledger.services.voice_reference import (
+    ApprovedReferenceClip,
+    canonical_reference_approval_hash,
 )
 
 
@@ -170,3 +175,55 @@ def test_voice_commands_and_results_are_immutable_proposal_only_records() -> Non
     )
     with pytest.raises(FrozenInstanceError):
         result.proposal = VoiceProposal.LIKELY_ABSENT
+
+
+def test_reference_approval_hash_binds_public_approval_and_record_is_immutable() -> None:
+    approved_at = datetime(2026, 8, 22, 1, 2, 3, tzinfo=timezone.utc)
+    approval_hash = canonical_reference_approval_hash(
+        subject_id=1,
+        video_id=2,
+        start_ms=1_000,
+        end_ms=16_000,
+        ordinal=1,
+        clip_kind="enrollment",
+        actor="local_user",
+        reason="clear solo speech",
+        approved_at=approved_at,
+    )
+    approval = ApprovedReferenceClip(
+        subject_id=1,
+        video_id=2,
+        start_ms=1_000,
+        end_ms=16_000,
+        ordinal=1,
+        clip_kind="enrollment",
+        actor="local_user",
+        reason="clear solo speech",
+        approved_at=approved_at,
+        approval_hash=approval_hash,
+    )
+
+    assert approval_hash == canonical_reference_approval_hash(
+        subject_id=approval.subject_id,
+        video_id=approval.video_id,
+        start_ms=approval.start_ms,
+        end_ms=approval.end_ms,
+        ordinal=approval.ordinal,
+        clip_kind=approval.clip_kind,
+        actor=approval.actor,
+        reason=approval.reason,
+        approved_at=approval.approved_at,
+    )
+    assert approval_hash != canonical_reference_approval_hash(
+        subject_id=approval.subject_id,
+        video_id=approval.video_id,
+        start_ms=approval.start_ms,
+        end_ms=approval.end_ms + 1,
+        ordinal=approval.ordinal,
+        clip_kind=approval.clip_kind,
+        actor=approval.actor,
+        reason=approval.reason,
+        approved_at=approval.approved_at,
+    )
+    with pytest.raises(FrozenInstanceError):
+        approval.reason = "changed"
