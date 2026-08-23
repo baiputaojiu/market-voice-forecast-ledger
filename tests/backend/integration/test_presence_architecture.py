@@ -15,16 +15,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_ROOT = PROJECT_ROOT / "src" / "market_voice_forecast_ledger"
 VOICE_ADAPTER_FILES = (PACKAGE_ROOT / "voice" / "adapter_main.py",)
 PRODUCTION_FILES = tuple(sorted(PACKAGE_ROOT.rglob("*.py")))
-PRESENCE_PROTECTED_FILES = (
-    PACKAGE_ROOT / "repositories" / "voice_verification.py",
-    PACKAGE_ROOT / "services" / "voice_reference.py",
-    PACKAGE_ROOT / "services" / "voice_verification.py",
-    PACKAGE_ROOT / "workers" / "presence_verification.py",
-    PACKAGE_ROOT / "voice" / "adapter_main.py",
+PRESENCE_SHARED_BOUNDARY_PATHS = frozenset(
+    {
+        "cli.py",
+        "config.py",
+        "db/connection.py",
+        "repositories/discovery.py",
+        "repositories/retention.py",
+        "services/audit.py",
+        "services/job_state.py",
+        "services/retention.py",
+    }
 )
-PRESENCE_PROTECTED_RELATIVE = frozenset(
-    path.relative_to(PACKAGE_ROOT).as_posix()
-    for path in PRESENCE_PROTECTED_FILES
+PRESENCE_NAMED_BOUNDARY_DIRECTORIES = frozenset(
+    {"domain", "repositories", "services", "workers"}
 )
 PRESENCE_SQL_OWNERS = frozenset(
     {
@@ -32,6 +36,34 @@ PRESENCE_SQL_OWNERS = frozenset(
         "repositories/voice_verification.py",
     }
 )
+CANONICAL_DOWNSTREAM_SQL_OWNERS = frozenset(
+    {
+        ("repositories/retention.py", "analysis_input_snapshots"),
+        ("repositories/retention.py", "transcript_segments"),
+    }
+)
+
+
+def _is_protected_presence_path(relative: str) -> bool:
+    parts = relative.split("/")
+    if relative in PRESENCE_SHARED_BOUNDARY_PATHS:
+        return True
+    if len(parts) != 2 or not parts[1].endswith(".py"):
+        return False
+    if parts[0] == "voice":
+        return True
+    stem = parts[1][:-3]
+    return parts[0] in PRESENCE_NAMED_BOUNDARY_DIRECTORIES and stem.startswith(
+        ("presence_", "voice_")
+    )
+
+
+def _protected_presence_files(package_root: Path) -> tuple[Path, ...]:
+    return tuple(
+        path
+        for path in sorted(package_root.rglob("*.py"))
+        if _is_protected_presence_path(_relative(path, package_root))
+    )
 REVIEW_WRITER_METHOD = "add_review_and_decision"
 APPROVED_REVIEW_WRITER_CALLERS = (
     "services/voice_verification.py:PresenceVerificationService.review",
@@ -205,9 +237,14 @@ def _direct_sql_writes(tree: ast.Module) -> Iterator[tuple[int, str]]:
 def _is_protected_sql_write(relative: str, table: str) -> bool:
     if table in {"presence_decisions", "subject_video_candidates"}:
         return relative not in PRESENCE_SQL_OWNERS
-    return relative in PRESENCE_PROTECTED_RELATIVE and (
+    is_downstream = (
         table in {"speaker_assignments", "transcript_segments"}
         or table.startswith("analysis_")
+    )
+    return (
+        _is_protected_presence_path(relative)
+        and is_downstream
+        and (relative, table) not in CANONICAL_DOWNSTREAM_SQL_OWNERS
     )
 
 
@@ -308,12 +345,13 @@ def _call_mechanism(node: ast.Call) -> str | None:
 
 
 def writer_convention_violations(
-    files: Iterable[Path] = PRESENCE_PROTECTED_FILES,
+    files: Iterable[Path] | None = None,
     *,
     package_root: Path = PACKAGE_ROOT,
 ) -> tuple[tuple[str, int, str], ...]:
     violations = []
-    for path in files:
+    targets = _protected_presence_files(package_root) if files is None else files
+    for path in targets:
         relative = _relative(path, package_root)
         for node in ast.walk(_tree(path)):
             if any(
@@ -364,6 +402,32 @@ def test_only_review_service_calls_canonical_presence_writer_directly() -> None:
 
 def test_protected_modules_do_not_alias_or_dynamically_dispatch_writer() -> None:
     assert writer_convention_violations() == ()
+
+
+@pytest.mark.parametrize(
+    ("relative", "table"),
+    (
+        ("voice/process.py", "transcript_segments"),
+        ("services/presence_mutation.py", "analysis_runs"),
+    ),
+)
+def test_finite_guard_protects_complete_presence_production_surface(
+    tmp_path: Path,
+    relative: str,
+    table: str,
+) -> None:
+    package_root = tmp_path / "market_voice_forecast_ledger"
+    mutation = package_root / relative
+    mutation.parent.mkdir(parents=True)
+    mutation.write_text(
+        f"def mutate(conn):\n"
+        f"    conn.execute(\"INSERT INTO {table}(id) VALUES (1)\")\n",
+        encoding="utf-8",
+    )
+
+    assert direct_sql_write_violations(
+        (mutation,), package_root=package_root
+    ) == ((relative, 2, table),)
 
 
 def test_finite_guard_detects_direct_protected_sql_mutation(
