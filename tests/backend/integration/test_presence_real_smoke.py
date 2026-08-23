@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,7 +52,39 @@ def _runtime_version_probe(argv: tuple[str, ...]) -> str:
     )
     if completed.returncode != 0 or type(completed.stdout) is not str:
         raise ValueError("runtime version probe failed")
-    return completed.stdout
+    for line in completed.stdout.splitlines():
+        if line:
+            return line
+    raise ValueError("runtime version probe failed")
+
+
+def test_runtime_version_probe_returns_first_nonempty_stdout_line() -> None:
+    writer = "import sys; sys.stdout.write(sys.argv[1])"
+
+    output = _runtime_version_probe(
+        (
+            sys.executable,
+            "-c",
+            writer,
+            "\nPython 3.14.6\nextra output\n",
+        )
+    )
+
+    assert output == "Python 3.14.6"
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        "",
+        "import sys; sys.stdout.write('Python 3.14.6\\n'); sys.exit(7)",
+    ),
+)
+def test_runtime_version_probe_rejects_empty_stdout_or_nonzero_exit(
+    script: str,
+) -> None:
+    with pytest.raises(ValueError, match="runtime version probe failed"):
+        _runtime_version_probe((sys.executable, "-c", script))
 
 
 def _default_settings_factory(data_dir: Path) -> object:

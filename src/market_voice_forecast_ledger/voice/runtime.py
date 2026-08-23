@@ -488,7 +488,14 @@ def _validate_probe(
     if not callable(probe):
         raise ValueError("invalid version probe")
     output = probe((str(path), argument))
-    if type(output) is not str or output != expected:
+    banner_prefixes = (f"{expected} ", f"{expected}-")
+    if type(output) is not str or (
+        output != expected
+        and not any(
+            output.startswith(prefix) and len(output) > len(prefix)
+            for prefix in banner_prefixes
+        )
+    ):
         raise ValueError("unexpected version output")
 
 

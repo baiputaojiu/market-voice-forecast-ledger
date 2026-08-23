@@ -148,6 +148,74 @@ def test_runtime_attests_exact_private_artifacts_and_fixed_probe_argv(tmp_path: 
     ]
 
 
+@pytest.mark.parametrize(
+    ("executable", "argument", "output"),
+    (
+        (
+            "deno.exe",
+            "--version",
+            "deno 2.9.5 (stable, release, x86_64-pc-windows-msvc)",
+        ),
+        (
+            "ffmpeg.exe",
+            "-version",
+            "ffmpeg version 9.0.1-essentials_build-www.gyan.dev Copyright 2026",
+        ),
+    ),
+)
+def test_runtime_accepts_pinned_official_version_banner_suffixes(
+    tmp_path: Path, executable: str, argument: str, output: str
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    path = (settings.voice_runtime_dir / executable).resolve()
+    probe.outputs[(str(path), argument)] = output
+
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+
+    assert (attestation.deno_version, attestation.ffmpeg_version) == (
+        "2.9.5",
+        "9.0.1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("executable", "argument", "output"),
+    (
+        (
+            "deno.exe",
+            "--version",
+            "deno 2.9.50 (stable, release, x86_64-pc-windows-msvc)",
+        ),
+        (
+            "ffmpeg.exe",
+            "-version",
+            "ffmpeg version 9.0.10-essentials_build-www.gyan.dev",
+        ),
+        ("deno.exe", "--version", "2.9.5 (stable, release)"),
+        ("ffmpeg.exe", "-version", "9.0.1-essentials_build-www.gyan.dev"),
+        ("deno.exe", "--version", "deno 2.9.5(stable, release)"),
+        (
+            "ffmpeg.exe",
+            "-version",
+            "ffmpeg version 9.0.1_essentials_build-www.gyan.dev",
+        ),
+    ),
+)
+def test_runtime_rejects_near_versions_missing_prefixes_and_bad_boundaries(
+    tmp_path: Path, executable: str, argument: str, output: str
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    path = (settings.voice_runtime_dir / executable).resolve()
+    probe.outputs[(str(path), argument)] = output
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        attest_runtime(settings, version_probe=probe, allowlists=allowlists)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+
+
 def test_runtime_attests_exact_project_and_sherpa_startup_inventory(
     tmp_path: Path,
 ) -> None:
