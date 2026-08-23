@@ -204,6 +204,21 @@ def test_static_guard_mutations_detect_module_import_and_new_helper_assertion() 
     assert _opt_in_path_assertions(helper_assertion_mutation)
 
 
+def test_static_guard_detects_rewritten_assertion_in_exact_real_smoke_root() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+    mutated = source.replace(
+        "def test_real_presence_runtime() -> None:\n    run_presence_smoke_entry()\n",
+        (
+            "def test_real_presence_runtime() -> None:\n"
+            "    run_presence_smoke_entry()\n"
+            "    assert os.environ['private-voice-env']\n"
+        ),
+        1,
+    )
+
+    assert _opt_in_path_assertions(ast.parse(mutated))
+
+
 def test_smoke_config_has_one_absolute_private_data_root() -> None:
     valid = PrivateSmokeConfig(data_dir=Path.cwd())
 
@@ -311,7 +326,11 @@ def _opt_in_path_nodes(tree: ast.Module) -> tuple[ast.FunctionDef, ...]:
     return tuple(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and not node.name.startswith("test_")
+        if isinstance(node, ast.FunctionDef)
+        and (
+            not node.name.startswith("test_")
+            or node.name == "test_real_presence_runtime"
+        )
     )
 
 
@@ -355,7 +374,10 @@ def test_real_smoke_opt_in_path_uses_only_fixed_failures_and_one_skip() -> None:
         and node.func.attr == "skip"
     )
 
-    assert "run_presence_smoke_entry" in {target.name for target in targets}
+    assert {
+        "run_presence_smoke_entry",
+        "test_real_presence_runtime",
+    } <= {target.name for target in targets}
     assert assertions == ()
     assert len(fail_calls) == 2
     assert all(
