@@ -8,8 +8,212 @@ from typing import Any
 
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.voice_verification import VoiceProposal
-from market_voice_forecast_ledger.voice.protocol import AdapterRequest
+from market_voice_forecast_ledger.services.voice_reference import (
+    ApprovedReferenceClip,
+    PreparedReferenceAudio,
+    ReferenceFeatureData,
+    ReferenceMediaPlan,
+)
+from market_voice_forecast_ledger.voice.protocol import (
+    AdapterRequest,
+    AdapterResponse,
+)
 from market_voice_forecast_ledger.voice.runtime import RuntimeAttestation
+
+
+class SimulatedPresenceCrash(BaseException):
+    pass
+
+
+class SyntheticReferenceMedia:
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve(strict=True)
+        self.calls: list[tuple[str, int, int]] = []
+
+    def plan(
+        self,
+        model: RuntimeAttestation,
+        approval: ApprovedReferenceClip,
+    ) -> ReferenceMediaPlan:
+        model_key = hashlib.sha256(
+            model.model_name.encode("ascii")
+        ).hexdigest()[:12]
+        job_dir = (
+            self.root
+            / model_key
+            / (
+                f"{approval.subject_id}-{approval.ordinal}-"
+                f"{approval.approval_hash[:12]}"
+            )
+        ).resolve()
+        job_dir.mkdir(parents=True, exist_ok=False)
+        return ReferenceMediaPlan(
+            model_sha256=model.model_sha256,
+            approval_hash=approval.approval_hash,
+            video_id=approval.video_id,
+            source_path=job_dir / "source.media",
+            source_part_path=job_dir / "source.media.part",
+            normalized_path=job_dir / "normalized.wav",
+        )
+
+    def prepare(
+        self,
+        model: RuntimeAttestation,
+        approval: ApprovedReferenceClip,
+        plan: ReferenceMediaPlan,
+    ) -> PreparedReferenceAudio:
+        self.calls.append(
+            (model.model_name, approval.subject_id, approval.ordinal)
+        )
+        source = (
+            f"synthetic-source:{model.model_name}:"
+            f"{approval.subject_id}:{approval.ordinal}"
+        ).encode("ascii")
+        partial = b"synthetic-registered-partial"
+        normalized = _synthetic_pcm_wav(duration_ms=approval.end_ms)
+        plan.source_path.write_bytes(source)
+        plan.source_part_path.write_bytes(partial)
+        plan.normalized_path.write_bytes(normalized)
+        return PreparedReferenceAudio(
+            local_path=plan.normalized_path,
+            audio_duration_ms=approval.end_ms,
+            normalized_audio_sha256=hashlib.sha256(normalized).hexdigest(),
+        )
+
+
+class SyntheticReferenceScorer:
+    def __init__(self) -> None:
+        self.enrollment_calls: list[tuple[str, int, tuple[int, ...]]] = []
+        self.score_calls: list[tuple[str, int, int]] = []
+        self._dry_run_calls: list[tuple[str, int]] = []
+
+    @property
+    def dry_run_calls(self) -> tuple[tuple[str, int], ...]:
+        return tuple(self._dry_run_calls)
+
+    def derive_enrollment_feature(
+        self,
+        model: RuntimeAttestation,
+        subject_id: int,
+        clips: tuple[
+            tuple[ApprovedReferenceClip, PreparedReferenceAudio], ...
+        ],
+    ) -> ReferenceFeatureData:
+        self.enrollment_calls.append(
+            (
+                model.model_name,
+                subject_id,
+                tuple(approval.ordinal for approval, _audio in clips),
+            )
+        )
+        is_campplus = "campplus" in model.model_name
+        dimension = 192 if is_campplus else 256
+        marker = 1.0 if is_campplus else 2.0
+        body = struct.pack(
+            f"<{dimension}f",
+            marker,
+            float(subject_id),
+            *([0.0] * (dimension - 2)),
+        )
+        return ReferenceFeatureData(
+            subject_id=subject_id,
+            encoding_version="sherpa-speaker-embedding-v1",
+            float_dtype="float32-le",
+            dimension=dimension,
+            embedding_blob=body,
+            feature_sha256=hashlib.sha256(body).hexdigest(),
+        )
+
+    def score(
+        self,
+        model: RuntimeAttestation,
+        subject_id: int,
+        feature: ReferenceFeatureData,
+        approval: ApprovedReferenceClip,
+        audio: PreparedReferenceAudio,
+    ) -> float:
+        del feature, audio
+        self.score_calls.append(
+            (model.model_name, subject_id, approval.ordinal)
+        )
+        positive, negative = (
+            (0.80, 0.30)
+            if "campplus" in model.model_name
+            else (0.75, 0.10)
+        )
+        return positive if approval.clip_kind == "held_out_positive" else negative
+
+    def dry_run(
+        self,
+        model: RuntimeAttestation,
+        features: tuple[ReferenceFeatureData, ...],
+        *,
+        candidate_count: int,
+    ) -> int:
+        if len(features) != 4 or candidate_count != 20:
+            raise AssertionError("synthetic dry run shape changed")
+        self._dry_run_calls.append((model.model_name, candidate_count))
+        return 900 if "campplus" in model.model_name else 1_100
+
+
+class SequencedPresenceAdapter:
+    def __init__(
+        self,
+        scores: tuple[tuple[float, float], ...],
+    ) -> None:
+        if len(scores) != 20 or any(len(item) != 2 for item in scores):
+            raise AssertionError("synthetic proposal sequence changed")
+        self._scores = scores
+        self.calls: list[AdapterRequest] = []
+
+    def score(self, request: AdapterRequest) -> AdapterResponse:
+        index = len(self.calls)
+        if index >= len(self._scores):
+            raise AssertionError("unexpected synthetic adapter call")
+        self.calls.append(request)
+        segments = []
+        for ordinal, score in enumerate(self._scores[index], start=1):
+            start_ms = (ordinal - 1) * 900
+            end_ms = ordinal * 900
+            segments.append(
+                {
+                    "end_ms": end_ms,
+                    "evidence_hash": sha256_text(
+                        canonical_json(
+                            {
+                                "audio_sha256": request.audio_sha256,
+                                "end_ms": end_ms,
+                                "ordinal": ordinal,
+                                "raw_score": score,
+                                "start_ms": start_ms,
+                            }
+                        )
+                    ),
+                    "ordinal": ordinal,
+                    "raw_score": score,
+                    "start_ms": start_ms,
+                }
+            )
+        maximum = max(self._scores[index])
+        if maximum >= request.subject_boundary:
+            proposal = VoiceProposal.LIKELY_PRESENT
+        elif maximum <= request.interviewer_boundary:
+            proposal = VoiceProposal.LIKELY_ABSENT
+        else:
+            proposal = VoiceProposal.NEEDS_REVIEW
+        values: dict[str, object] = {
+            "adapter_contract_version": request.adapter_contract_version,
+            "input_hash": request.input_hash,
+            "model_name": request.model_name,
+            "model_version": request.model_version,
+            "proposal": proposal.value,
+            "segments": segments,
+            "vad_contract_version": request.vad_contract_version,
+        }
+        values["output_hash"] = sha256_text(canonical_json(values))
+        return AdapterResponse.model_validate_json(
+            canonical_json(values), strict=True
+        )
 
 
 def _write(path: Path, contents: bytes) -> str:
