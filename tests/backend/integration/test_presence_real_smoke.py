@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -84,13 +85,123 @@ def run_real_smoke_without_private_assert_values(
     return SMOKE_SUCCESS
 
 
-def test_real_presence_runtime() -> None:
-    if os.environ.get(SMOKE_FLAG) != "1":
+def run_presence_smoke_entry(
+    *,
+    environment: Mapping[str, str] = os.environ,
+    config_loader: Callable[[], object] = load_private_smoke_config,
+    config_validator: Callable[[object], bool] = validate_safe_config_shape,
+    smoke_runner: Callable[[PrivateSmokeConfig], str] = (
+        run_real_smoke_without_private_assert_values
+    ),
+) -> None:
+    if environment.get(SMOKE_FLAG) != "1":
         pytest.skip("real presence voice smoke not requested")
-    config = load_private_smoke_config()
-    if not validate_safe_config_shape(config):
+    config = config_loader()
+    if not config_validator(config):
         pytest.fail("real presence voice smoke configuration invalid", pytrace=False)
-    run_real_smoke_without_private_assert_values(config)
+    smoke_runner(config)
+
+
+def test_real_presence_runtime() -> None:
+    run_presence_smoke_entry()
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ({}, {"MVFL_RUN_REAL_VOICE_SMOKE": "0"}),
+)
+def test_real_smoke_entry_requires_the_exact_opt_in_flag_before_loading_config(
+    environment: dict[str, str],
+) -> None:
+    calls: list[str] = []
+
+    def forbidden_loader() -> object:
+        calls.append("load")
+        return object()
+
+    with pytest.raises(pytest.skip.Exception) as caught:
+        run_presence_smoke_entry(
+            environment=environment,
+            config_loader=forbidden_loader,
+            config_validator=lambda _config: True,
+            smoke_runner=lambda _config: calls.append("run"),
+        )
+
+    assert str(caught.value) == SMOKE_SKIP_REASON
+    assert calls == []
+
+
+def test_real_smoke_entry_runs_each_opt_in_stage_once_for_exact_flag() -> None:
+    calls: list[object] = []
+    config = PrivateSmokeConfig(data_dir=Path.cwd())
+
+    def config_loader() -> object:
+        calls.append("load")
+        return config
+
+    def config_validator(candidate: object) -> bool:
+        calls.append(candidate)
+        return candidate is config
+
+    def smoke_runner(candidate: PrivateSmokeConfig) -> str:
+        calls.append(candidate)
+        return "unused fixed result"
+
+    try:
+        run_presence_smoke_entry(
+            environment={"MVFL_RUN_REAL_VOICE_SMOKE": "1"},
+            config_loader=config_loader,
+            config_validator=config_validator,
+            smoke_runner=smoke_runner,
+        )
+    except pytest.skip.Exception:
+        pytest.fail("real presence voice smoke entry unexpectedly skipped", pytrace=False)
+
+    assert calls == ["load", config, config]
+
+
+def test_real_smoke_entry_rejects_invalid_config_with_fixed_nontrace_failure() -> None:
+    calls: list[str] = []
+
+    def invalid_config_loader() -> object:
+        calls.append("load")
+        return object()
+
+    def invalid_config_validator(_config: object) -> bool:
+        calls.append("validate")
+        return False
+
+    with pytest.raises(pytest.fail.Exception) as caught:
+        run_presence_smoke_entry(
+            environment={"MVFL_RUN_REAL_VOICE_SMOKE": "1"},
+            config_loader=invalid_config_loader,
+            config_validator=invalid_config_validator,
+            smoke_runner=lambda _config: calls.append("run"),
+        )
+
+    assert str(caught.value) == SMOKE_CONFIG_FAILURE
+    assert caught.value.pytrace is False
+    assert calls == ["load", "validate"]
+
+
+def test_module_scope_import_guard_recurses_without_entering_helpers() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    assert _module_scope_production_imports(tree) == ()
+
+
+def test_static_guard_mutations_detect_module_import_and_new_helper_assertion() -> None:
+    module_import_mutation = ast.parse(
+        "if True:\n    import market_voice_forecast_ledger.voice.runtime\n"
+    )
+    helper_assertion_mutation = ast.parse(
+        "def _new_opt_in_helper() -> None:\n    assert False\n"
+    )
+
+    assert _module_scope_production_imports(module_import_mutation) == (
+        "market_voice_forecast_ledger.voice.runtime",
+    )
+    assert _opt_in_path_assertions(helper_assertion_mutation)
 
 
 def test_smoke_config_has_one_absolute_private_data_root() -> None:
@@ -175,44 +286,54 @@ def test_injected_private_attestation_failure_never_discloses_sentinel() -> None
         pytest.fail(SMOKE_PRIVACY_FAILURE, pytrace=False)
 
 
-def test_real_smoke_collection_imports_no_private_runtime_module() -> None:
-    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    imported_modules = tuple(
-        alias.name
-        for node in tree.body
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    ) + tuple(
-        node.module
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom) and node.module is not None
+def _module_scope_production_imports(tree: ast.Module) -> tuple[str, ...]:
+    imported_modules: list[str] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return
+        if isinstance(node, ast.Import):
+            imported_modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.append(node.module)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    return tuple(
+        module
+        for module in imported_modules
+        if module.startswith("market_voice_forecast_ledger")
     )
 
-    assert all(
-        not module.startswith("market_voice_forecast_ledger")
-        for module in imported_modules
+
+def _opt_in_path_nodes(tree: ast.Module) -> tuple[ast.FunctionDef, ...]:
+    return tuple(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("test_")
     )
+
+
+def _opt_in_path_assertions(tree: ast.Module) -> tuple[ast.Assert, ...]:
+    return tuple(
+        node
+        for target in _opt_in_path_nodes(tree)
+        for node in ast.walk(target)
+        if isinstance(node, ast.Assert)
+    )
+
+
+def test_real_smoke_collection_imports_no_private_runtime_module() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    assert _module_scope_production_imports(tree) == ()
 
 
 def test_real_smoke_opt_in_path_uses_only_fixed_failures_and_one_skip() -> None:
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    target_names = {
-        "load_private_smoke_config",
-        "validate_safe_config_shape",
-        "_runtime_version_probe",
-        "_default_settings_factory",
-        "_default_attestation_runner",
-        "run_real_smoke_without_private_assert_values",
-        "test_real_presence_runtime",
-    }
-    targets = tuple(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in target_names
-    )
-    assertions = tuple(
-        node for target in targets for node in ast.walk(target) if isinstance(node, ast.Assert)
-    )
+    targets = _opt_in_path_nodes(tree)
+    assertions = _opt_in_path_assertions(tree)
     fail_calls = tuple(
         node
         for target in targets
@@ -234,7 +355,7 @@ def test_real_smoke_opt_in_path_uses_only_fixed_failures_and_one_skip() -> None:
         and node.func.attr == "skip"
     )
 
-    assert {target.name for target in targets} == target_names
+    assert "run_presence_smoke_entry" in {target.name for target in targets}
     assert assertions == ()
     assert len(fail_calls) == 2
     assert all(
