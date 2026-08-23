@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -93,6 +93,9 @@ class _LexicalScope:
     events: dict[str, list[ast.AST | _KnownBinding]] = field(
         default_factory=dict
     )
+    global_names: frozenset[str] = frozenset()
+    nonlocal_names: frozenset[str] = frozenset()
+    has_star_import: bool = False
 
     def bind(self, name: str, value: ast.AST | _KnownBinding) -> None:
         self.events.setdefault(name, []).append(value)
@@ -119,8 +122,32 @@ def _binding_target_names(node: ast.AST) -> tuple[str, ...]:
     return tuple(
         item.id
         for item in ast.walk(node)
-        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+        if isinstance(item, ast.Name)
+        and isinstance(item.ctx, (ast.Store, ast.Del))
     )
+
+
+def _scope_declarations(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> tuple[frozenset[str], frozenset[str]]:
+    global_names = set()
+    nonlocal_names = set()
+
+    def visit(candidate: ast.AST) -> None:
+        for child in ast.iter_child_nodes(candidate):
+            if isinstance(
+                child,
+                (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+            ):
+                continue
+            if isinstance(child, ast.Global):
+                global_names.update(child.names)
+            elif isinstance(child, ast.Nonlocal):
+                nonlocal_names.update(child.names)
+            visit(child)
+
+    visit(node)
+    return frozenset(global_names), frozenset(nonlocal_names)
 
 
 class _ScopeBuilder(ast.NodeVisitor):
@@ -129,18 +156,85 @@ class _ScopeBuilder(ast.NodeVisitor):
         self.current = self.module
         self.node_scopes: dict[int, _LexicalScope] = {}
         self.scopes = [self.module]
+        self.recorded_targets: set[int] = set()
         self.visit(tree)
+
+    def _binding_scope(
+        self,
+        name: str,
+        scope: _LexicalScope | None = None,
+    ) -> _LexicalScope:
+        target = scope or self.current
+        if name in target.global_names:
+            return self.module
+        if name in target.nonlocal_names:
+            parent = _outer_scope(target)
+            while parent is not None:
+                if name in parent.events or parent.kind in {
+                    "function",
+                    "lambda",
+                    "type_parameters",
+                }:
+                    return parent
+                parent = _outer_scope(parent)
+        return target
+
+    def _bind_name(
+        self,
+        name: str,
+        value: ast.AST | _KnownBinding,
+        scope: _LexicalScope | None = None,
+    ) -> None:
+        self._binding_scope(name, scope).bind(name, value)
+
+    def _bind_target(
+        self,
+        target: ast.AST,
+        value: ast.AST | _KnownBinding,
+        scope: _LexicalScope | None = None,
+    ) -> None:
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                self.recorded_targets.add(id(node))
+                self._bind_name(node.id, value, scope)
+        previous = self.current
+        if scope is not None:
+            self.current = scope
+        self.visit(target)
+        self.current = previous
+
+    def _type_parameter_scope(self, node: ast.AST) -> _LexicalScope:
+        child = _LexicalScope("type_parameters", self.current)
+        self.scopes.append(child)
+        previous, self.current = self.current, child
+        for parameter in getattr(node, "type_params", ()):
+            name = getattr(parameter, "name", None)
+            if isinstance(name, str):
+                child.bind(name, _UNKNOWN_BINDING)
+            self.visit(parameter)
+        self.current = previous
+        return child
 
     def generic_visit(self, node: ast.AST) -> None:
         self.node_scopes[id(node)] = self.current
         super().generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self.node_scopes[id(node)] = self.current
+        if (
+            isinstance(node.ctx, (ast.Store, ast.Del))
+            and id(node) not in self.recorded_targets
+        ):
+            self._bind_name(node.id, _UNKNOWN_BINDING)
 
     def _visit_function(
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> None:
         self.node_scopes[id(node)] = self.current
-        self.current.bind(node.name, _UNKNOWN_BINDING)
+        self._bind_name(node.name, _UNKNOWN_BINDING)
         for item in (
             *node.decorator_list,
             *node.args.defaults,
@@ -151,6 +245,9 @@ class _ScopeBuilder(ast.NodeVisitor):
             ),
         ):
             self.visit(item)
+        outer = self.current
+        if node.type_params:
+            self.current = self._type_parameter_scope(node)
         for argument in (
             *node.args.posonlyargs,
             *node.args.args,
@@ -162,11 +259,15 @@ class _ScopeBuilder(ast.NodeVisitor):
                 self.visit(argument.annotation)
         if node.returns is not None:
             self.visit(node.returns)
-        for type_parameter in getattr(node, "type_params", ()):
-            self.visit(type_parameter)
-        child = _LexicalScope("function", self.current)
+        global_names, nonlocal_names = _scope_declarations(node)
+        child = _LexicalScope(
+            "function",
+            self.current,
+            global_names=global_names,
+            nonlocal_names=nonlocal_names,
+        )
         self.scopes.append(child)
-        previous, self.current = self.current, child
+        self.current = child
         for argument in (
             *node.args.posonlyargs,
             *node.args.args,
@@ -178,26 +279,35 @@ class _ScopeBuilder(ast.NodeVisitor):
             child.bind(argument.arg, _UNKNOWN_BINDING)
         for statement in node.body:
             self.visit(statement)
-        self.current = previous
+        self.current = outer
 
     visit_FunctionDef = _visit_function
     visit_AsyncFunctionDef = _visit_function
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.node_scopes[id(node)] = self.current
-        self.current.bind(node.name, _UNKNOWN_BINDING)
-        for item in (*node.decorator_list, *node.bases):
+        self._bind_name(node.name, _UNKNOWN_BINDING)
+        for item in node.decorator_list:
+            self.visit(item)
+        outer = self.current
+        if node.type_params:
+            self.current = self._type_parameter_scope(node)
+        for item in node.bases:
             self.visit(item)
         for keyword in node.keywords:
             self.visit(keyword.value)
-        for type_parameter in getattr(node, "type_params", ()):
-            self.visit(type_parameter)
-        child = _LexicalScope("class", self.current)
+        global_names, nonlocal_names = _scope_declarations(node)
+        child = _LexicalScope(
+            "class",
+            self.current,
+            global_names=global_names,
+            nonlocal_names=nonlocal_names,
+        )
         self.scopes.append(child)
-        previous, self.current = self.current, child
+        self.current = child
         for statement in node.body:
             self.visit(statement)
-        self.current = previous
+        self.current = outer
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self.node_scopes[id(node)] = self.current
@@ -221,6 +331,15 @@ class _ScopeBuilder(ast.NodeVisitor):
         self.visit(node.body)
         self.current = previous
 
+    def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
+        self.node_scopes[id(node)] = self.current
+        outer = self.current
+        self._bind_target(node.name, _UNKNOWN_BINDING)
+        if node.type_params:
+            self.current = self._type_parameter_scope(node)
+        self.visit(node.value)
+        self.current = outer
+
     def _visit_comprehension_scope(
         self,
         node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
@@ -233,9 +352,7 @@ class _ScopeBuilder(ast.NodeVisitor):
         for index, generator in enumerate(node.generators):
             if index:
                 self.visit(generator.iter)
-            self.visit(generator.target)
-            for name in _binding_target_names(generator.target):
-                child.bind(name, _UNKNOWN_BINDING)
+            self._bind_target(generator.target, _UNKNOWN_BINDING)
             for condition in generator.ifs:
                 self.visit(condition)
         if isinstance(node, ast.DictComp):
@@ -268,7 +385,7 @@ class _ScopeBuilder(ast.NodeVisitor):
                 and item.rest is not None
             )
             for name in captures:
-                self.current.bind(name, _UNKNOWN_BINDING)
+                self._bind_name(name, _UNKNOWN_BINDING)
             if case.guard is not None:
                 self.visit(case.guard)
             for statement in case.body:
@@ -283,11 +400,13 @@ class _ScopeBuilder(ast.NodeVisitor):
                 "importlib": _IMPORTLIB_MODULE_BINDING,
                 "builtins": _BUILTINS_MODULE_BINDING,
             }.get(alias.name, _UNKNOWN_BINDING)
-            self.current.bind(bound, known)
+            self._bind_name(bound, known)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self.node_scopes[id(node)] = self.current
         for alias in node.names:
+            if alias.name == "*":
+                self.current.has_star_import = True
             bound = alias.asname or alias.name
             known = _UNKNOWN_BINDING
             if node.level == 0 and node.module == "typing":
@@ -299,23 +418,19 @@ class _ScopeBuilder(ast.NodeVisitor):
             elif node.level == 0 and node.module == "builtins":
                 if alias.name == "__import__":
                     known = _BUILTIN_IMPORT_BINDING
-            self.current.bind(bound, known)
+            self._bind_name(bound, known)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.node_scopes[id(node)] = self.current
         self.visit(node.value)
         for target in node.targets:
-            self.visit(target)
-            for name in _binding_target_names(target):
-                self.current.bind(name, node.value)
+            self._bind_target(target, node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.node_scopes[id(node)] = self.current
         if node.value is not None:
             self.visit(node.value)
-        self.visit(node.target)
-        for name in _binding_target_names(node.target):
-            self.current.bind(name, node.value or _UNKNOWN_BINDING)
+        self._bind_target(node.target, node.value or _UNKNOWN_BINDING)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.node_scopes[id(node)] = self.current
@@ -325,25 +440,22 @@ class _ScopeBuilder(ast.NodeVisitor):
             if binding_scope.parent is None:
                 break
             binding_scope = binding_scope.parent
-        previous, self.current = self.current, binding_scope
-        self.visit(node.target)
-        for name in _binding_target_names(node.target):
-            binding_scope.bind(name, node.value)
-        self.current = previous
+        self._bind_target(node.target, node.value, binding_scope)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.node_scopes[id(node)] = self.current
         self.visit(node.value)
-        self.visit(node.target)
-        for name in _binding_target_names(node.target):
-            self.current.bind(name, _UNKNOWN_BINDING)
+        self._bind_target(node.target, _UNKNOWN_BINDING)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        self.node_scopes[id(node)] = self.current
+        for target in node.targets:
+            self._bind_target(target, _UNKNOWN_BINDING)
 
     def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
         self.node_scopes[id(node)] = self.current
         self.visit(node.iter)
-        self.visit(node.target)
-        for name in _binding_target_names(node.target):
-            self.current.bind(name, _UNKNOWN_BINDING)
+        self._bind_target(node.target, _UNKNOWN_BINDING)
         for statement in (*node.body, *node.orelse):
             self.visit(statement)
 
@@ -354,9 +466,7 @@ class _ScopeBuilder(ast.NodeVisitor):
         for item in node.items:
             self.visit(item.context_expr)
             if item.optional_vars is not None:
-                self.visit(item.optional_vars)
-                for name in _binding_target_names(item.optional_vars):
-                    self.current.bind(name, _UNKNOWN_BINDING)
+                self._bind_target(item.optional_vars, _UNKNOWN_BINDING)
         for statement in node.body:
             self.visit(statement)
 
@@ -367,30 +477,25 @@ class _ScopeBuilder(ast.NodeVisitor):
         if node.type is not None:
             self.visit(node.type)
         if node.name is not None:
-            self.current.bind(node.name, _UNKNOWN_BINDING)
+            self._bind_name(node.name, _UNKNOWN_BINDING)
         for statement in node.body:
             self.visit(statement)
 
     def visit_Global(self, node: ast.Global) -> None:
         self.node_scopes[id(node)] = self.current
-        for name in node.names:
-            self.current.bind(name, _UNKNOWN_BINDING)
-            self.module.bind(name, _UNKNOWN_BINDING)
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         self.node_scopes[id(node)] = self.current
-        for name in node.names:
-            self.current.bind(name, _UNKNOWN_BINDING)
-            parent = self.current.parent
-            while parent is not None and parent.kind == "class":
-                parent = parent.parent
-            if parent is not None:
-                parent.bind(name, _UNKNOWN_BINDING)
 
 
 def _outer_scope(scope: _LexicalScope) -> _LexicalScope | None:
     parent = scope.parent
-    if scope.kind in {"function", "lambda", "comprehension"}:
+    if scope.kind in {
+        "function",
+        "lambda",
+        "comprehension",
+        "type_parameters",
+    }:
         while parent is not None and parent.kind == "class":
             parent = parent.parent
     return parent
@@ -404,6 +509,20 @@ def _resolve_binding(
 ) -> _KnownBinding:
     key = (id(scope), name)
     if key in seen:
+        return _UNKNOWN_BINDING
+    if name in scope.global_names and scope.kind != "module":
+        module = scope
+        while module.parent is not None:
+            module = module.parent
+        return _resolve_binding(name, module, seen=seen | {key})
+    if name in scope.nonlocal_names:
+        parent = _outer_scope(scope)
+        return (
+            _UNKNOWN_BINDING
+            if parent is None
+            else _resolve_binding(name, parent, seen=seen | {key})
+        )
+    if scope.has_star_import:
         return _UNKNOWN_BINDING
     events = scope.events.get(name, ())
     if len(events) > 1:
@@ -733,28 +852,98 @@ class _ExecutableScope:
     name: str
     node: ast.AST
     positional_parameters: tuple[str, ...]
+    positional_count: int
+    defaults: tuple[tuple[str, ast.AST], ...]
+    method_kind: str
+    class_owner: str | None
+
+    def default_for(self, parameter: str) -> ast.AST | None:
+        return dict(self.defaults).get(parameter)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedCallable:
+    name: str
+    bound_offset: int
 
 
 def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
-    scopes = [_ExecutableScope("<module>", tree, ())]
+    scopes = [_ExecutableScope("<module>", tree, (), 0, (), "module", None)]
 
-    def visit(node: ast.AST, owners: tuple[str, ...]) -> None:
+    def function_scope(
+        child: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        name: str,
+        class_owner: str | None,
+    ) -> _ExecutableScope:
+        positional = (*child.args.posonlyargs, *child.args.args)
+        keyword_only = child.args.kwonlyargs
+        parameters = tuple(
+            argument.arg for argument in (*positional, *keyword_only)
+        )
+        positional_default_args = (
+            positional[-len(child.args.defaults) :]
+            if child.args.defaults
+            else ()
+        )
+        defaults = {
+            argument.arg: value
+            for argument, value in zip(
+                positional_default_args,
+                child.args.defaults,
+                strict=True,
+            )
+        }
+        defaults.update(
+            {
+                argument.arg: value
+                for argument, value in zip(
+                    keyword_only,
+                    child.args.kw_defaults,
+                    strict=True,
+                )
+                if value is not None
+            }
+        )
+        decorators = {
+            decorator.id
+            for decorator in getattr(child, "decorator_list", ())
+            if isinstance(decorator, ast.Name)
+        }
+        method_kind = "function"
+        if class_owner is not None:
+            if "staticmethod" in decorators:
+                method_kind = "static"
+            elif "classmethod" in decorators:
+                method_kind = "class"
+            else:
+                method_kind = "instance"
+        return _ExecutableScope(
+            name,
+            child,
+            parameters,
+            len(positional),
+            tuple(defaults.items()),
+            method_kind,
+            class_owner,
+        )
+
+    def visit(
+        node: ast.AST,
+        owners: tuple[str, ...],
+        class_owner: str | None = None,
+    ) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ClassDef):
                 name = ".".join((*owners, child.name))
-                scopes.append(_ExecutableScope(f"{name}.<body>", child, ()))
-                visit(child, (*owners, child.name))
-            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                name = ".".join((*owners, child.name))
-                parameters = tuple(
-                    argument.arg
-                    for argument in (
-                        *child.args.posonlyargs,
-                        *child.args.args,
-                        *child.args.kwonlyargs,
+                scopes.append(
+                    _ExecutableScope(
+                        f"{name}.<body>", child, (), 0, (), "class", name
                     )
                 )
-                scopes.append(_ExecutableScope(name, child, parameters))
+                visit(child, (*owners, child.name), name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = ".".join((*owners, child.name))
+                scopes.append(function_scope(child, name, class_owner))
                 visit(child, (*owners, child.name))
             elif isinstance(child, ast.Lambda):
                 prefix = ".".join(owners)
@@ -763,18 +952,10 @@ def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
                     if prefix
                     else f"<lambda>@{child.lineno}"
                 )
-                parameters = tuple(
-                    argument.arg
-                    for argument in (
-                        *child.args.posonlyargs,
-                        *child.args.args,
-                        *child.args.kwonlyargs,
-                    )
-                )
-                scopes.append(_ExecutableScope(name, child, parameters))
+                scopes.append(function_scope(child, name, None))
                 visit(child, (*owners, f"<lambda>@{child.lineno}"))
             else:
-                visit(child, owners)
+                visit(child, owners, class_owner)
 
     visit(tree, ())
     unique = {id(scope.node): scope for scope in scopes}
@@ -913,9 +1094,79 @@ def _scope_assignment_values(
             continue
         targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
         for target in targets:
-            if isinstance(target, ast.Name):
-                values.setdefault(target.id, []).append(value)
+            path = _expression_alias_key(target)
+            if path is not None:
+                values.setdefault(path, []).append(value)
+                continue
+            for name in _binding_target_names(target):
+                values.setdefault(name, []).append(value)
     return {name: tuple(items) for name, items in values.items()}
+
+
+def _expression_path(expression: ast.AST) -> str | None:
+    if isinstance(expression, ast.Name):
+        return expression.id
+    if isinstance(expression, ast.Attribute):
+        owner = _expression_path(expression.value)
+        return None if owner is None else f"{owner}.{expression.attr}"
+    if isinstance(expression, ast.Subscript):
+        owner = _expression_path(expression.value)
+        key = expression.slice
+        if (
+            owner is None
+            or not isinstance(key, ast.Constant)
+            or type(key.value) not in {str, int}
+        ):
+            return None
+        return f"{owner}[{key.value!r}]"
+    return None
+
+
+_DYNAMIC_SUBSCRIPT = "[<dynamic>]"
+
+
+def _expression_alias_key(expression: ast.AST) -> str | None:
+    if isinstance(expression, ast.Name):
+        return expression.id
+    if isinstance(expression, ast.Attribute):
+        owner = _expression_alias_key(expression.value)
+        return None if owner is None else f"{owner}.{expression.attr}"
+    if isinstance(expression, ast.Subscript):
+        owner = _expression_alias_key(expression.value)
+        if owner is None:
+            return None
+        key = expression.slice
+        if isinstance(key, ast.Constant) and type(key.value) in {str, int}:
+            return f"{owner}[{key.value!r}]"
+        return f"{owner}{_DYNAMIC_SUBSCRIPT}"
+    return None
+
+
+def _alias_keys_overlap(left: str, right: str) -> bool:
+    def pattern(key: str) -> re.Pattern[str]:
+        rendered = re.escape(key).replace(
+            re.escape(_DYNAMIC_SUBSCRIPT), r"\[[^\]]+\]"
+        )
+        return re.compile(rf"^{rendered}$")
+
+    return pattern(left).fullmatch(right) is not None or pattern(
+        right
+    ).fullmatch(left) is not None
+
+
+def _assigned_expression_values(
+    assignments: dict[str, tuple[ast.AST, ...]],
+    expression: ast.AST,
+) -> tuple[ast.AST, ...]:
+    key = _expression_alias_key(expression)
+    if key is None:
+        return ()
+    return tuple(
+        value
+        for assigned_key, values in assignments.items()
+        if _alias_keys_overlap(key, assigned_key)
+        for value in values
+    )
 
 
 def _visible_scope_names(
@@ -938,17 +1189,18 @@ def _call_argument(
     call: ast.Call,
     callee: _ExecutableScope,
     parameter_index: int,
+    bound_offset: int,
 ) -> ast.AST | None:
-    bound_offset = int(
-        isinstance(call.func, ast.Attribute)
-        and bool(callee.positional_parameters)
-        and callee.positional_parameters[0] in {"self", "cls"}
-    )
+    if parameter_index < bound_offset:
+        return None
     positional_index = parameter_index - bound_offset
-    if 0 <= positional_index < len(call.args):
+    if (
+        parameter_index < callee.positional_count
+        and 0 <= positional_index < len(call.args)
+    ):
         return call.args[positional_index]
     parameter_name = callee.positional_parameters[parameter_index]
-    return next(
+    keyword = next(
         (
             keyword.value
             for keyword in call.keywords
@@ -956,10 +1208,13 @@ def _call_argument(
         ),
         None,
     )
+    return keyword or callee.default_for(parameter_name)
 
 
 def _presence_writer_details(
     files: Iterable[Path],
+    *,
+    writes_sql: Callable[[str], bool] = _writes_presence_decision,
 ) -> dict[str, frozenset[str]]:
     details: dict[str, frozenset[str]] = {}
     for path in files:
@@ -982,6 +1237,15 @@ def _presence_writer_details(
             assignments_by_name[scope.name] = _scope_assignment_values(
                 nodes_by_name[scope.name]
             )
+        sql_call_ids_by_name = {
+            scope.name: {
+                id(call)
+                for call, _expression in _sql_expression_calls(
+                    nodes_by_name[scope.name]
+                )
+            }
+            for scope in scopes
+        }
 
         callables_by_short: dict[str, set[str]] = {}
         lambda_by_node = {}
@@ -994,30 +1258,74 @@ def _presence_writer_details(
             if isinstance(scope.node, ast.Lambda):
                 lambda_by_node[id(scope.node)] = scope.name
 
+        def is_class_reference(
+            expression: ast.AST,
+            class_owner: str | None,
+            caller_name: str,
+            seen: frozenset[tuple[str, str]] = frozenset(),
+        ) -> bool:
+            if class_owner is None:
+                return False
+            path = _expression_alias_key(expression)
+            class_names = {class_owner, class_owner.rsplit(".", 1)[-1]}
+            if path in class_names:
+                return True
+            if path is None:
+                return False
+            key = (caller_name, path)
+            if key in seen:
+                return False
+            return any(
+                is_class_reference(
+                    value,
+                    class_owner,
+                    caller_name,
+                    seen | {key},
+                )
+                for visible in _visible_scope_names(
+                    caller_name, known_scopes
+                )
+                for value in _assigned_expression_values(
+                    assignments_by_name[visible], expression
+                )
+            )
+
         def callable_targets(
             expression: ast.AST,
             caller_name: str,
             seen: frozenset[tuple[str, str]] = frozenset(),
-        ) -> frozenset[str]:
+        ) -> frozenset[_ResolvedCallable]:
             if isinstance(expression, ast.Lambda):
                 target = lambda_by_node.get(id(expression))
-                return frozenset() if target is None else frozenset({target})
-            if isinstance(expression, ast.Name):
-                key = (caller_name, expression.id)
+                return (
+                    frozenset()
+                    if target is None
+                    else frozenset({_ResolvedCallable(target, 0)})
+                )
+            path = _expression_alias_key(expression)
+            if path is not None:
+                key = (caller_name, path)
                 if key in seen:
                     return frozenset()
                 resolved = set()
                 for visible in _visible_scope_names(caller_name, known_scopes):
-                    for value in assignments_by_name[visible].get(
-                        expression.id, ()
+                    for value in _assigned_expression_values(
+                        assignments_by_name[visible], expression
                     ):
                         resolved.update(
                             callable_targets(
                                 value, caller_name, seen | {key}
                             )
                         )
-                resolved.update(callables_by_short.get(expression.id, ()))
-                return frozenset(resolved)
+                if isinstance(expression, ast.Name):
+                    resolved.update(
+                        _ResolvedCallable(target, 0)
+                        for target in callables_by_short.get(
+                            expression.id, ()
+                        )
+                    )
+                if resolved:
+                    return frozenset(resolved)
             if isinstance(expression, ast.Attribute):
                 if (
                     isinstance(expression.value, ast.Name)
@@ -1026,9 +1334,24 @@ def _presence_writer_details(
                     in {"execute", "executemany", "executescript"}
                 ):
                     return frozenset()
-                return frozenset(
-                    callables_by_short.get(expression.attr, ())
-                )
+                resolved = set()
+                for target in callables_by_short.get(expression.attr, ()):
+                    callee = scopes_by_name[target]
+                    offset = 0
+                    if callee.method_kind == "class":
+                        offset = 1
+                    elif callee.method_kind == "instance":
+                        offset = (
+                            0
+                            if is_class_reference(
+                                expression.value,
+                                callee.class_owner,
+                                caller_name,
+                            )
+                            else 1
+                        )
+                    resolved.add(_ResolvedCallable(target, offset))
+                return frozenset(resolved)
             return frozenset()
 
         def parameter_indexes(
@@ -1045,8 +1368,8 @@ def _presence_writer_details(
             if expression.id in seen:
                 return frozenset()
             indexes = set()
-            for value in assignments_by_name[scope.name].get(
-                expression.id, ()
+            for value in _assigned_expression_values(
+                assignments_by_name[scope.name], expression
             ):
                 indexes.update(
                     parameter_indexes(
@@ -1054,6 +1377,50 @@ def _presence_writer_details(
                     )
                 )
             return frozenset(indexes)
+
+        def argument_states(
+            expression: ast.AST,
+            scope_name: str,
+            seen: frozenset[str] = frozenset(),
+        ) -> frozenset[str]:
+            rendered = _static_string(
+                expression, constants_by_name[scope_name]
+            )
+            if rendered in _PRESENCE_STATES:
+                return frozenset({rendered})
+            if isinstance(expression, ast.Attribute):
+                state = _PRESENCE_STATE_BY_ATTRIBUTE.get(expression.attr)
+                return frozenset() if state is None else frozenset({state})
+            path = _expression_alias_key(expression)
+            if path is not None and path not in seen:
+                states = set()
+                for visible in _visible_scope_names(
+                    scope_name, known_scopes
+                ):
+                    for value in _assigned_expression_values(
+                        assignments_by_name[visible], expression
+                    ):
+                        states.update(
+                            argument_states(
+                                value, scope_name, seen | {path}
+                            )
+                        )
+                if states:
+                    return frozenset(states)
+            children: tuple[ast.AST, ...] = ()
+            if isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
+                children = tuple(expression.elts)
+            elif isinstance(expression, ast.Dict):
+                children = tuple(
+                    item
+                    for item in (*expression.keys, *expression.values)
+                    if item is not None
+                )
+            return frozenset(
+                state
+                for child in children
+                for state in argument_states(child, scope_name, seen)
+            )
 
         sink_parameters: dict[str, set[int]] = {
             scope.name: set() for scope in scopes
@@ -1066,28 +1433,57 @@ def _presence_writer_details(
                 rendered = _static_string(
                     expression, constants_by_name[scope.name]
                 )
-                if rendered is not None and _writes_presence_decision(rendered):
+                if rendered is not None and writes_sql(rendered):
                     writer_names.add(scope.name)
                 sink_parameters[scope.name].update(
                     parameter_indexes(expression, scope)
                 )
 
-        edges: list[tuple[str, str, ast.Call]] = []
+        edges: list[tuple[str, _ResolvedCallable, ast.Call]] = []
         for scope in scopes:
             for node in nodes_by_name[scope.name]:
                 if not isinstance(node, ast.Call):
                     continue
-                for target in callable_targets(node.func, scope.name):
+                resolved_targets = callable_targets(node.func, scope.name)
+                for target in resolved_targets:
                     edges.append((scope.name, target, node))
+                arguments = (
+                    *node.args,
+                    *(keyword.value for keyword in node.keywords),
+                )
+                rendered_arguments = tuple(
+                    _static_string(
+                        argument, constants_by_name[scope.name]
+                    )
+                    for argument in arguments
+                )
+                if any(
+                    rendered is not None
+                    and writes_sql(rendered)
+                    for rendered in rendered_arguments
+                ):
+                    writer_names.add(scope.name)
+                elif (
+                    not resolved_targets
+                    and id(node) not in sql_call_ids_by_name[scope.name]
+                    and any(
+                        argument_states(argument, scope.name)
+                        for argument in arguments
+                    )
+                ):
+                    writer_names.add(scope.name)
 
         changed = True
         while changed:
             changed = False
-            for caller_name, callee_name, call in edges:
+            for caller_name, resolved, call in edges:
+                callee_name = resolved.name
                 caller = scopes_by_name[caller_name]
                 callee = scopes_by_name[callee_name]
                 for index in tuple(sink_parameters[callee_name]):
-                    expression = _call_argument(call, callee, index)
+                    expression = _call_argument(
+                        call, callee, index, resolved.bound_offset
+                    )
                     if expression is None:
                         continue
                     propagated = parameter_indexes(expression, caller)
@@ -1095,30 +1491,50 @@ def _presence_writer_details(
                         sink_parameters[caller_name].update(propagated)
                         changed = True
 
+        for scope in scopes:
+            for index in sink_parameters[scope.name]:
+                parameter = scope.positional_parameters[index]
+                default = scope.default_for(parameter)
+                rendered = (
+                    None
+                    if default is None
+                    else _static_string(
+                        default, constants_by_name[scope.name]
+                    )
+                )
+                if rendered is not None and writes_sql(rendered):
+                    writer_names.add(scope.name)
+
         active_edges: set[tuple[str, str]] = set()
-        for caller_name, callee_name, call in edges:
+        for caller_name, resolved, call in edges:
+            callee_name = resolved.name
             callee = scopes_by_name[callee_name]
             for index in sink_parameters[callee_name]:
-                expression = _call_argument(call, callee, index)
+                expression = _call_argument(
+                    call, callee, index, resolved.bound_offset
+                )
                 if expression is None:
                     continue
                 rendered = _static_string(
                     expression, constants_by_name[caller_name]
                 )
-                if rendered is not None and _writes_presence_decision(rendered):
+                if rendered is not None and writes_sql(rendered):
                     active_edges.add((caller_name, callee_name))
                     writer_names.update({caller_name, callee_name})
 
         changed = True
         while changed:
             changed = False
-            for caller_name, callee_name, call in edges:
+            for caller_name, resolved, call in edges:
+                callee_name = resolved.name
                 if caller_name not in writer_names:
                     continue
                 caller = scopes_by_name[caller_name]
                 callee = scopes_by_name[callee_name]
                 for index in sink_parameters[callee_name]:
-                    expression = _call_argument(call, callee, index)
+                    expression = _call_argument(
+                        call, callee, index, resolved.bound_offset
+                    )
                     if expression is None:
                         continue
                     if not (
@@ -1144,7 +1560,10 @@ def _presence_writer_details(
         for caller_name, callee_name in active_edges:
             adjacency.setdefault(caller_name, set()).add(callee_name)
             adjacency.setdefault(callee_name, set()).add(caller_name)
-        relative = _relative(path)
+        try:
+            relative = _relative(path)
+        except ValueError:
+            relative = path.resolve().as_posix()
         for writer_name in writer_names:
             component = {writer_name}
             queued = [writer_name]
@@ -1207,37 +1626,42 @@ def review_writer_callers(
             for alias in node.names
             if alias.name == "add_review_and_decision"
         }
+        module_assignments = _scope_assignment_values(_scope_nodes(tree))
         for name, scope in _function_scopes(tree):
             nodes = _scope_nodes(scope)
-            aliases = set(imported_aliases)
-            for node in nodes:
-                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    continue
-                targets = (
-                    node.targets if isinstance(node, ast.Assign) else (node.target,)
-                )
-                value = node.value
+            local_assignments = _scope_assignment_values(nodes)
+
+            def is_writer(
+                expression: ast.AST,
+                seen: frozenset[str] = frozenset(),
+            ) -> bool:
                 if (
-                    isinstance(value, ast.Attribute)
-                    and value.attr == "add_review_and_decision"
+                    isinstance(expression, ast.Attribute)
+                    and expression.attr == "add_review_and_decision"
                 ):
-                    aliases.update(
-                        target.id
-                        for target in targets
-                        if isinstance(target, ast.Name)
+                    return True
+                if (
+                    isinstance(expression, ast.Name)
+                    and expression.id in imported_aliases
+                ):
+                    return True
+                path = _expression_alias_key(expression)
+                if path is None or path in seen:
+                    return False
+                return any(
+                    is_writer(value, seen | {path})
+                    for assignments in (
+                        local_assignments,
+                        module_assignments,
                     )
+                    for value in _assigned_expression_values(
+                        assignments, expression
+                    )
+                )
+
             calls_writer = any(
                 isinstance(node, ast.Call)
-                and (
-                    (
-                        isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "add_review_and_decision"
-                    )
-                    or (
-                        isinstance(node.func, ast.Name)
-                        and node.func.id in aliases
-                    )
-                )
+                and is_writer(node.func)
                 for node in nodes
             )
             if calls_writer:
@@ -1444,9 +1868,15 @@ def presence_expansion_writer_calls(
         path: _project_import_targets(path, tree, root)
         for path, tree in trees.items()
     }
-    module_constants = {
-        path: _string_constants(_scope_nodes(tree))
-        for path, tree in trees.items()
+    sql_writer_scopes = {
+        path: {
+            writer.rsplit(":", 1)[-1]
+            for writer in _presence_writer_details(
+                (path,),
+                writes_sql=lambda sql: _writes_any_table(sql, tables),
+            )
+        }
+        for path in trees
     }
     assignments = {
         (path, scope.name): _scope_assignment_values(_scope_nodes(scope.node))
@@ -1470,9 +1900,7 @@ def presence_expansion_writer_calls(
             continue
         visited.add(identity)
         nodes = _scope_nodes(scope.node)
-        direct_sql = _scope_writes_tables(
-            scope, module_constants[path], tables
-        )
+        direct_sql = scope.name in sql_writer_scopes[path]
         method_reference = any(
             isinstance(node, ast.Attribute)
             and _is_downstream_writer_method(node.attr, writer_methods)
@@ -1493,17 +1921,22 @@ def presence_expansion_writer_calls(
             expression: ast.AST,
             seen: frozenset[str] = frozenset(),
         ) -> tuple[tuple[Path, _ExecutableScope], ...]:
+            path_key = _expression_alias_key(expression)
+            if path_key is not None and path_key not in seen:
+                assigned_targets = []
+                for visible_scope in (scope.name, "<module>"):
+                    for value in _assigned_expression_values(
+                        assignments[(path, visible_scope)], expression
+                    ):
+                        assigned_targets.extend(
+                            call_targets(value, seen | {path_key})
+                        )
+                if assigned_targets:
+                    return tuple(dict.fromkeys(assigned_targets))
             if isinstance(expression, ast.Name):
                 if expression.id in seen:
                     return ()
                 targets = []
-                for visible_scope in (scope.name, "<module>"):
-                    for value in assignments[(path, visible_scope)].get(
-                        expression.id, ()
-                    ):
-                        targets.extend(
-                            call_targets(value, seen | {expression.id})
-                        )
                 if expression.id in local:
                     targets.append((path, local[expression.id]))
                 imported = imports_by_path[path].get(expression.id)
@@ -1515,18 +1948,37 @@ def presence_expansion_writer_calls(
                     if target_scope is not None:
                         targets.append((target_path.resolve(), target_scope))
                 return tuple(dict.fromkeys(targets))
-            if isinstance(expression, ast.Attribute) and isinstance(
-                expression.value, ast.Name
-            ):
-                imported = imports_by_path[path].get(expression.value.id)
-                if imported is None or imported[1] is not None:
-                    return ()
-                target_path = imported[0].resolve()
-                target_scope = scope_lookup.get(
-                    (target_path, expression.attr)
-                )
-                if target_scope is not None:
-                    return ((target_path, target_scope),)
+            if isinstance(expression, ast.Attribute):
+                targets = []
+                for target_path in module_paths(expression.value):
+                    target_scope = scope_lookup.get(
+                        (target_path, expression.attr)
+                    )
+                    if target_scope is not None:
+                        targets.append((target_path, target_scope))
+                return tuple(dict.fromkeys(targets))
+            return ()
+
+        def module_paths(
+            expression: ast.AST,
+            seen: frozenset[str] = frozenset(),
+        ) -> tuple[Path, ...]:
+            path_key = _expression_alias_key(expression)
+            if path_key is not None and path_key not in seen:
+                targets = []
+                for visible_scope in (scope.name, "<module>"):
+                    for value in _assigned_expression_values(
+                        assignments[(path, visible_scope)], expression
+                    ):
+                        targets.extend(
+                            module_paths(value, seen | {path_key})
+                        )
+                if targets:
+                    return tuple(dict.fromkeys(targets))
+            if isinstance(expression, ast.Name):
+                imported = imports_by_path[path].get(expression.id)
+                if imported is not None and imported[1] is None:
+                    return (imported[0].resolve(),)
             return ()
 
         for node in nodes:
@@ -1937,6 +2389,198 @@ def test_adapter_guard_keeps_unshadowed_type_checking_after_other_walrus(
 @pytest.mark.parametrize(
     "mutation",
     (
+        "type CHECK = int\n"
+        "if CHECK:\n"
+        "    import sqlite3\n",
+        "def runtime[CHECK]():\n"
+        "    if CHECK:\n"
+        "        import sqlite3\n",
+        "class Runtime[CHECK]:\n"
+        "    if CHECK:\n"
+        "        import sqlite3\n",
+    ),
+)
+def test_adapter_guard_models_python_314_type_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING as CHECK\n" f"{mutation}"
+    )
+    fake = Path("type-binding-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/type_binding.py"
+    )
+
+    assert runtime_import_violations((fake,)) == (
+        ("voice/type_binding.py", 4, "sqlite3"),
+    )
+
+
+def test_adapter_guard_does_not_leak_class_alias_into_generic_method(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(
+        "import typing\n"
+        "class Runtime:\n"
+        "    CHECK = typing.TYPE_CHECKING\n"
+        "    def run[T](self):\n"
+        "        if CHECK:\n"
+        "            import sqlite3\n"
+    )
+    fake = Path("generic-method-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/generic_method.py"
+    )
+
+    assert runtime_import_violations((fake,)) == (
+        ("voice/generic_method.py", 6, "sqlite3"),
+    )
+
+
+def test_adapter_guard_keeps_module_alias_in_generic_method(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING as CHECK\n"
+        "class Runtime:\n"
+        "    def run[T](self):\n"
+        "        if CHECK:\n"
+        "            import sqlite3\n"
+    )
+    fake = Path("generic-method-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/generic_control.py"
+    )
+
+    assert runtime_import_violations((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    "neighbor",
+    (
+        "type Neighbor = int\n",
+        "def runtime[Neighbor]():\n    return Neighbor\n",
+        "class Runtime[Neighbor]:\n    marker = Neighbor\n",
+        "loaded = [item for CHECK in values]\n",
+        "loaded = {CHECK: item for CHECK, item in values}\n",
+    ),
+)
+def test_adapter_guard_keeps_unshadowed_alias_after_neighboring_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    neighbor: str,
+) -> None:
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING as CHECK\n"
+        f"{neighbor}"
+        "if CHECK:\n"
+        "    import sqlite3\n"
+    )
+    fake = Path("type-binding-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/type_control.py"
+    )
+
+    assert runtime_import_violations((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        "CHECK: bool\n",
+        "CHECK += runtime_flag\n",
+        "for CHECK in values:\n    pass\n",
+        "with manager() as CHECK:\n    pass\n",
+        "try:\n    work()\nexcept RuntimeError as CHECK:\n    pass\n",
+        "del CHECK\n",
+    ),
+)
+def test_adapter_guard_inventories_neighboring_binding_statements(
+    monkeypatch: pytest.MonkeyPatch,
+    binding: str,
+) -> None:
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING as CHECK\n"
+        f"{binding}"
+        "if CHECK:\n"
+        "    import sqlite3\n"
+    )
+    fake = Path("binding-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/binding_mutation.py"
+    )
+
+    import_node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        and node.names[0].name == "sqlite3"
+    )
+    assert runtime_import_violations((fake,)) == (
+        ("voice/binding_mutation.py", import_node.lineno, "sqlite3"),
+    )
+
+
+def test_adapter_guard_fails_closed_after_star_import_ambiguity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING as CHECK\n"
+        "from runtime_flags import *\n"
+        "if CHECK:\n"
+        "    import sqlite3\n"
+    )
+    fake = Path("star-import-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/star_import.py"
+    )
+
+    assert runtime_import_violations((fake,)) == (
+        ("voice/star_import.py", 2, "runtime_flags.*"),
+        ("voice/star_import.py", 4, "sqlite3"),
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "def runtime():\n"
+        "    global CHECK\n"
+        "    if CHECK:\n"
+        "        import sqlite3\n",
+        "def outer():\n"
+        "    from typing import TYPE_CHECKING as CHECK\n"
+        "    def runtime():\n"
+        "        nonlocal CHECK\n"
+        "        if CHECK:\n"
+        "            import sqlite3\n",
+    ),
+)
+def test_adapter_guard_resolves_unmodified_global_and_nonlocal_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    declaration: str,
+) -> None:
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING as CHECK\n" f"{declaration}"
+    )
+    fake = Path("declaration-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "voice/declaration_control.py"
+    )
+
+    assert runtime_import_violations((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
         (
             "CONFIRMED = {'presence_confirmed', 'presence_rejected'}\n"
             "class ModelWriter:\n"
@@ -2168,6 +2812,182 @@ def test_raw_presence_writer_guard_traces_class_lambda_and_alias_helpers(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "writers"),
+    (
+        (
+            "def execute_sql(conn, statement="
+            "'INSERT INTO presence_decisions(candidate_id, state) '"
+            "'VALUES (?, ?)', state='presence_confirmed'):\n"
+            "    conn.execute(statement, (1, state))\n"
+            "def write(conn):\n"
+            "    execute_sql(conn)\n",
+            (
+                "workers/resolved_helper.py:execute_sql",
+                "workers/resolved_helper.py:write",
+            ),
+        ),
+        (
+            "class SqlHelpers:\n"
+            "    def execute_sql(self, conn, statement, state):\n"
+            "        conn.execute(statement, (1, state))\n"
+            "    def write(self, conn):\n"
+            "        sql = 'INSERT INTO presence_decisions '"
+            "              '(candidate_id, state) VALUES (?, ?)'\n"
+            "        state = 'presence_rejected'\n"
+            "        SqlHelpers.execute_sql(self, conn, sql, state)\n",
+            (
+                "workers/resolved_helper.py:SqlHelpers.execute_sql",
+                "workers/resolved_helper.py:SqlHelpers.write",
+            ),
+        ),
+        (
+            "def execute_sql(conn, statement, state):\n"
+            "    conn.execute(statement, (1, state))\n"
+            "class Holder:\n"
+            "    pass\n"
+            "holder = Holder()\n"
+            "holder.run = execute_sql\n"
+            "def write(conn):\n"
+            "    sql = 'INSERT INTO presence_decisions '"
+            "          '(candidate_id, state) VALUES (?, ?)'\n"
+            "    holder.run(conn, sql, 'presence_confirmed')\n",
+            (
+                "workers/resolved_helper.py:execute_sql",
+                "workers/resolved_helper.py:write",
+            ),
+        ),
+        (
+            "def execute_sql(conn, statement, state):\n"
+            "    conn.execute(statement, (1, state))\n"
+            "helpers = {}\n"
+            "helpers['run'] = execute_sql\n"
+            "def write(conn):\n"
+            "    sql = 'INSERT INTO presence_decisions '"
+            "          '(candidate_id, state) VALUES (?, ?)'\n"
+            "    helpers['run'](conn, sql, 'presence_confirmed')\n",
+            (
+                "workers/resolved_helper.py:execute_sql",
+                "workers/resolved_helper.py:write",
+            ),
+        ),
+        (
+            "def execute_sql(conn, statement, state):\n"
+            "    conn.execute(statement, (1, state))\n"
+            "helpers = {}\n"
+            "key = 'run'\n"
+            "helpers[key] = execute_sql\n"
+            "def write(conn):\n"
+            "    sql = 'INSERT INTO presence_decisions '"
+            "          '(candidate_id, state) VALUES (?, ?)'\n"
+            "    helpers[key](conn, sql, 'presence_confirmed')\n",
+            (
+                "workers/resolved_helper.py:execute_sql",
+                "workers/resolved_helper.py:write",
+            ),
+        ),
+        (
+            "def write(conn):\n"
+            "    sql = 'INSERT INTO presence_decisions '"
+            "          '(candidate_id, state) VALUES (?, ?)'\n"
+            "    state = 'presence_confirmed'\n"
+            "    unresolved(conn, sql, state)\n",
+            ("workers/resolved_helper.py:write",),
+        ),
+        (
+            "class SqlHelpers:\n"
+            "    def execute_sql(self, conn, statement, state):\n"
+            "        conn.execute(statement, (1, state))\n"
+            "    def write("
+            "self, conn, sql='INSERT INTO presence_decisions '"
+            "'(candidate_id, state) VALUES (?, ?)', "
+            "state='presence_rejected'):\n"
+            "        alias = SqlHelpers\n"
+            "        alias.execute_sql(self, conn, sql, state)\n",
+            (
+                "workers/resolved_helper.py:SqlHelpers.execute_sql",
+                "workers/resolved_helper.py:SqlHelpers.write",
+            ),
+        ),
+        (
+            "class StaticHelpers:\n"
+            "    @classmethod\n"
+            "    def execute_sql(cls, conn, statement, state):\n"
+            "        conn.execute(statement, (1, state))\n"
+            "    @staticmethod\n"
+            "    def write(conn):\n"
+            "        sql = 'INSERT INTO presence_decisions '"
+            "              '(candidate_id, state) VALUES (?, ?)'\n"
+            "        StaticHelpers.execute_sql("
+            "conn, sql, 'presence_confirmed')\n",
+            (
+                "workers/resolved_helper.py:StaticHelpers.execute_sql",
+                "workers/resolved_helper.py:StaticHelpers.write",
+            ),
+        ),
+        (
+            "def write(conn, statement):\n"
+            "    state = 'presence_confirmed'\n"
+            "    unresolved(conn, statement, state)\n",
+            ("workers/resolved_helper.py:write",),
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_resolves_complete_helper_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    writers: tuple[str, ...],
+) -> None:
+    tree = ast.parse(mutation)
+    fake = Path("resolved-helper-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/resolved_helper.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == writers
+    assert _presence_writer_details((fake,)) == {
+        writer: frozenset(
+            {"presence_rejected"}
+            if "SqlHelpers" in writer
+            else {"presence_confirmed"}
+        )
+        for writer in writers
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "def execute_sql(conn, statement='SELECT 1'):\n"
+        "    conn.execute(statement)\n"
+        "def inspect(conn):\n"
+        "    execute_sql(conn)\n",
+        "class SqlHelpers:\n"
+        "    @staticmethod\n"
+        "    def execute_sql(conn, statement):\n"
+        "        conn.execute(statement)\n"
+        "    @classmethod\n"
+        "    def inspect(cls, conn):\n"
+        "        cls.execute_sql(conn, 'SELECT 1')\n",
+        "def inspect(conn):\n"
+        "    unresolved(conn, 'SELECT 1', 'not-a-presence-state')\n",
+    ),
+)
+def test_raw_presence_writer_guard_ignores_nonwriter_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    tree = ast.parse(mutation)
+    fake = Path("resolved-helper-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/helper_control.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
     ("relative", "owner", "state"),
     (
         (
@@ -2274,6 +3094,39 @@ def test_review_writer_caller_guard_detects_aliased_model_call(
 @pytest.mark.parametrize(
     "mutation",
     (
+        "review_write = repository.add_review_and_decision\n"
+        "def save(command):\n"
+        "    return review_write(command)\n",
+        "aliases = {}\n"
+        "aliases['review'] = repository.add_review_and_decision\n"
+        "def save(command):\n"
+        "    return aliases['review'](command)\n",
+        "aliases = {}\n"
+        "key = 'review'\n"
+        "aliases[key] = repository.add_review_and_decision\n"
+        "def save(command):\n"
+        "    return aliases[key](command)\n",
+    ),
+)
+def test_review_writer_caller_guard_follows_module_container_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    tree = ast.parse(mutation)
+    fake = Path("review-alias-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_alias.py"
+    )
+
+    assert review_writer_callers((fake,)) == (
+        "workers/review_alias.py:save",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
         (
             "def add_transcript(conn):\n"
             "    table = 'transcript_segments'\n"
@@ -2347,6 +3200,61 @@ def test_presence_expansion_guard_flags_writer_method_alias_before_call(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "writers"),
+    (
+        (
+            "def execute_sql(conn, statement):\n"
+            "    conn.execute(statement)\n"
+            "def run(conn):\n"
+            "    sql = 'INSERT INTO analysis_runs(id) VALUES (1)'\n"
+            "    execute_sql(conn, sql)\n",
+            (
+                "workers/downstream_helper.py:execute_sql",
+                "workers/downstream_helper.py:run",
+            ),
+        ),
+        (
+            "def run(conn):\n"
+            "    sql = 'INSERT INTO analysis_runs(id) VALUES (1)'\n"
+            "    unresolved(conn, sql)\n",
+            ("workers/downstream_helper.py:run",),
+        ),
+    ),
+)
+def test_presence_expansion_guard_traces_generic_or_unresolved_sql_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    writers: tuple[str, ...],
+) -> None:
+    tree = ast.parse(mutation)
+    fake = Path("downstream-helper-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/downstream_helper.py"
+    )
+
+    assert presence_expansion_writer_calls((fake,)) == writers
+
+
+def test_presence_expansion_guard_ignores_nonwriter_generic_sql_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(
+        "def execute_sql(conn, statement='SELECT 1'):\n"
+        "    conn.execute(statement)\n"
+        "def inspect(conn):\n"
+        "    execute_sql(conn)\n"
+    )
+    fake = Path("downstream-helper-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/downstream_control.py"
+    )
+
+    assert presence_expansion_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
     "method",
     (
         "get_analysis_run",
@@ -2389,6 +3297,27 @@ def test_presence_expansion_guard_ignores_readers_and_unrelated_aliases(
             "def run(repository):\n"
             "    escape = helper.run_analysis\n"
             "    escape(repository)\n"
+        ),
+        (
+            "from ..helpers import analysis_escape\n"
+            "helper = analysis_escape\n"
+            "def run(repository):\n"
+            "    helper.run_analysis(repository)\n"
+        ),
+        (
+            "from ..helpers import analysis_escape\n"
+            "helpers = {}\n"
+            "helpers['analysis'] = analysis_escape\n"
+            "def run(repository):\n"
+            "    helpers['analysis'].run_analysis(repository)\n"
+        ),
+        (
+            "from ..helpers import analysis_escape\n"
+            "helpers = {}\n"
+            "key = 'analysis'\n"
+            "helpers[key] = analysis_escape\n"
+            "def run(repository):\n"
+            "    helpers[key].run_analysis(repository)\n"
         ),
     ),
 )
