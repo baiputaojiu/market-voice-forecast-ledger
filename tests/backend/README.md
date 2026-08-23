@@ -64,6 +64,43 @@ Remove-Item Env:MVFL_YOUTUBE_SMOKE_VIDEO_ID
 明示承認のない実行、音声・字幕・文字起こし・本人声確認・分析、live HTTP
 server/socket、UIはこのtestの対象外です。
 
+## 本人声確認の real runtime smoke（未実行・明示 opt-in）
+
+`test_presence_real_smoke.py` は通常suiteでは必ず
+`real presence voice smoke not requested` として skip されます。収集時とskip時には
+private runtime、model、native executable、network、YouTube、credential、CLI、DB、audioを
+初期化または実行しません。
+
+Task 11のStep 3からStep 7は、ユーザーが実行内容を理解したうえで明示承認するまで、
+実施も準備もしてはいけません。このREADMEはその承認を記録するものではなく、現時点で
+実行済みであるとも主張しません。
+
+承認後だけ、private data rootの外へruntime、model、cache、audio、DB、logを置かず、
+Step 3でrepository Pythonを使って`Settings.voice_runtime_dir`のisolated runtimeを作成し、
+current project wheelを`--no-deps`でinstallしてから、private wheel directoryを使う
+`--no-index --find-links ... --require-hashes`でpinned sherpa wheelをinstallします。yt-dlp、
+Deno、FFmpeg、candidate modelとruntime lockはprivate rootだけへ配置し、必要なSHA-256と
+CPU providerを検証してruntime lockを完成させてください。lock完成前にsmokeを実行しては
+いけません。
+
+runtime attestationだけを実行する正確なopt-in手順は次です。値はprocess環境だけに設定し、
+repository file、DB、logへ保存しません。
+
+```powershell
+$env:MVFL_REAL_VOICE_SMOKE_DATA_DIR='C:\absolute\private\MarketVoiceForecastLedger'
+$env:MVFL_RUN_REAL_VOICE_SMOKE='1'
+python -m pytest tests/backend/integration/test_presence_real_smoke.py -q -rs
+Remove-Item Env:MVFL_RUN_REAL_VOICE_SMOKE
+Remove-Item Env:MVFL_REAL_VOICE_SMOKE_DATA_DIR
+```
+
+このsmokeはprivate runtime lockと固定version probeだけをattestし、private path/hash、
+provider本文、audio、embeddingを表示しません。Step 4以降（公開clip調査、ユーザーによる
+試聴と承認、reference approve、二model calibration、20件pilot、review、cleanup/audit）は
+別途の明示ユーザー承認後にのみ、Task 11の順序どおりに行います。承認前後を問わず、
+runtime lock、model、audio、database、calibration score/report、operator noteをstageまたは
+commitしてはいけません。
+
 ## ローカル成果物の境界
 
 実際の全文文字起こし、音声、埋め込み、SQLiteデータベース、runtime log、
