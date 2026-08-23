@@ -718,67 +718,88 @@ git commit -m "feat: add presence verification CLI"
 ### Task 10: Architecture Guards and Complete Synthetic E2E
 
 **Files:**
-- Create: `tests/backend/integration/test_presence_architecture.py`
-- Create: `tests/backend/e2e/test_presence_verification_flow.py`
-- Modify: `tests/backend/voice_fakes.py`
+- Modify: `tests/backend/integration/test_presence_architecture.py`
+- Preserve byte-for-byte: `tests/backend/e2e/test_presence_verification_flow.py`
+- Modify: `docs/superpowers/specs/2026-08-22-presence-verification-design.md`
+- Modify: `docs/superpowers/plans/2026-08-22-presence-verification.md`
 
 **Interfaces:**
 - Consumes: all production interfaces from Tasks 1–9.
-- Produces: executable final-schema/AST guards and exact four-person × five-candidate acceptance fixture.
+- Produces: finite convention lint plus the existing exact four-person ×
+  five-candidate acceptance fixture.
 
-- [ ] **Step 1: Write architecture mutation controls**
-
-```python
-def test_adapter_cannot_import_database_network_credentials_or_analysis() -> None:
-    violations = runtime_import_violations(VOICE_ADAPTER_FILES)
-    assert violations == ()
-
-
-def test_only_review_service_can_write_confirmed_or_rejected_presence() -> None:
-    assert presence_decision_writer_calls() == (
-        "repositories/voice_verification.py:VoiceVerificationRepository.add_review_and_decision",
-    )
-```
-
-Mutation controls must prove detection of function-local and relative imports, aliased imports, indirect confirmed/rejected literals, adapter network/subprocess expansion, and new transcript/speaker/analysis writers.
-
-- [ ] **Step 2: Write the exact synthetic E2E inventory**
-
-Build four active persons with five deterministic candidates each, fake approved reference sets, separable calibration, 20 fake adapter responses spanning all three proposals, crash one job and resume it, then apply confirm, reject, and hold reviews. Assert:
+- [ ] **Step 1: Bound the architecture lint with a genuine RED**
 
 ```python
-assert table_count(db, "voice_verification_manifests") == 20
-assert table_count(db, "voice_verification_runs") == 20
-assert model_only_presence_changes(db) == 0
-assert confirmed_or_rejected_changes(db) == confirm_review_count + reject_review_count
-assert hold_pointer_changes(db) == 0
-assert remaining_audio_artifacts(db) == 0
-assert table_count(db, "transcript_segments") == 0
-assert table_count(db, "speaker_assignments") == 0
-assert table_count(db, "analysis_runs") == 0
+def test_finite_guard_detects_direct_protected_sql_mutation() -> None:
+    assert direct_sql_write_violations((mutation,)) == expected_violation
+
+
+def test_architecture_lint_remains_finite() -> None:
+    assert forbidden_interpreter_types.isdisjoint(defined_classes)
+    assert architecture_file_line_count <= 600
 ```
 
-- [ ] **Step 3: Run E2E/architecture RED against deliberate mutations**
+Capture RED because the finite scanner API is absent and the generated
+point-sensitive binder/call resolver is still present. The lint must not model
+arbitrary Python semantics.
 
-Run: `python -m pytest tests/backend/integration/test_presence_architecture.py tests/backend/e2e/test_presence_verification_flow.py -q`
+- [ ] **Step 2: Replace the semantic interpreter with finite rules**
 
-Expected: mutation fixtures fail when a model writes a decision, adapter imports DB, a 21st job appears, or a hidden audio file remains; unmutated fixture passes.
+Keep only these convention checks:
 
-- [ ] **Step 4: Complete the guards and fixture helpers**
+- obvious direct protected-table SQL outside canonical repository/migration
+  ownership
+- direct calls to the canonical review writer outside the approved service
+- writer aliases and writer dispatch through `getattr`, `setattr`, or
+  `functools.partial` in protected modules
+- any `eval` or `exec` in protected modules
+- the existing simple adapter direct-import allowlist and exact migrated voice
+  schema
 
-Use real migrations, real repositories/services/job transitions/review transaction, and only fake external media/model boundaries. Inventory all jobs, units, decisions, artifacts, transcripts, assignments, and analysis rows rather than querying only expected IDs.
+Delete the point-sensitive dataflow/call binder, MRO/descriptor/property/
+callable/partial/container/branch interpreter, and its adversarial mutation
+matrix. Keep only one or two representative mutations per finite rule.
 
-- [ ] **Step 5: Run the full focused acceptance set**
+- [ ] **Step 3: Preserve the exact synthetic E2E inventory**
 
-Run: `python -m pytest tests/backend/unit/test_voice_calibration.py tests/backend/unit/test_voice_protocol.py tests/backend/unit/test_voice_runtime.py tests/backend/unit/test_voice_media.py tests/backend/integration/test_voice_reference_enrollment.py tests/backend/integration/test_presence_pilot.py tests/backend/integration/test_voice_verification_jobs.py tests/backend/integration/test_presence_reviews.py tests/backend/integration/test_presence_cli.py tests/backend/integration/test_presence_architecture.py tests/backend/e2e/test_presence_verification_flow.py -q`
+`tests/backend/e2e/test_presence_verification_flow.py` remains byte-unchanged.
+It continues to use real migrations, repositories, services, job transitions,
+review transaction, canonical rereads, and synthetic external boundaries. Its
+full inventory remains the executable authority for 20 manifests/runs, human-
+authorized decisions, unchanged hold pointers, zero retained audio, and zero
+transcript/speaker/analysis expansion.
 
-Expected: PASS with no skip in the synthetic set.
+- [ ] **Step 4: Run architecture and E2E GREEN**
+
+Run:
+
+```powershell
+python -m pytest `
+  tests/backend/integration/test_presence_architecture.py `
+  tests/backend/e2e/test_presence_verification_flow.py -q
+```
+
+Expected: finite mutation fixtures and the unchanged exhaustive E2E pass.
+
+- [ ] **Step 5: Run the full focused and repository acceptance set**
+
+Run the Task 1–10 focused set, related foundation/privacy regressions, a fresh
+full backend suite with at least 1500 seconds allowance, `compileall`, work-state
+`All`, state-doc, WorkingTree/Staged public-safety, and diff checks.
+
+Completion requires all finite lint rules, representative mutations, SQLite
+schema/integration enforcement, the unchanged synthetic E2E, and the full
+backend regression to be green. Semantically equivalent deliberate-evasion
+encodings are outside the approved threat model and are not blockers.
 
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add tests/backend/voice_fakes.py tests/backend/integration/test_presence_architecture.py tests/backend/e2e/test_presence_verification_flow.py
-git commit -m "test: verify synthetic presence workflow"
+git add tests/backend/integration/test_presence_architecture.py `
+  docs/superpowers/plans/2026-08-22-presence-verification.md `
+  docs/superpowers/specs/2026-08-22-presence-verification-design.md
+git commit -m "test: bound presence architecture rules"
 ```
 
 ### Task 11: Opt-in Real Runtime, Reference Research, and Pilot Acceptance

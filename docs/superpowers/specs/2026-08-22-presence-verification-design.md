@@ -3,7 +3,8 @@
 ## Status
 
 - Date: 2026-08-22 JST
-- State: user-approved design, implementation not started
+- State: user-approved design; Tasks 1–10 implemented, with the Task 10
+  architecture lint bounded by the finite threat model below
 - Depends on: YouTube collection model and M2 core backend on `main`
 
 ## Purpose
@@ -264,6 +265,33 @@ public CLI/APIへ返すerrorは固定allowlist codeと一般化したmessageだ�
 - integration testsでmigration、append-only guards、same-owner pointers、job recovery、transaction rollback、cleanup、private-output boundaryを検証する。
 - mutation-sensitive testsでmodel-only decision、stale review、foreign candidate、corrupt feature/hash、non-finite score、OR REPLACE、partial output adoptionを検出する。
 - E2Eで4 synthetic persons×5 candidatesの20-run flowを作り、model proposal 20件とhuman reviewだけがdecisionを更新することを検証する。
+
+### Architecture lint threat model
+
+Architecture lintはtrusted contributorの通常の実装ミスを検出する有限のconvention
+checkとする。malicious developerや、property、descriptor、callable object、複雑な
+alias、dynamic dispatch、任意の`match`/`try` dataflowでwriterを意図的に隠す実装は
+threat model外であり、lintはPython実行意味論の完全な証明を行わない。
+
+有限lintは次だけを検査する。
+
+- canonical repositoryまたはmigration ownership外の、直接literal SQLによる
+  protected-table write
+- `add_review_and_decision`の直接callが承認済みreview serviceだけに存在すること
+- presence protected modulesでwriter referenceをaliasへ保存しないこと、およびwriterを
+  `getattr`、`setattr`、`functools.partial`でdispatchしないこと
+- presence protected modulesで`eval`と`exec`を使わないこと
+- adapterの直接import allowlist、process isolation boundary、最終voice schema
+
+各有限ruleのmutationは代表的な1～2 encodingだけとし、同じ効果を持つadversarialな
+別encodingはcompletion blockerにしない。実際のintegrityはSQLite
+`CHECK`/FK/`UNIQUE`/trigger、transaction、canonical hash reread、実SQLite integration
+test、完全合成E2Eで保証する。
+
+Task 10のcompletionは、有限lintとその代表mutation、既存のDB/integration test、
+byte-unchangedの完全合成E2E、およびfull backend regressionがgreenであることを条件と
+する。threat model外の任意Python encodingを追加で発見しても、明示的なthreat-model
+変更がない限りTask 10を再openしない。
 
 ### Opt-in real checks
 
