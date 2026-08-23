@@ -182,9 +182,21 @@ def verify_runtime_startup(
         if not isinstance(attestation, RuntimeAttestation):
             raise ValueError("invalid runtime attestation")
         private_data = _private_root(data_root)
-        runtime_root = _private_child_root(
+        manifest_root = _private_child_root(
+            attestation.python_startup_manifest_path.parent, private_data
+        )
+        pyvenv_root = _private_child_root(
+            attestation.python_pyvenv_path.parent, private_data
+        )
+        python_parent = _private_child_root(
             attestation.python_path.parent, private_data
         )
+        if manifest_root != pyvenv_root or python_parent not in {
+            manifest_root,
+            manifest_root / "Scripts",
+        }:
+            raise ValueError("unexpected Python runtime root")
+        runtime_root = manifest_root
         expected_import_root = runtime_root / "Lib" / "site-packages"
         import_root = _private_child_root(
             attestation.python_import_root, runtime_root

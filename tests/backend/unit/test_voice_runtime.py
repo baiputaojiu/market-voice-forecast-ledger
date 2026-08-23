@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -76,10 +77,13 @@ class _FakeProbe:
 
 
 def _runtime_fixture(
-    tmp_path: Path, *, provider: str = "CPUExecutionProvider"
+    tmp_path: Path,
+    *,
+    provider: str = "CPUExecutionProvider",
+    python_relative: Path = Path("python.exe"),
 ) -> tuple[Settings, _FakeProbe, RuntimeAllowlists]:
     settings = Settings.for_data_dir(tmp_path / "private-data")
-    python = settings.voice_runtime_dir / "python.exe"
+    python = settings.voice_runtime_dir / python_relative
     yt_dlp = settings.voice_runtime_dir / "yt-dlp.exe"
     deno = settings.voice_runtime_dir / "deno.exe"
     ffmpeg = settings.voice_runtime_dir / "ffmpeg.exe"
@@ -435,6 +439,54 @@ def test_verify_runtime_startup_rejects_late_windows_python_path_override(
 
     with pytest.raises(DomainError, match="voice runtime is invalid"):
         verify_runtime_startup(attestation, settings.data_dir)
+
+
+@pytest.mark.parametrize(
+    "python_relative",
+    (
+        pytest.param(Path("python.exe"), id="root"),
+        pytest.param(Path("Scripts/python.exe"), id="windows-venv"),
+    ),
+)
+def test_verify_runtime_startup_accepts_supported_python_layouts(
+    tmp_path: Path, python_relative: Path
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(
+        tmp_path, python_relative=python_relative
+    )
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+
+    verify_runtime_startup(attestation, settings.data_dir)
+
+
+def test_verify_runtime_startup_rejects_mismatched_startup_artifact_parents(
+    tmp_path: Path,
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(
+        tmp_path, python_relative=Path("Scripts/python.exe")
+    )
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+    alternate_manifest = (
+        settings.voice_runtime_dir / "alternate" / "startup-manifest.json"
+    )
+    alternate_sha256 = _write(
+        alternate_manifest,
+        attestation.python_startup_manifest_path.read_bytes(),
+    )
+    mismatched = replace(
+        attestation,
+        python_startup_manifest_path=alternate_manifest.resolve(),
+        python_startup_manifest_sha256=alternate_sha256,
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        verify_runtime_startup(mismatched, settings.data_dir)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
 
 
 def test_runtime_rejects_system_site_packages_in_pyvenv_config(
