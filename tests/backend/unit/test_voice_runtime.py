@@ -131,6 +131,36 @@ def _runtime_fixture(
     )
 
 
+def test_default_runtime_allowlist_pins_official_deno_executable_sha256() -> None:
+    assert RuntimeAllowlists().deno_sha256 == (
+        "98f8c2a2d470e4ccb04c935c86ff8050817d877762aec5eaeeb9e409ccb3b9fd"
+    )
+
+
+@pytest.mark.parametrize(
+    "deno_sha256",
+    (
+        "98f8c2a2d470e4ccb04c935c86ff8050817d877762aec5eaee9e409ccb3b9fd",
+        "0" * 64,
+    ),
+)
+def test_runtime_rejects_near_or_wrong_deno_executable_sha256(
+    tmp_path: Path, deno_sha256: str
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    candidate = RuntimeAllowlists(
+        deno_sha256=deno_sha256,
+        sherpa_wheel_sha256=allowlists.sherpa_wheel_sha256,
+        yt_dlp_sha256=allowlists.yt_dlp_sha256,
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        attest_runtime(settings, version_probe=probe, allowlists=candidate)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+    assert probe.calls == []
+
+
 def test_runtime_attests_exact_private_artifacts_and_fixed_probe_argv(tmp_path: Path) -> None:
     settings, probe, allowlists = _runtime_fixture(tmp_path)
 
