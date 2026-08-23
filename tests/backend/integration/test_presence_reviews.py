@@ -385,6 +385,14 @@ def test_review_requires_exact_command_action_and_actor_types(
         "PRIVATE\u0000CONTROL",
         "audio_path contains private content",
         "file://private/audio.wav",
+        "Author" + "ization: Bear" + "er synthetic-private-credential-000001",
+        "Author" + "ization: Basic c3ludGhldGljOnByaXZhdGU=",
+        "Cook" + "ie: session=synthetic-private-cookie",
+        "Set-Cook" + "ie: session=synthetic-private-cookie",
+        "provider_api_" + "key=synthetic-private-key",
+        "access_" + "token: synthetic-private-token",
+        "password" + "=synthetic-private-password",
+        "-----BEGIN " + "PRIVATE KEY-----",
     ),
 )
 def test_review_rejects_empty_long_or_unsafe_reason_before_mutation(
@@ -577,6 +585,90 @@ def test_corrupt_job_artifact_identity_is_never_shown_or_reviewed(
     assert str(review_error.value) == "presence review could not be saved"
     assert_no_private_exception_chain(detail_error.value)
     assert_no_private_exception_chain(review_error.value)
+    assert_review_unchanged(db, job)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "row_status",
+        "row_error_state",
+        "row_timestamp_order",
+        "file_resurrection",
+        "output_linkage",
+    ),
+)
+def test_review_revalidates_exact_cleanup_receipt_before_any_write(
+    db,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    job, run_id = successful_run(db, tmp_path)
+    artifact = db.execute(
+        "SELECT id, local_path FROM local_artifacts ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert artifact is not None
+    resurrected_path: Path | None = None
+    if mutation == "row_status":
+        db.execute("DROP TRIGGER local_artifacts_limited_update")
+        db.execute(
+            """
+            UPDATE local_artifacts
+            SET status='delete_failed', retry_count=retry_count + 1,
+                safe_error_code='AUDIO_DELETE_OS_ERROR', deleted_at=NULL
+            WHERE id=?
+            """,
+            (artifact["id"],),
+        )
+    elif mutation == "row_error_state":
+        db.execute("DROP TRIGGER local_artifacts_limited_update")
+        db.execute("PRAGMA ignore_check_constraints=ON")
+        db.execute(
+            "UPDATE local_artifacts SET safe_error_code='AUDIO_DELETE_OS_ERROR' "
+            "WHERE id=?",
+            (artifact["id"],),
+        )
+        db.execute("PRAGMA ignore_check_constraints=OFF")
+    elif mutation == "row_timestamp_order":
+        db.execute("DROP TRIGGER local_artifacts_limited_update")
+        db.execute(
+            "UPDATE local_artifacts SET deleted_at=? WHERE id=?",
+            ("2020-01-01T00:00:00.000000Z", artifact["id"]),
+        )
+    elif mutation == "file_resurrection":
+        resurrected_path = Path(artifact["local_path"])
+        resurrected_path.write_bytes(b"synthetic-resurrected-media")
+    else:
+        db.execute("DROP TRIGGER job_unit_attempts_no_update")
+        db.execute(
+            "UPDATE job_units SET output_hash=? "
+            "WHERE job_id=? AND unit_key='audio:cleanup'",
+            ("f" * 64, job.job_id),
+        )
+        db.execute(
+            "UPDATE job_unit_attempts SET output_hash=? "
+            "WHERE job_id=? AND unit_key='audio:cleanup'",
+            ("f" * 64, job.job_id),
+        )
+    before_review = tuple(db.iterdump())
+    statements: list[str] = []
+    db.set_trace_callback(statements.append)
+
+    try:
+        with pytest.raises(DomainError) as caught:
+            review_service(db).review(
+                command(run_id, ReviewAction.CONFIRM)
+            )
+    finally:
+        db.set_trace_callback(None)
+        if resurrected_path is not None:
+            resurrected_path.unlink(missing_ok=True)
+
+    assert caught.value.code == "PRESENCE_REVIEW_FAILED"
+    assert str(caught.value) == "presence review could not be saved"
+    assert_no_private_exception_chain(caught.value)
+    assert "BEGIN IMMEDIATE" in statements
+    assert tuple(db.iterdump()) == before_review
     assert_review_unchanged(db, job)
 
 

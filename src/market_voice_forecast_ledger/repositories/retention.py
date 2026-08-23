@@ -1,10 +1,15 @@
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from market_voice_forecast_ledger.domain.common import sha256_text, utc_iso
+from market_voice_forecast_ledger.domain.common import (
+    canonical_json,
+    sha256_text,
+    utc_iso,
+)
 from market_voice_forecast_ledger.domain.errors import DomainError
 
 
@@ -17,6 +22,9 @@ _AUDIO_ERROR_CODES = {
     "AUDIO_DELETE_PERMISSION",
     "AUDIO_DELETE_OS_ERROR",
 }
+_PRESENCE_AUDIO_FILENAMES = frozenset(
+    {"source.media", "source.media.part", "normalized.wav"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +344,95 @@ class RetentionRepository:
         _validate_artifact(artifact)
         return artifact
 
+    def require_presence_cleanup_receipt(
+        self,
+        job_id: int,
+        expected_output_hash: str,
+    ) -> tuple[LocalArtifact, ...]:
+        if (
+            not self._conn.in_transaction
+            or type(job_id) is not int
+            or job_id <= 0
+            or type(expected_output_hash) is not str
+            or _SHA256.fullmatch(expected_output_hash) is None
+        ):
+            _presence_cleanup_invalid()
+        workspace_name = f"presence-job-{job_id:020d}"
+        selected_rows: list[sqlite3.Row] = []
+        workspace_paths: set[Path] = set()
+        seen_filenames: set[str] = set()
+        rows = tuple(
+            self._conn.execute(
+                """
+                SELECT id, local_path,
+                       typeof(id) AS type_id,
+                       typeof(local_path) AS type_local_path
+                FROM local_artifacts ORDER BY id
+                """
+            )
+        )
+        for row in rows:
+            if row["type_id"] != "integer" or row["type_local_path"] != "text":
+                _presence_cleanup_invalid()
+            path = Path(row["local_path"])
+            workspace_indexes = tuple(
+                index
+                for index, part in enumerate(path.parts)
+                if part == workspace_name
+            )
+            if not workspace_indexes:
+                continue
+            if (
+                not path.is_absolute()
+                or len(workspace_indexes) != 1
+                or workspace_indexes[0] != len(path.parts) - 2
+                or path.name not in _PRESENCE_AUDIO_FILENAMES
+            ):
+                _presence_cleanup_invalid()
+            selected_rows.append(row)
+            workspace_paths.add(path.parent)
+            seen_filenames.add(path.name)
+        if (
+            not selected_rows
+            or len(workspace_paths) != 1
+            or seen_filenames != _PRESENCE_AUDIO_FILENAMES
+        ):
+            _presence_cleanup_invalid()
+
+        artifacts = tuple(
+            self.get_audio_artifact(row["id"])
+            for row in selected_rows
+        )
+        if any(
+            artifact.status != "deleted"
+            or type(artifact.retry_count) is not int
+            or artifact.retry_count < 0
+            or artifact.safe_error_code is not None
+            or artifact.deleted_at is None
+            or artifact.deleted_at < artifact.created_at
+            or os.path.lexists(artifact.local_path)
+            for artifact in artifacts
+        ):
+            _presence_cleanup_invalid()
+        receipt_hash = sha256_text(
+            canonical_json(
+                {
+                    "artifacts": [
+                        {
+                            "deleted_at": artifact.deleted_at.isoformat(),
+                            "id": artifact.id,
+                            "retry_count": artifact.retry_count,
+                        }
+                        for artifact in artifacts
+                    ],
+                    "schema": "presence-audio-cleanup.v1",
+                }
+            )
+        )
+        if receipt_hash != expected_output_hash:
+            _presence_cleanup_invalid()
+        return artifacts
+
     def record_audio_failure(self, artifact_id: int, error_code: str) -> int:
         self._require_transaction()
         if error_code not in _AUDIO_ERROR_CODES:
@@ -425,6 +522,13 @@ def _validate_artifact(artifact: LocalArtifact) -> None:
         raise DomainError(
             "AUDIO_ARTIFACT_STATE_INVALID", "audio artifact state is invalid"
         )
+
+
+def _presence_cleanup_invalid() -> None:
+    raise DomainError(
+        "PRESENCE_CLEANUP_STORED_INVALID",
+        "stored presence cleanup receipt is invalid",
+    )
 
 
 def _require_sha256(value: object) -> str:

@@ -18,7 +18,7 @@ from market_voice_forecast_ledger.domain.discovery import (
     DiscoverySourceKind,
     PresenceState,
 )
-from market_voice_forecast_ledger.domain.enums import JobStatus
+from market_voice_forecast_ledger.domain.enums import JobStatus, UnitStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import (
     ReviewAction,
@@ -30,6 +30,9 @@ from market_voice_forecast_ledger.repositories.discovery import (
     DiscoveryRepository,
 )
 from market_voice_forecast_ledger.repositories.jobs import JobRepository
+from market_voice_forecast_ledger.repositories.retention import (
+    RetentionRepository,
+)
 from market_voice_forecast_ledger.repositories.voice_verification import (
     ReferenceBundle,
     StoredCalibrationIdentity,
@@ -182,6 +185,7 @@ class PresenceVerificationService:
         self._selection_contract_version = selection_contract_version
         self._discovery = DiscoveryRepository(conn)
         self._jobs = JobRepository(conn)
+        self._retention = RetentionRepository(conn)
         self._job_state = JobStateService(conn, clock=self._clock)
         self._voice = VoiceVerificationRepository(conn, clock=self._clock)
 
@@ -240,8 +244,9 @@ class PresenceVerificationService:
         storage_error: DomainError | None = None
         try:
             with transaction(self._conn):
-                self._require_pending_review(command.run_id)
+                job_id = self._require_pending_review(command.run_id)
                 self._review_detail(command.run_id)
+                self._require_cleanup_receipt(job_id)
                 review_id = self._voice.add_review_and_decision(command)
                 result = self._review_result(command, review_id)
         except DomainError as cause:
@@ -270,7 +275,7 @@ class PresenceVerificationService:
             raise _review_invalid_error()
         validate_audit_reason(self._conn, command.reason)
 
-    def _require_pending_review(self, run_id: int) -> None:
+    def _require_pending_review(self, run_id: int) -> int:
         row = self._conn.execute(
             """
             SELECT run.job_id, run.candidate_id AS run_candidate_id,
@@ -323,6 +328,19 @@ class PresenceVerificationService:
             raise _review_stale_error()
         if row["current_presence_decision_id"] != row["presence_decision_id"]:
             raise _review_stale_error()
+        return row["job_id"]
+
+    def _require_cleanup_receipt(self, job_id: int) -> None:
+        cleanup = self._job_state.unit(job_id, "audio:cleanup")
+        if (
+            cleanup.status is not UnitStatus.SUCCESS
+            or cleanup.output_hash is None
+        ):
+            raise ValueError("presence review cleanup is incomplete")
+        self._retention.require_presence_cleanup_receipt(
+            job_id,
+            cleanup.output_hash,
+        )
 
     def _review_detail(self, run_id: int) -> ReviewDetail:
         run = self._voice.get_run(run_id)

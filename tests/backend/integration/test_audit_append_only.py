@@ -153,6 +153,58 @@ def test_audit_append_rejects_unsafe_reason_shapes_without_echo(db, reason):
     assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "Author" + "ization: Bear" + "er synthetic-private-credential-000001",
+        "Author" + "ization: Basic c3ludGhldGljOnByaXZhdGU=",
+        "Cook" + "ie: session=synthetic-private-cookie",
+        "Set-Cook" + "ie: session=synthetic-private-cookie",
+        "provider_api_" + "key=synthetic-private-key",
+        "access_" + "token: synthetic-private-token",
+        "password" + "=synthetic-private-password",
+        "-----BEGIN " + "PRIVATE KEY-----",
+    ),
+)
+def test_audit_append_rejects_concrete_credential_reason_without_echo(
+    db,
+    reason,
+):
+    event = replace(AuditEventInput.synthetic(), reason_text=reason)
+
+    with pytest.raises(DomainError) as error:
+        with transaction(db):
+            AuditRepository(db).append(event)
+
+    assert error.value.code == "AUDIT_REASON_PRIVATE"
+    assert error.value.message == "audit reason contains prohibited private content"
+    assert reason not in error.value.message
+    assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "review token remained local and was not copied",
+        "public cookie policy was mentioned during review",
+        "key speaker listened to the cited segment",
+        "watched 木野内栄治 at https://www.youtube.com/watch?v=abcdefghijk",
+        "YouTube video ID abcdefghijk matched the public page",
+        "speaker-model 1.0 adapter-v1 threshold-v1 were displayed",
+    ),
+)
+def test_audit_append_keeps_ordinary_public_review_vocabulary(db, reason):
+    with transaction(db):
+        event_id = AuditRepository(db).append(
+            replace(AuditEventInput.synthetic(), reason_text=reason)
+        )
+
+    assert db.execute(
+        "SELECT reason_text FROM audit_events WHERE id=?",
+        (event_id,),
+    ).fetchone()[0] == reason
+
+
 @pytest.mark.parametrize("reason", [None, False, 1, "", "\u3000\t\n"])
 def test_audit_append_requires_exact_practical_reason_string(db, reason):
     event = replace(AuditEventInput.synthetic(), reason_text=reason)

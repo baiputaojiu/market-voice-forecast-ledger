@@ -22,8 +22,29 @@ _SAFE_AUDIT_TOKEN: Final = re.compile(
 )
 _ABSOLUTE_PATH: Final = re.compile(
     r"(?i)(?:(?<![A-Za-z0-9])[a-z]:[\\/]"
-    r"|(?<![\\/])(?:\\\\|//)[^\\/\s]"
+    r"|(?<![\\/:])(?:\\\\|//)[^\\/\s]"
     r"|(?<![A-Za-z0-9/])/(?!/)[^/\s])"
+)
+_CREDENTIAL_REASON: Final = (
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_-])authori"
+        r"zation\s*:\s*(?:bearer|basic)\s+\S+"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_-])(?:set-)?cookie\s*:\s*"
+        r"[^\s;=]+\s*=\s*[^\s;]+"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[a-z][a-z0-9]*[_-])*"
+        r"(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
+        r"refresh[_-]?token|secret[_-]?key|client[_-]?secret|token|"
+        r"password|passwd)\s*[:=]\s*"
+        r"(?:\"[^\"\r\n]+\"|'[^'\r\n]+'|[^\s,;]+)"
+    ),
+    re.compile(
+        r"(?i)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE "
+        r"KEY-----"
+    ),
 )
 
 
@@ -76,6 +97,8 @@ def validate_audit_reason(conn: sqlite3.Connection, reason: object) -> None:
     if any(unicodedata.category(character).startswith("C") for character in reason):
         _raise_private_reason()
     if _ABSOLUTE_PATH.search(reason) is not None or "file://" in reason.casefold():
+        _raise_private_reason()
+    if any(pattern.search(reason) is not None for pattern in _CREDENTIAL_REASON):
         _raise_private_reason()
     lowered = reason.casefold()
     if any(
