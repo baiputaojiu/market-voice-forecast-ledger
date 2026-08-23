@@ -853,6 +853,8 @@ class _ExecutableScope:
     node: ast.AST
     positional_parameters: tuple[str, ...]
     positional_count: int
+    vararg_index: int | None
+    kwarg_index: int | None
     defaults: tuple[tuple[str, ast.AST], ...]
     method_kind: str
     class_owner: str | None
@@ -867,8 +869,139 @@ class _ResolvedCallable:
     bound_offset: int
 
 
+@dataclass(frozen=True, slots=True)
+class _AstBindingEvent:
+    key: str
+    value: ast.AST
+    position: tuple[int, int, int]
+    branches: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ParameterSelector:
+    index: int
+    path: tuple[str | int, ...] = ()
+
+
+def _scope_binding_events(
+    nodes: tuple[ast.AST, ...],
+) -> tuple[_AstBindingEvent, ...]:
+    if not nodes:
+        return ()
+    root = nodes[0]
+    parents = {
+        id(child): parent
+        for parent in ast.walk(root)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def branch_path(node: ast.AST) -> tuple[tuple[int, str], ...]:
+        branches = []
+        child = node
+        parent = parents.get(id(child))
+        while parent is not None:
+            if isinstance(parent, ast.If):
+                arm = "body" if child in parent.body else "else"
+                branches.append((id(parent), arm))
+            child = parent
+            parent = parents.get(id(child))
+        return tuple(branches)
+
+    events = []
+    counter = 0
+
+    def add(key: str, value: ast.AST, owner: ast.AST) -> None:
+        nonlocal counter
+        counter += 1
+        events.append(
+            _AstBindingEvent(
+                key,
+                value,
+                (
+                    getattr(owner, "end_lineno", owner.lineno),
+                    getattr(owner, "end_col_offset", owner.col_offset),
+                    counter,
+                ),
+                branch_path(owner),
+            )
+        )
+
+    for node in nodes:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            if node.value is None:
+                continue
+            targets = (
+                node.targets if isinstance(node, ast.Assign) else (node.target,)
+            )
+            for target in targets:
+                path = _expression_alias_key(target)
+                if path is not None:
+                    add(path, node.value, node)
+                else:
+                    for name in _binding_target_names(target):
+                        add(name, node.value, node)
+
+    def declarations(statements: Iterable[ast.stmt]) -> None:
+        for statement in statements:
+            if isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                add(statement.name, statement, statement)
+                continue
+            for field_name in ("body", "orelse", "finalbody"):
+                body = getattr(statement, field_name, None)
+                if isinstance(body, list):
+                    declarations(body)
+            if isinstance(statement, ast.Try):
+                for handler in statement.handlers:
+                    declarations(handler.body)
+
+    body = getattr(root, "body", None)
+    if isinstance(body, list):
+        declarations(body)
+    return tuple(sorted(events, key=lambda event: event.position))
+
+
+def _assigned_event_values(
+    events: tuple[_AstBindingEvent, ...],
+    expression: ast.AST,
+    cutoff: tuple[int, int, int],
+) -> tuple[ast.AST, ...]:
+    key = _expression_alias_key(expression)
+    if key is None:
+        return ()
+    candidates = sorted(
+        (
+            event
+            for event in events
+            if event.position < cutoff
+            and _alias_keys_overlap(key, event.key)
+        ),
+        key=lambda event: event.position,
+        reverse=True,
+    )
+    if not candidates:
+        return ()
+    selected = [candidates[0]]
+    for candidate in candidates[1:]:
+        candidate_branches = dict(candidate.branches)
+        if any(
+            branch_id in candidate_branches
+            and candidate_branches[branch_id] != arm
+            for current in selected
+            for branch_id, arm in current.branches
+        ):
+            selected.append(candidate)
+    return tuple(event.value for event in selected)
+
+
 def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
-    scopes = [_ExecutableScope("<module>", tree, (), 0, (), "module", None)]
+    scopes = [
+        _ExecutableScope(
+            "<module>", tree, (), 0, None, None, (), "module", None
+        )
+    ]
 
     def function_scope(
         child: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
@@ -877,8 +1010,21 @@ def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
     ) -> _ExecutableScope:
         positional = (*child.args.posonlyargs, *child.args.args)
         keyword_only = child.args.kwonlyargs
-        parameters = tuple(
+        fixed_parameters = tuple(
             argument.arg for argument in (*positional, *keyword_only)
+        )
+        parameters = (
+            *fixed_parameters,
+            *((child.args.vararg.arg,) if child.args.vararg else ()),
+            *((child.args.kwarg.arg,) if child.args.kwarg else ()),
+        )
+        vararg_index = (
+            len(fixed_parameters) if child.args.vararg is not None else None
+        )
+        kwarg_index = (
+            len(fixed_parameters) + int(child.args.vararg is not None)
+            if child.args.kwarg is not None
+            else None
         )
         positional_default_args = (
             positional[-len(child.args.defaults) :]
@@ -922,6 +1068,8 @@ def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
             child,
             parameters,
             len(positional),
+            vararg_index,
+            kwarg_index,
             tuple(defaults.items()),
             method_kind,
             class_owner,
@@ -937,7 +1085,15 @@ def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
                 name = ".".join((*owners, child.name))
                 scopes.append(
                     _ExecutableScope(
-                        f"{name}.<body>", child, (), 0, (), "class", name
+                        f"{name}.<body>",
+                        child,
+                        (),
+                        0,
+                        None,
+                        None,
+                        (),
+                        "class",
+                        name,
                     )
                 )
                 visit(child, (*owners, child.name), name)
@@ -964,51 +1120,71 @@ def _executable_scopes(tree: ast.Module) -> tuple[_ExecutableScope, ...]:
 
 def _sql_expression_calls(
     nodes: tuple[ast.AST, ...],
+    assigned_values_at: Callable[
+        [ast.AST, tuple[int, int, int]], tuple[ast.AST, ...]
+    ]
+    | None = None,
 ) -> tuple[tuple[ast.Call, ast.AST], ...]:
-    executor_aliases = set()
-    changed = True
-    while changed:
-        changed = False
-        for node in nodes:
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
-            value = node.value
-            is_executor = (
-                isinstance(value, ast.Attribute)
-                and value.attr in {"execute", "executemany", "executescript"}
-            ) or (
-                isinstance(value, ast.Name) and value.id in executor_aliases
-            )
-            aliases = {
-                target.id for target in targets if isinstance(target, ast.Name)
-            }
-            if is_executor and not aliases <= executor_aliases:
-                executor_aliases.update(aliases)
-                changed = True
-    assignments = _scope_assignment_values(nodes)
+    events = _scope_binding_events(nodes)
 
-    def assigned_values(expression: ast.AST) -> tuple[ast.AST, ...]:
-        return _assigned_expression_values(assignments, expression)
+    def is_executor(
+        expression: ast.AST,
+        assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+        seen: frozenset[str] = frozenset(),
+    ) -> bool:
+        if (
+            isinstance(expression, ast.Attribute)
+            and expression.attr in {"execute", "executemany", "executescript"}
+        ):
+            return True
+        path = _expression_alias_key(expression)
+        if path in seen:
+            return False
+        resolved = _subscript_container_values(expression, assigned_values)
+        if path is not None:
+            resolved = (*resolved, *assigned_values(expression))
+        return any(
+            is_executor(
+                value,
+                assigned_values,
+                seen if path is None else seen | {path},
+            )
+            for value in resolved
+        )
 
     calls = []
     for node in nodes:
         if not isinstance(node, ast.Call):
             continue
-        is_executor = (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"execute", "executemany", "executescript"}
-        ) or (
-            isinstance(node.func, ast.Name) and node.func.id in executor_aliases
-        )
-        if is_executor:
-            calls.extend(
-                (node, option[0])
-                for option in _expanded_positional_options(
-                    node.args, assigned_values
-                )
-                if option
+        cutoff = (node.lineno, node.col_offset, 2**31 - 1)
+
+        def assigned_values(expression: ast.AST) -> tuple[ast.AST, ...]:
+            if assigned_values_at is not None:
+                return assigned_values_at(expression, cutoff)
+            return _assigned_event_values(events, expression, cutoff)
+
+        if not is_executor(node.func, assigned_values):
+            continue
+        options = _expanded_positional_options(node.args, assigned_values)
+        if (
+            node.args
+            and isinstance(node.args[0], ast.Starred)
+            and not _sequence_expression_options(
+                node.args[0].value, assigned_values
             )
+        ):
+            calls.append(
+                (
+                    node,
+                    ast.Subscript(
+                        value=node.args[0].value,
+                        slice=ast.Constant(value=0),
+                        ctx=ast.Load(),
+                    ),
+                )
+            )
+        else:
+            calls.extend((node, option[0]) for option in options if option)
     return tuple(calls)
 
 
@@ -1227,13 +1403,12 @@ def _sequence_expression_options(
     if isinstance(expression, (ast.List, ast.Tuple)):
         options: tuple[tuple[ast.AST, ...], ...] = ((),)
         for item in expression.elts:
-            item_options = (
-                _sequence_expression_options(
+            if isinstance(item, ast.Starred):
+                item_options = _sequence_expression_options(
                     item.value, assigned_values, seen
-                )
-                if isinstance(item, ast.Starred)
-                else ((item,),)
-            )
+                ) or ((item.value,),)
+            else:
+                item_options = ((item,),)
             if not item_options:
                 return ()
             options = tuple(
@@ -1242,6 +1417,19 @@ def _sequence_expression_options(
                 for suffix in item_options
             )
         return options
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Name)
+        and expression.func.id in {"list", "tuple"}
+        and not assigned_values(expression.func)
+    ):
+        if not expression.args:
+            return ((),)
+        if len(expression.args) != 1:
+            return ()
+        return _sequence_expression_options(
+            expression.args[0], assigned_values, seen
+        )
     key = _expression_alias_key(expression)
     if key is None or key in seen:
         return ()
@@ -1254,49 +1442,135 @@ def _sequence_expression_options(
     )
 
 
+def _mapping_expression_options(
+    expression: ast.AST,
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+    seen: frozenset[str] = frozenset(),
+) -> tuple[dict[str, ast.AST], ...]:
+    if isinstance(expression, ast.Dict):
+        options: tuple[dict[str, ast.AST], ...] = ({},)
+        for key_node, value in zip(
+            expression.keys, expression.values, strict=True
+        ):
+            if key_node is None:
+                additions = _mapping_expression_options(
+                    value, assigned_values, seen
+                )
+                if not additions:
+                    continue
+                options = tuple(
+                    {**prefix, **addition}
+                    for prefix in options
+                    for addition in additions
+                )
+            elif (
+                isinstance(key_node, ast.Constant)
+                and type(key_node.value) is str
+            ):
+                options = tuple(
+                    {**prefix, key_node.value: value} for prefix in options
+                )
+        return options
+    if isinstance(expression, ast.BinOp) and isinstance(
+        expression.op, ast.BitOr
+    ):
+        left = _mapping_expression_options(
+            expression.left, assigned_values, seen
+        )
+        right = _mapping_expression_options(
+            expression.right, assigned_values, seen
+        )
+        return tuple(
+            {**left_option, **right_option}
+            for left_option in left
+            for right_option in right
+        )
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Name)
+        and expression.func.id == "dict"
+        and not assigned_values(expression.func)
+    ):
+        options: tuple[dict[str, ast.AST], ...] = ({},)
+        for argument in expression.args:
+            additions = _mapping_expression_options(
+                argument, assigned_values, seen
+            )
+            if not additions:
+                pairs = _sequence_expression_options(
+                    argument, assigned_values, seen
+                )
+                pair_options: list[dict[str, ast.AST]] = []
+                for pair_sequence in pairs:
+                    mapping: dict[str, ast.AST] = {}
+                    valid = True
+                    for pair in pair_sequence:
+                        pair_values = _sequence_expression_options(
+                            pair, assigned_values, seen
+                        )
+                        if len(pair_values) != 1 or len(pair_values[0]) != 2:
+                            valid = False
+                            break
+                        key_node, value_node = pair_values[0]
+                        if not (
+                            isinstance(key_node, ast.Constant)
+                            and type(key_node.value) is str
+                        ):
+                            valid = False
+                            break
+                        mapping[key_node.value] = value_node
+                    if valid:
+                        pair_options.append(mapping)
+                additions = tuple(pair_options)
+            if not additions:
+                return ()
+            options = tuple(
+                {**prefix, **addition}
+                for prefix in options
+                for addition in additions
+            )
+        for keyword in expression.keywords:
+            if keyword.arg is None:
+                additions = _mapping_expression_options(
+                    keyword.value, assigned_values, seen
+                )
+                if not additions:
+                    continue
+                options = tuple(
+                    {**prefix, **addition}
+                    for prefix in options
+                    for addition in additions
+                )
+            else:
+                options = tuple(
+                    {**prefix, keyword.arg: keyword.value}
+                    for prefix in options
+                )
+        return options
+    key = _expression_alias_key(expression)
+    if key is None or key in seen:
+        return ()
+    return tuple(
+        option
+        for assigned in assigned_values(expression)
+        for option in _mapping_expression_options(
+            assigned, assigned_values, seen | {key}
+        )
+    )
+
+
 def _mapping_expression_values(
     expression: ast.AST,
     parameter: str,
     assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
     seen: frozenset[str] = frozenset(),
 ) -> tuple[ast.AST, ...]:
-    if isinstance(expression, ast.Dict):
-        found = []
-        for key_node, value in zip(
-            expression.keys, expression.values, strict=True
-        ):
-            if key_node is None:
-                found.extend(
-                    _mapping_expression_values(
-                        value, parameter, assigned_values, seen
-                    )
-                )
-            elif (
-                isinstance(key_node, ast.Constant)
-                and type(key_node.value) is str
-                and key_node.value == parameter
-            ):
-                found.append(value)
-        return tuple(found)
-    if (
-        isinstance(expression, ast.Call)
-        and isinstance(expression.func, ast.Name)
-        and expression.func.id == "dict"
-    ):
-        return tuple(
-            keyword.value
-            for keyword in expression.keywords
-            if keyword.arg == parameter
-        )
-    key = _expression_alias_key(expression)
-    if key is None or key in seen:
-        return ()
     return tuple(
-        value
-        for assigned in assigned_values(expression)
-        for value in _mapping_expression_values(
-            assigned, parameter, assigned_values, seen | {key}
+        option[parameter]
+        for option in _mapping_expression_options(
+            expression, assigned_values, seen
         )
+        if parameter in option
     )
 
 
@@ -1311,6 +1585,8 @@ def _expanded_positional_options(
             if isinstance(argument, ast.Starred)
             else ((argument,),)
         )
+        if isinstance(argument, ast.Starred) and not argument_options:
+            argument_options = ((argument.value,),)
         if not argument_options:
             return ()
         options = tuple(
@@ -1335,42 +1611,28 @@ def _subscript_container_values(
         else None
     )
 
-    def containers(
-        candidate: ast.AST,
-        seen: frozenset[str] = frozenset(),
-    ) -> tuple[ast.AST, ...]:
-        if isinstance(candidate, (ast.Dict, ast.List, ast.Tuple)):
-            return (candidate,)
-        path_key = _expression_alias_key(candidate)
-        if path_key is None or path_key in seen:
-            return ()
-        return tuple(
-            container
-            for value in assigned_values(candidate)
-            for container in containers(value, seen | {path_key})
-        )
-
     values = []
-    for container in containers(expression.value):
-        if isinstance(container, (ast.List, ast.Tuple)):
-            if type(key) is int and -len(container.elts) <= key < len(
-                container.elts
-            ):
-                values.append(container.elts[key])
-            elif key is None:
-                values.extend(container.elts)
-        elif isinstance(container, ast.Dict):
-            for item_key, value in zip(
-                container.keys, container.values, strict=True
-            ):
-                if key is None:
-                    values.append(value)
-                elif (
-                    isinstance(item_key, ast.Constant)
-                    and item_key.value == key
-                    and type(item_key.value) is type(key)
-                ):
-                    values.append(value)
+    if type(key) is int:
+        for option in _sequence_expression_options(
+            expression.value, assigned_values
+        ):
+            if -len(option) <= key < len(option):
+                values.append(option[key])
+    elif type(key) is str:
+        for option in _mapping_expression_options(
+            expression.value, assigned_values
+        ):
+            if key in option:
+                values.append(option[key])
+    else:
+        for option in _sequence_expression_options(
+            expression.value, assigned_values
+        ):
+            values.extend(option)
+        for option in _mapping_expression_options(
+            expression.value, assigned_values
+        ):
+            values.extend(option.values())
     return tuple(dict.fromkeys(values))
 
 
@@ -1383,9 +1645,28 @@ def _call_argument_values(
 ) -> tuple[ast.AST, ...]:
     if parameter_index < bound_offset:
         return ()
+    options = _expanded_positional_options(call.args, assigned_values)
+    if parameter_index == callee.vararg_index:
+        supplied_count = callee.positional_count - bound_offset
+        return tuple(
+            dict.fromkeys(
+                expression
+                for option in options
+                for expression in option[supplied_count:]
+            )
+        )
+    if parameter_index == callee.kwarg_index:
+        return tuple(
+            value
+            for keyword in call.keywords
+            if keyword.arg is None
+            for option in _mapping_expression_options(
+                keyword.value, assigned_values
+            )
+            for value in option.values()
+        )
     positional_index = parameter_index - bound_offset
     if parameter_index < callee.positional_count:
-        options = _expanded_positional_options(call.args, assigned_values)
         positional = tuple(
             option[positional_index]
             for option in options
@@ -1414,6 +1695,104 @@ def _call_argument_values(
     return () if default is None else (default,)
 
 
+def _select_ast_values(
+    expressions: Iterable[ast.AST],
+    selector: tuple[str | int, ...],
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+) -> tuple[ast.AST, ...]:
+    selected = tuple(expressions)
+    for key in selector:
+        next_values = []
+        for expression in selected:
+            subscript = ast.Subscript(
+                value=expression,
+                slice=ast.Constant(value=key),
+                ctx=ast.Load(),
+            )
+            resolved = _subscript_container_values(
+                subscript, assigned_values
+            )
+            next_values.extend(resolved or (subscript,))
+        selected = tuple(dict.fromkeys(next_values))
+    return selected
+
+
+def _call_selector_values(
+    call: ast.Call,
+    callee: _ExecutableScope,
+    selector: _ParameterSelector,
+    bound_offset: int,
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+) -> tuple[ast.AST, ...]:
+    parameter_index = selector.index
+    if parameter_index < bound_offset:
+        return ()
+    if parameter_index == callee.vararg_index:
+        options = _expanded_positional_options(call.args, assigned_values)
+        supplied_count = callee.positional_count - bound_offset
+        extras = tuple(
+            option[supplied_count:]
+            for option in options
+        )
+        if not selector.path:
+            return tuple(
+                dict.fromkeys(
+                    expression
+                    for option in extras
+                    for expression in option
+                )
+            )
+        first, *remaining = selector.path
+        if type(first) is not int:
+            return ()
+        selected = tuple(
+            option[first]
+            for option in extras
+            if -len(option) <= first < len(option)
+        )
+        return _select_ast_values(
+            selected, tuple(remaining), assigned_values
+        )
+    if parameter_index == callee.kwarg_index:
+        if not selector.path:
+            return tuple(
+                value
+                for keyword in call.keywords
+                if keyword.arg is None
+                for option in _mapping_expression_options(
+                    keyword.value, assigned_values
+                )
+                for value in option.values()
+            )
+        first, *remaining = selector.path
+        if type(first) is not str:
+            return ()
+        selected = tuple(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg == first
+        )
+        selected += tuple(
+            value
+            for keyword in call.keywords
+            if keyword.arg is None
+            for value in _mapping_expression_values(
+                keyword.value, first, assigned_values
+            )
+        )
+        return _select_ast_values(
+            selected, tuple(remaining), assigned_values
+        )
+    expressions = _call_argument_values(
+        call,
+        callee,
+        parameter_index,
+        bound_offset,
+        assigned_values,
+    )
+    return _select_ast_values(expressions, selector.path, assigned_values)
+
+
 def _presence_writer_details(
     files: Iterable[Path],
     *,
@@ -1431,6 +1810,10 @@ def _presence_writer_details(
         nodes_by_name = {
             scope.name: _scope_nodes(scope.node) for scope in scopes
         }
+        binding_events_by_name = {
+            scope.name: _scope_binding_events(nodes_by_name[scope.name])
+            for scope in scopes
+        }
         constants_by_name = {}
         assignments_by_name = {}
         for scope in scopes:
@@ -1438,11 +1821,109 @@ def _presence_writer_details(
             constants.update(_string_constants(nodes_by_name[scope.name]))
             constants_by_name[scope.name] = constants
             assignments_by_name[scope.name] = _scope_binding_values(scope)
+        infinity = (2**31 - 1, 2**31 - 1, 2**31 - 1)
+
+        def visible_assigned_values(
+            expression: ast.AST,
+            scope_name: str,
+            cutoff: tuple[int, int, int] = infinity,
+        ) -> tuple[ast.AST, ...]:
+            values = []
+            for visible in _visible_scope_names(scope_name, known_scopes):
+                visible_cutoff = cutoff if visible == scope_name else infinity
+                resolved = _assigned_event_values(
+                    binding_events_by_name[visible],
+                    expression,
+                    visible_cutoff,
+                )
+                if resolved:
+                    values.extend(resolved)
+                    break
+            return tuple(dict.fromkeys(values))
+
+        def rendered_expression(
+            expression: ast.AST,
+            scope_name: str,
+            cutoff: tuple[int, int, int] = infinity,
+            seen: frozenset[str] = frozenset(),
+        ) -> str | None:
+            if isinstance(expression, ast.Constant) and type(
+                expression.value
+            ) is str:
+                return expression.value
+            if isinstance(expression, ast.Name):
+                if expression.id in seen:
+                    return None
+                rendered = {
+                    value
+                    for assigned in visible_assigned_values(
+                        expression, scope_name, cutoff
+                    )
+                    if (
+                        value := rendered_expression(
+                            assigned,
+                            scope_name,
+                            cutoff,
+                            seen | {expression.id},
+                        )
+                    )
+                    is not None
+                }
+                return next(iter(rendered)) if len(rendered) == 1 else None
+            if isinstance(expression, ast.BinOp) and isinstance(
+                expression.op, ast.Add
+            ):
+                left = rendered_expression(
+                    expression.left, scope_name, cutoff, seen
+                )
+                right = rendered_expression(
+                    expression.right, scope_name, cutoff, seen
+                )
+                return None if left is None or right is None else left + right
+            if isinstance(expression, ast.JoinedStr):
+                parts = []
+                for value in expression.values:
+                    target = (
+                        value.value
+                        if isinstance(value, ast.FormattedValue)
+                        else value
+                    )
+                    rendered = rendered_expression(
+                        target, scope_name, cutoff, seen
+                    )
+                    if rendered is None:
+                        return None
+                    parts.append(rendered)
+                return "".join(parts)
+            if isinstance(expression, ast.Subscript):
+                assigned_values = lambda item: visible_assigned_values(
+                    item, scope_name, cutoff
+                )
+                rendered = {
+                    value
+                    for selected in _subscript_container_values(
+                        expression, assigned_values
+                    )
+                    if (
+                        value := rendered_expression(
+                            selected, scope_name, cutoff, seen
+                        )
+                    )
+                    is not None
+                }
+                return next(iter(rendered)) if len(rendered) == 1 else None
+            return None
+
         sql_call_ids_by_name = {
             scope.name: {
                 id(call)
                 for call, _expression in _sql_expression_calls(
-                    nodes_by_name[scope.name]
+                    nodes_by_name[scope.name],
+                    lambda expression, cutoff, scope_name=scope.name: (
+                        visible_assigned_values(
+                            expression, scope_name, cutoff
+                        )
+                    ),
                 )
             }
             for scope in scopes
@@ -1450,6 +1931,7 @@ def _presence_writer_details(
 
         callables_by_short: dict[str, set[str]] = {}
         lambda_by_node = {}
+        callable_by_node = {}
         for scope in scopes:
             if scope.name == "<module>" or ".<body>" in scope.name:
                 continue
@@ -1458,11 +1940,13 @@ def _presence_writer_details(
             ).add(scope.name)
             if isinstance(scope.node, ast.Lambda):
                 lambda_by_node[id(scope.node)] = scope.name
+            callable_by_node[id(scope.node)] = scope.name
 
         def is_class_reference(
             expression: ast.AST,
             class_owner: str | None,
             caller_name: str,
+            cutoff: tuple[int, int, int],
             seen: frozenset[tuple[str, str]] = frozenset(),
         ) -> bool:
             if class_owner is None:
@@ -1481,21 +1965,23 @@ def _presence_writer_details(
                     value,
                     class_owner,
                     caller_name,
+                    cutoff,
                     seen | {key},
                 )
-                for visible in _visible_scope_names(
-                    caller_name, known_scopes
-                )
-                for value in _assigned_expression_values(
-                    assignments_by_name[visible], expression
+                for value in visible_assigned_values(
+                    expression, caller_name, cutoff
                 )
             )
 
         def callable_targets(
             expression: ast.AST,
             caller_name: str,
+            cutoff: tuple[int, int, int] = infinity,
             seen: frozenset[tuple[str, str]] = frozenset(),
         ) -> frozenset[_ResolvedCallable]:
+            direct = callable_by_node.get(id(expression))
+            if direct is not None:
+                return frozenset({_ResolvedCallable(direct, 0)})
             if isinstance(expression, ast.Lambda):
                 target = lambda_by_node.get(id(expression))
                 return (
@@ -1509,15 +1995,23 @@ def _presence_writer_details(
                 if key in seen:
                     return frozenset()
                 resolved = set()
-                for visible in _visible_scope_names(caller_name, known_scopes):
-                    for value in _assigned_expression_values(
-                        assignments_by_name[visible], expression
-                    ):
-                        resolved.update(
-                            callable_targets(
-                                value, caller_name, seen | {key}
-                            )
+                assigned_values = lambda item: visible_assigned_values(
+                    item, caller_name, cutoff
+                )
+                candidates = (
+                    *_subscript_container_values(
+                        expression, assigned_values
+                    ),
+                    *visible_assigned_values(
+                        expression, caller_name, cutoff
+                    ),
+                )
+                for value in candidates:
+                    resolved.update(
+                        callable_targets(
+                            value, caller_name, cutoff, seen | {key}
                         )
+                    )
                 if isinstance(expression, ast.Name):
                     resolved.update(
                         _ResolvedCallable(target, 0)
@@ -1548,6 +2042,7 @@ def _presence_writer_details(
                                 expression.value,
                                 callee.class_owner,
                                 caller_name,
+                                cutoff,
                             )
                             else 1
                         )
@@ -1555,38 +2050,57 @@ def _presence_writer_details(
                 return frozenset(resolved)
             return frozenset()
 
-        def parameter_indexes(
+        def parameter_selectors(
             expression: ast.AST,
             scope: _ExecutableScope,
+            cutoff: tuple[int, int, int] = infinity,
             seen: frozenset[str] = frozenset(),
-        ) -> frozenset[int]:
-            if not isinstance(expression, ast.Name):
-                return frozenset()
-            if expression.id in scope.positional_parameters:
-                return frozenset(
-                    {scope.positional_parameters.index(expression.id)}
-                )
-            if expression.id in seen:
-                return frozenset()
-            indexes = set()
-            for value in _assigned_expression_values(
-                assignments_by_name[scope.name], expression
+        ) -> frozenset[_ParameterSelector]:
+            if isinstance(expression, ast.Subscript):
+                key_node = expression.slice
+                if isinstance(key_node, ast.Constant) and type(
+                    key_node.value
+                ) in {str, int}:
+                    return frozenset(
+                        _ParameterSelector(
+                            selector.index,
+                            (*selector.path, key_node.value),
+                        )
+                        for selector in parameter_selectors(
+                            expression.value, scope, cutoff, seen
+                        )
+                    )
+            if isinstance(expression, ast.Name) and (
+                expression.id in scope.positional_parameters
             ):
-                indexes.update(
-                    parameter_indexes(
-                        value, scope, seen | {expression.id}
+                return frozenset(
+                    {
+                        _ParameterSelector(
+                            scope.positional_parameters.index(expression.id)
+                        )
+                    }
+                )
+            path = _expression_alias_key(expression)
+            if path is None or path in seen:
+                return frozenset()
+            selectors = set()
+            for value in _assigned_event_values(
+                binding_events_by_name[scope.name], expression, cutoff
+            ):
+                selectors.update(
+                    parameter_selectors(
+                        value, scope, cutoff, seen | {path}
                     )
                 )
-            return frozenset(indexes)
+            return frozenset(selectors)
 
         def argument_states(
             expression: ast.AST,
             scope_name: str,
+            cutoff: tuple[int, int, int] = infinity,
             seen: frozenset[str] = frozenset(),
         ) -> frozenset[str]:
-            rendered = _static_string(
-                expression, constants_by_name[scope_name]
-            )
+            rendered = rendered_expression(expression, scope_name, cutoff)
             if rendered in _PRESENCE_STATES:
                 return frozenset({rendered})
             if isinstance(expression, ast.Attribute):
@@ -1595,17 +2109,14 @@ def _presence_writer_details(
             path = _expression_alias_key(expression)
             if path is not None and path not in seen:
                 states = set()
-                for visible in _visible_scope_names(
-                    scope_name, known_scopes
+                for value in visible_assigned_values(
+                    expression, scope_name, cutoff
                 ):
-                    for value in _assigned_expression_values(
-                        assignments_by_name[visible], expression
-                    ):
-                        states.update(
-                            argument_states(
-                                value, scope_name, seen | {path}
-                            )
+                    states.update(
+                        argument_states(
+                            value, scope_name, cutoff, seen | {path}
                         )
+                    )
                 if states:
                     return frozenset(states)
             children: tuple[ast.AST, ...] = ()
@@ -1620,36 +2131,34 @@ def _presence_writer_details(
             return frozenset(
                 state
                 for child in children
-                for state in argument_states(child, scope_name, seen)
-            )
-
-        def visible_assigned_values(
-            expression: ast.AST,
-            scope_name: str,
-        ) -> tuple[ast.AST, ...]:
-            return tuple(
-                value
-                for visible in _visible_scope_names(scope_name, known_scopes)
-                for value in _assigned_expression_values(
-                    assignments_by_name[visible], expression
+                for state in argument_states(
+                    child, scope_name, cutoff, seen
                 )
             )
 
-        sink_parameters: dict[str, set[int]] = {
+        sink_parameters: dict[str, set[_ParameterSelector]] = {
             scope.name: set() for scope in scopes
         }
         writer_names = set()
         for scope in scopes:
-            for _call, expression in _sql_expression_calls(
-                nodes_by_name[scope.name]
+            for sql_call, expression in _sql_expression_calls(
+                nodes_by_name[scope.name],
+                lambda item, cutoff, scope_name=scope.name: (
+                    visible_assigned_values(item, scope_name, cutoff)
+                ),
             ):
-                rendered = _static_string(
-                    expression, constants_by_name[scope.name]
+                cutoff = (
+                    sql_call.lineno,
+                    sql_call.col_offset,
+                    infinity[2],
+                )
+                rendered = rendered_expression(
+                    expression, scope.name, cutoff
                 )
                 if rendered is not None and writes_sql(rendered):
                     writer_names.add(scope.name)
                 sink_parameters[scope.name].update(
-                    parameter_indexes(expression, scope)
+                    parameter_selectors(expression, scope, cutoff)
                 )
 
         edges: list[tuple[str, _ResolvedCallable, ast.Call]] = []
@@ -1657,7 +2166,10 @@ def _presence_writer_details(
             for node in nodes_by_name[scope.name]:
                 if not isinstance(node, ast.Call):
                     continue
-                resolved_targets = callable_targets(node.func, scope.name)
+                cutoff = (node.lineno, node.col_offset, infinity[2])
+                resolved_targets = callable_targets(
+                    node.func, scope.name, cutoff
+                )
                 for target in resolved_targets:
                     edges.append((scope.name, target, node))
                 arguments = (
@@ -1665,22 +2177,23 @@ def _presence_writer_details(
                     *(keyword.value for keyword in node.keywords),
                 )
                 rendered_arguments = tuple(
-                    _static_string(
-                        argument, constants_by_name[scope.name]
-                    )
+                    rendered_expression(argument, scope.name, cutoff)
                     for argument in arguments
                 )
-                if any(
-                    rendered is not None
-                    and writes_sql(rendered)
-                    for rendered in rendered_arguments
+                if (
+                    not resolved_targets
+                    and id(node) not in sql_call_ids_by_name[scope.name]
+                    and any(
+                        rendered is not None and writes_sql(rendered)
+                        for rendered in rendered_arguments
+                    )
                 ):
                     writer_names.add(scope.name)
                 elif (
                     not resolved_targets
                     and id(node) not in sql_call_ids_by_name[scope.name]
                     and any(
-                        argument_states(argument, scope.name)
+                        argument_states(argument, scope.name, cutoff)
                         for argument in arguments
                     )
                 ):
@@ -1693,31 +2206,45 @@ def _presence_writer_details(
                 callee_name = resolved.name
                 caller = scopes_by_name[caller_name]
                 callee = scopes_by_name[callee_name]
-                for index in tuple(sink_parameters[callee_name]):
-                    expressions = _call_argument_values(
+                cutoff = (call.lineno, call.col_offset, infinity[2])
+                for selector in tuple(sink_parameters[callee_name]):
+                    expressions = _call_selector_values(
                         call,
                         callee,
-                        index,
+                        selector,
                         resolved.bound_offset,
                         lambda expression: visible_assigned_values(
-                            expression, caller_name
+                            expression, caller_name, cutoff
                         ),
                     )
                     for expression in expressions:
-                        propagated = parameter_indexes(expression, caller)
+                        propagated = parameter_selectors(
+                            expression, caller, cutoff
+                        )
                         if not propagated <= sink_parameters[caller_name]:
                             sink_parameters[caller_name].update(propagated)
                             changed = True
 
         for scope in scopes:
-            for index in sink_parameters[scope.name]:
-                parameter = scope.positional_parameters[index]
+            for selector in sink_parameters[scope.name]:
+                parameter = scope.positional_parameters[selector.index]
                 default = scope.default_for(parameter)
+                selected_defaults = (
+                    ()
+                    if default is None
+                    else _select_ast_values(
+                        (default,),
+                        selector.path,
+                        lambda expression: visible_assigned_values(
+                            expression, scope.name, infinity
+                        ),
+                    )
+                )
                 rendered = (
                     None
-                    if default is None
-                    else _static_string(
-                        default, constants_by_name[scope.name]
+                    if len(selected_defaults) != 1
+                    else rendered_expression(
+                        selected_defaults[0], scope.name, infinity
                     )
                 )
                 if rendered is not None and writes_sql(rendered):
@@ -1727,19 +2254,20 @@ def _presence_writer_details(
         for caller_name, resolved, call in edges:
             callee_name = resolved.name
             callee = scopes_by_name[callee_name]
-            for index in sink_parameters[callee_name]:
-                expressions = _call_argument_values(
+            cutoff = (call.lineno, call.col_offset, infinity[2])
+            for selector in sink_parameters[callee_name]:
+                expressions = _call_selector_values(
                     call,
                     callee,
-                    index,
+                    selector,
                     resolved.bound_offset,
                     lambda expression: visible_assigned_values(
-                        expression, caller_name
+                        expression, caller_name, cutoff
                     ),
                 )
                 if any(
-                    (rendered := _static_string(
-                        expression, constants_by_name[caller_name]
+                    (rendered := rendered_expression(
+                        expression, caller_name, cutoff
                     ))
                     is not None
                     and writes_sql(rendered)
@@ -1757,18 +2285,19 @@ def _presence_writer_details(
                     continue
                 caller = scopes_by_name[caller_name]
                 callee = scopes_by_name[callee_name]
-                for index in sink_parameters[callee_name]:
-                    expressions = _call_argument_values(
+                cutoff = (call.lineno, call.col_offset, infinity[2])
+                for selector in sink_parameters[callee_name]:
+                    expressions = _call_selector_values(
                         call,
                         callee,
-                        index,
+                        selector,
                         resolved.bound_offset,
                         lambda expression: visible_assigned_values(
-                            expression, caller_name
+                            expression, caller_name, cutoff
                         ),
                     )
                     if not any(
-                        parameter_indexes(expression, caller)
+                        parameter_selectors(expression, caller, cutoff)
                         & sink_parameters[caller_name]
                         for expression in expressions
                     ):
@@ -1844,187 +2373,1388 @@ def presence_decision_state_violations(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ReviewValue:
+    kind: str
+    name: str = ""
+    detail: str = ""
+    selector: tuple[str | int, ...] = ()
+    members: tuple[tuple[str, "_ReviewValue"], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewBindingEvent:
+    key: str
+    position: tuple[int, int, int]
+    kind: str
+    node: ast.AST
+    target: str = ""
+    branches: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewFormal:
+    scope: str
+    parameter: str
+    selector: tuple[str | int, ...] = ()
+
+
+class _ReviewResolver:
+    _INFINITY = (10**9, 10**9, 10**9)
+    _FACTORIES = frozenset(
+        {
+            "classmethod",
+            "dict",
+            "getattr",
+            "list",
+            "property",
+            "setattr",
+            "staticmethod",
+            "tuple",
+            "vars",
+        }
+    )
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
+        self.parents_by_node = {
+            id(child): parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        self.scopes = _executable_scopes(tree)
+        self.scopes_by_name = {
+            scope.name: scope for scope in self.scopes
+        }
+        self.function_scopes_by_node = {
+            id(scope.node): scope
+            for scope in self.scopes
+            if isinstance(
+                scope.node,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+            )
+        }
+        self.class_scopes_by_node = {
+            id(scope.node): scope
+            for scope in self.scopes
+            if isinstance(scope.node, ast.ClassDef)
+        }
+        self.classes = {
+            scope.class_owner or "": scope
+            for scope in self.scopes
+            if isinstance(scope.node, ast.ClassDef)
+        }
+        self.class_names_by_short: dict[str, list[str]] = {}
+        for name in self.classes:
+            self.class_names_by_short.setdefault(
+                name.rsplit(".", 1)[-1], []
+            ).append(name)
+        self.parents: dict[str, str | None] = {"<module>": None}
+        self.events: dict[str, list[_ReviewBindingEvent]] = {
+            scope.name: [] for scope in self.scopes
+        }
+        self.local_names: dict[str, set[str]] = {
+            scope.name: set(scope.positional_parameters)
+            for scope in self.scopes
+        }
+        self._pending_setattrs: list[tuple[str, ast.Call]] = []
+        self._event_ordinal = 0
+        self._record_definitions(tree, "<module>")
+        self._record_bindings()
+        self._record_setattr_bindings()
+        for events in self.events.values():
+            events.sort(key=lambda event: event.position)
+
+    def _position(self, node: ast.AST) -> tuple[int, int, int]:
+        self._event_ordinal += 1
+        return (
+            getattr(node, "lineno", 0),
+            getattr(node, "col_offset", 0),
+            self._event_ordinal,
+        )
+
+    def _add_event(
+        self,
+        scope: str,
+        key: str,
+        kind: str,
+        node: ast.AST,
+        target: str = "",
+    ) -> None:
+        self.events[scope].append(
+            _ReviewBindingEvent(
+                key,
+                self._position(node),
+                kind,
+                node,
+                target,
+                self._branch_path(node),
+            )
+        )
+        self.local_names[scope].add(key)
+
+    def _branch_path(
+        self, node: ast.AST
+    ) -> tuple[tuple[int, str], ...]:
+        branches = []
+        child = node
+        parent = self.parents_by_node.get(id(child))
+        while parent is not None:
+            if isinstance(parent, ast.If):
+                arm = "body" if child in parent.body else "else"
+                branches.append((id(parent), arm))
+            child = parent
+            parent = self.parents_by_node.get(id(child))
+        return tuple(reversed(branches))
+
+    def _record_definitions(self, node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                class_scope = self.class_scopes_by_node[id(child)]
+                self._add_event(
+                    owner,
+                    child.name,
+                    "class",
+                    child,
+                    class_scope.class_owner or child.name,
+                )
+                self.parents[class_scope.name] = owner
+                self._record_definitions(child, class_scope.name)
+            elif isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                function_scope = self.function_scopes_by_node[id(child)]
+                self._add_event(
+                    owner,
+                    child.name,
+                    "function",
+                    child,
+                    function_scope.name,
+                )
+                self.parents[function_scope.name] = owner
+                self._record_definitions(child, function_scope.name)
+            elif isinstance(child, ast.Lambda):
+                function_scope = self.function_scopes_by_node[id(child)]
+                self.parents[function_scope.name] = owner
+                self._record_definitions(child, function_scope.name)
+            else:
+                self._record_definitions(child, owner)
+
+    def _record_bindings(self) -> None:
+        for scope in self.scopes:
+            for node in _scope_nodes(scope.node):
+                if isinstance(
+                    node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+                ):
+                    value = node.value
+                    if value is None:
+                        continue
+                    targets = (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else (node.target,)
+                    )
+                    for target in targets:
+                        key = _expression_alias_key(target)
+                        if key is not None:
+                            self._add_event(
+                                scope.name, key, "assignment", value
+                            )
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self._add_event(
+                            scope.name,
+                            alias.asname or alias.name.split(".", 1)[0],
+                            "import",
+                            node,
+                            alias.name,
+                        )
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    for alias in node.names:
+                        self._add_event(
+                            scope.name,
+                            alias.asname or alias.name,
+                            "from_import",
+                            node,
+                            f"{module}:{alias.name}",
+                        )
+                elif (
+                    isinstance(node, ast.Call)
+                    and len(node.args) >= 3
+                    and isinstance(node.args[1], ast.Constant)
+                    and type(node.args[1].value) is str
+                ):
+                    self._pending_setattrs.append((scope.name, node))
+
+    @staticmethod
+    def _is_setattr_syntax(expression: ast.AST) -> bool:
+        return (
+            isinstance(expression, ast.Name)
+            and expression.id == "setattr"
+        ) or (
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "builtins"
+            and expression.attr == "setattr"
+        )
+
+    def _is_builtin_setattr(
+        self,
+        expression: ast.AST,
+        scope: str,
+        cutoff: tuple[int, int, int],
+        seen: frozenset[str] = frozenset(),
+    ) -> bool:
+        if isinstance(expression, ast.Attribute):
+            return (
+                isinstance(expression.value, ast.Name)
+                and expression.value.id == "builtins"
+                and expression.attr == "setattr"
+            )
+        if not isinstance(expression, ast.Name) or expression.id in seen:
+            return False
+        events = self._matching_events(scope, expression.id, cutoff)
+        if events:
+            return any(
+                event.kind == "from_import"
+                and event.target == "builtins:setattr"
+                or event.kind == "assignment"
+                and self._is_builtin_setattr(
+                    event.node,
+                    scope,
+                    event.position,
+                    seen | {expression.id},
+                )
+                for event in events
+            )
+        if expression.id == "setattr":
+            return scope == "<module>" or expression.id not in self.local_names[
+                scope
+            ]
+        outer = self._outer_lookup(scope)
+        return (
+            outer is not None
+            and self._is_builtin_setattr(
+                expression, outer[0], outer[1], seen | {expression.id}
+            )
+        )
+
+    def _record_setattr_bindings(self) -> None:
+        for scope, call in self._pending_setattrs:
+            cutoff = (
+                call.lineno,
+                call.col_offset,
+                self._INFINITY[2],
+            )
+            if not self._is_builtin_setattr(call.func, scope, cutoff):
+                continue
+            owner = _expression_alias_key(call.args[0])
+            if owner is None:
+                continue
+            assert isinstance(call.args[1], ast.Constant)
+            self._add_event(
+                scope,
+                f"{owner}.{call.args[1].value}",
+                "assignment",
+                call.args[2],
+            )
+
+    @staticmethod
+    def _mutually_exclusive(
+        left: _ReviewBindingEvent,
+        right: _ReviewBindingEvent,
+    ) -> bool:
+        right_branches = dict(right.branches)
+        return any(
+            branch_id in right_branches
+            and right_branches[branch_id] != arm
+            for branch_id, arm in left.branches
+        )
+
+    def _matching_events(
+        self,
+        scope: str,
+        key: str,
+        cutoff: tuple[int, int, int],
+    ) -> tuple[_ReviewBindingEvent, ...]:
+        candidates = sorted(
+            (
+                event
+                for event in self.events[scope]
+                if event.position < cutoff
+                and _alias_keys_overlap(event.key, key)
+            ),
+            key=lambda event: event.position,
+            reverse=True,
+        )
+        if not candidates:
+            return ()
+        selected = [candidates[0]]
+        selected.extend(
+            candidate
+            for candidate in candidates[1:]
+            if any(
+                self._mutually_exclusive(candidate, current)
+                for current in selected
+            )
+        )
+        return tuple(selected)
+
+    def _matching_event(
+        self,
+        scope: str,
+        key: str,
+        cutoff: tuple[int, int, int],
+    ) -> _ReviewBindingEvent | None:
+        return next(iter(self._matching_events(scope, key, cutoff)), None)
+
+    def _outer_lookup(
+        self,
+        scope: str,
+    ) -> tuple[str, tuple[int, int, int]] | None:
+        parent = self.parents.get(scope)
+        if parent is None:
+            return None
+        current = self.scopes_by_name[scope]
+        if parent.endswith(".<body>") and current.method_kind in {
+            "instance",
+            "class",
+            "static",
+        }:
+            parent = self.parents.get(parent)
+            if parent is None:
+                return None
+        if scope.endswith(".<body>"):
+            return (
+                parent,
+                (
+                    getattr(current.node, "lineno", 0),
+                    getattr(current.node, "col_offset", 0),
+                    self._INFINITY[2],
+                ),
+            )
+        return parent, self._INFINITY
+
+    def _event_values(
+        self,
+        event: _ReviewBindingEvent,
+        scope: str,
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        if event.kind == "assignment":
+            return self.evaluate(
+                event.node,
+                scope,
+                event.position,
+                environment,
+                seen,
+            )
+        if event.kind == "class":
+            return (_ReviewValue("class", event.target),)
+        if event.kind == "function":
+            value = _ReviewValue("function", event.target, "0")
+            function = event.node
+            if not isinstance(
+                function, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                return (value,)
+            values = (value,)
+            for decorator in reversed(function.decorator_list):
+                factories = self.evaluate(
+                    decorator,
+                    scope,
+                    event.position,
+                    environment,
+                    seen,
+                )
+                wrapped = []
+                for factory in factories:
+                    if factory.kind == "factory" and factory.name in {
+                        "classmethod",
+                        "property",
+                        "staticmethod",
+                    }:
+                        wrapped.extend(
+                            _ReviewValue(
+                                "descriptor",
+                                factory.name,
+                                members=(("wrapped", item),),
+                            )
+                            for item in values
+                        )
+                if wrapped:
+                    values = tuple(wrapped)
+            return values
+        if event.kind == "import":
+            if event.target in {"builtins", "functools"}:
+                return (_ReviewValue("module", event.target),)
+            return (_ReviewValue("unknown", event.target),)
+        if event.kind == "from_import":
+            module, symbol = event.target.split(":", 1)
+            if module == "builtins" and symbol in self._FACTORIES:
+                return (_ReviewValue("factory", symbol),)
+            if module == "functools" and symbol == "partial":
+                return (_ReviewValue("factory", "partial"),)
+            if symbol == "add_review_and_decision":
+                return (_ReviewValue("writer"),)
+            return (_ReviewValue("unknown", event.target),)
+        return ()
+
+    def _default_values(
+        self,
+        scope: _ExecutableScope,
+        parameter: str,
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        default = scope.default_for(parameter)
+        if default is None:
+            return ()
+        parent = self.parents.get(scope.name) or "<module>"
+        cutoff = (
+            getattr(scope.node, "lineno", 0),
+            getattr(scope.node, "col_offset", 0),
+            self._INFINITY[2],
+        )
+        return self.evaluate(default, parent, cutoff, {}, seen)
+
+    def _lookup_name(
+        self,
+        name: str,
+        scope_name: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        if name in environment:
+            return environment[name]
+        scope = self.scopes_by_name[scope_name]
+        events = self._matching_events(scope_name, name, cutoff)
+        if events:
+            values = tuple(
+                dict.fromkeys(
+                    value
+                    for event in events
+                    for key in [(scope_name, name, event.position)]
+                    if key not in seen
+                    for value in self._event_values(
+                        event, scope_name, environment, seen | {key}
+                    )
+                )
+            )
+            if values and all(value.kind == "instance" for value in values):
+                values = tuple(
+                    _ReviewValue(
+                        value.kind,
+                        value.name,
+                        name,
+                        value.selector,
+                        value.members,
+                    )
+                    for value in values
+                )
+            return values
+        if name in scope.positional_parameters:
+            index = scope.positional_parameters.index(name)
+            values: tuple[_ReviewValue, ...] = (
+                _ReviewValue("parameter", f"{scope_name}:{name}"),
+            )
+            if (
+                index == 0
+                and scope.class_owner is not None
+                and scope.method_kind in {"instance", "class"}
+            ):
+                receiver_kind = (
+                    "instance"
+                    if scope.method_kind == "instance"
+                    else "class"
+                )
+                values = (
+                    _ReviewValue(receiver_kind, scope.class_owner, name),
+                    *values,
+                )
+            return tuple(
+                dict.fromkeys(
+                    (*values, *self._default_values(scope, name, seen))
+                )
+            )
+        if (
+            scope_name != "<module>"
+            and name in self.local_names[scope_name]
+        ):
+            return (_ReviewValue("unknown", name),)
+        outer = self._outer_lookup(scope_name)
+        if outer is not None:
+            return self._lookup_name(
+                name, outer[0], outer[1], environment, seen
+            )
+        if name in self._FACTORIES:
+            return (_ReviewValue("factory", name),)
+        if name == "partial":
+            return (_ReviewValue("unknown", name),)
+        return (_ReviewValue("unknown", name),)
+
+    @staticmethod
+    def _literal_key(expression: ast.AST) -> str | int | None:
+        if (
+            isinstance(expression, ast.Constant)
+            and type(expression.value) in {str, int}
+        ):
+            return expression.value
+        return None
+
+    @staticmethod
+    def _container(
+        kind: str,
+        entries: Iterable[tuple[str | int, _ReviewValue]],
+    ) -> _ReviewValue:
+        return _ReviewValue(
+            kind,
+            members=tuple((str(key), value) for key, value in entries),
+        )
+
+    @staticmethod
+    def _select_values(
+        values: Iterable[_ReviewValue],
+        selector: tuple[str | int, ...],
+    ) -> tuple[_ReviewValue, ...]:
+        selected = tuple(values)
+        for key in selector:
+            next_values = []
+            rendered = str(key)
+            for value in selected:
+                if value.kind == "parameter":
+                    next_values.append(
+                        _ReviewValue(
+                            "parameter",
+                            value.name,
+                            value.detail,
+                            (*value.selector, key),
+                        )
+                    )
+                elif value.kind in {"mapping", "sequence"}:
+                    next_values.extend(
+                        item
+                        for item_key, item in value.members
+                        if item_key == rendered
+                    )
+            selected = tuple(dict.fromkeys(next_values))
+        return selected
+
+    def _class_name(self, expression: ast.AST) -> str | None:
+        path = _expression_alias_key(expression)
+        if path in self.classes:
+            return path
+        if path is None:
+            return None
+        candidates = self.class_names_by_short.get(path, ())
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _base_names(self, class_name: str) -> tuple[str, ...]:
+        scope = self.classes[class_name]
+        assert isinstance(scope.node, ast.ClassDef)
+        names = []
+        for base in scope.node.bases:
+            resolved = self._class_name(base)
+            if resolved is not None:
+                names.append(resolved)
+        return tuple(names)
+
+    def _mro(
+        self,
+        class_name: str,
+        seen: frozenset[str] = frozenset(),
+    ) -> tuple[str, ...]:
+        if class_name in seen:
+            return (class_name,)
+        bases = self._base_names(class_name)
+        sequences = [
+            list(self._mro(base, seen | {class_name})) for base in bases
+        ]
+        sequences.append(list(bases))
+        result = [class_name]
+        while any(sequences):
+            sequences = [sequence for sequence in sequences if sequence]
+            candidate = next(
+                (
+                    sequence[0]
+                    for sequence in sequences
+                    if all(
+                        sequence[0] not in other[1:]
+                        for other in sequences
+                    )
+                ),
+                None,
+            )
+            if candidate is None:
+                result.extend(
+                    item
+                    for sequence in sequences
+                    for item in sequence
+                    if item not in result
+                )
+                break
+            result.append(candidate)
+            for sequence in sequences:
+                if sequence and sequence[0] == candidate:
+                    sequence.pop(0)
+        return tuple(dict.fromkeys(result))
+
+    def _raw_class_member(
+        self,
+        class_name: str,
+        member: str,
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        short = class_name.rsplit(".", 1)[-1]
+        parent = self.parents.get(self.classes[class_name].name)
+        if parent is not None:
+            event = self._matching_event(
+                parent, f"{short}.{member}", self._INFINITY
+            )
+            if event is not None:
+                return self._event_values(event, parent, {}, seen)
+        class_scope = self.classes[class_name]
+        event = self._matching_event(
+            class_scope.name, member, self._INFINITY
+        )
+        if event is None:
+            return ()
+        return self._event_values(event, class_scope.name, {}, seen)
+
+    def _effective_raw_member(
+        self,
+        class_name: str,
+        member: str,
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        for owner in self._mro(class_name):
+            values = self._raw_class_member(owner, member, seen)
+            if values:
+                return values
+        return ()
+
+    def _instance_member(
+        self,
+        value: _ReviewValue,
+        member: str,
+        scope_name: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        raw = self._effective_raw_member(value.name, member, seen)
+        properties = tuple(
+            item
+            for item in raw
+            if item.kind == "descriptor" and item.name == "property"
+        )
+        if properties:
+            return tuple(
+                returned
+                for descriptor in properties
+                for _key, getter in descriptor.members
+                for returned in self._function_returns(
+                    getter, (), scope_name, cutoff, environment, seen
+                )
+            )
+        if value.detail:
+            event = self._matching_event(
+                scope_name, f"{value.detail}.{member}", cutoff
+            )
+            if event is None and scope_name != "<module>":
+                event = self._matching_event(
+                    "<module>",
+                    f"{value.detail}.{member}",
+                    self._INFINITY,
+                )
+            if event is not None:
+                return self._event_values(
+                    event,
+                    scope_name if event in self.events[scope_name] else "<module>",
+                    environment,
+                    seen,
+                )
+        for owner in self._mro(value.name):
+            init = self._raw_class_member(owner, "__init__", seen)
+            for function in init:
+                if function.kind != "function":
+                    continue
+                init_scope = self.scopes_by_name[function.name]
+                if not init_scope.positional_parameters:
+                    continue
+                receiver = init_scope.positional_parameters[0]
+                event = self._matching_event(
+                    init_scope.name,
+                    f"{receiver}.{member}",
+                    self._INFINITY,
+                )
+                if event is not None:
+                    return self._event_values(
+                        event, init_scope.name, {}, seen
+                    )
+            if init:
+                break
+        return self._bind_descriptor(raw, instance=True)
+
+    @staticmethod
+    def _bind_descriptor(
+        values: Iterable[_ReviewValue],
+        *,
+        instance: bool,
+    ) -> tuple[_ReviewValue, ...]:
+        bound = []
+        for value in values:
+            if value.kind != "descriptor":
+                if value.kind == "function" and instance:
+                    bound.append(
+                        _ReviewValue("function", value.name, "1")
+                    )
+                else:
+                    bound.append(value)
+                continue
+            wrapped = tuple(item for _key, item in value.members)
+            if value.name == "property":
+                bound.append(value)
+            elif value.name == "classmethod":
+                bound.extend(
+                    _ReviewValue(
+                        item.kind,
+                        item.name,
+                        "1" if item.kind == "function" else item.detail,
+                        item.selector,
+                        item.members,
+                    )
+                    for item in wrapped
+                )
+            else:
+                bound.extend(wrapped)
+        return tuple(dict.fromkeys(bound))
+
+    def _attribute_values(
+        self,
+        receivers: tuple[_ReviewValue, ...],
+        attribute: str,
+        scope_name: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        values = []
+        for receiver in receivers:
+            if receiver.kind == "module":
+                if receiver.name == "builtins" and attribute in self._FACTORIES:
+                    values.append(_ReviewValue("factory", attribute))
+                elif receiver.name == "functools" and attribute == "partial":
+                    values.append(_ReviewValue("factory", "partial"))
+                else:
+                    values.append(
+                        _ReviewValue(
+                            "unknown", f"{receiver.name}.{attribute}"
+                        )
+                    )
+            elif receiver.kind == "instance":
+                member_values = self._instance_member(
+                    receiver,
+                    attribute,
+                    scope_name,
+                    cutoff,
+                    environment,
+                    seen,
+                )
+                if member_values:
+                    values.extend(member_values)
+                elif attribute == "add_review_and_decision":
+                    values.append(_ReviewValue("writer"))
+            elif receiver.kind == "class":
+                if attribute == "__dict__":
+                    values.append(_ReviewValue("classdict", receiver.name))
+                else:
+                    raw = self._effective_raw_member(
+                        receiver.name, attribute, seen
+                    )
+                    if raw:
+                        values.extend(
+                            self._bind_descriptor(raw, instance=False)
+                        )
+                    elif attribute == "add_review_and_decision":
+                        values.append(_ReviewValue("writer"))
+            elif receiver.kind == "classdict" and attribute == "get":
+                values.append(
+                    _ReviewValue("classdict_get", receiver.name)
+                )
+            elif receiver.kind == "descriptor":
+                if attribute == "__get__":
+                    values.append(
+                        _ReviewValue(
+                            "descriptor_get",
+                            receiver.name,
+                            members=receiver.members,
+                        )
+                    )
+                elif attribute in {"__func__", "__call__"}:
+                    values.extend(item for _key, item in receiver.members)
+            elif attribute == "__call__":
+                values.append(receiver)
+            elif attribute == "add_review_and_decision":
+                values.append(_ReviewValue("writer"))
+            else:
+                values.append(
+                    _ReviewValue(
+                        "unknown", f"{receiver.name}.{attribute}"
+                    )
+                )
+        return tuple(dict.fromkeys(values))
+
+    def _mapping_values(
+        self,
+        expression: ast.AST,
+        scope_name: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        entries: list[tuple[str, _ReviewValue]] = []
+
+        def merge(additions: Iterable[tuple[str, _ReviewValue]]) -> None:
+            additions = tuple(additions)
+            keys = {key for key, _value in additions}
+            entries[:] = [
+                item for item in entries if item[0] not in keys
+            ]
+            entries.extend(additions)
+
+        if isinstance(expression, ast.Dict):
+            for key_node, value in zip(
+                expression.keys, expression.values, strict=True
+            ):
+                if key_node is None:
+                    for mapping in self.evaluate(
+                        value, scope_name, cutoff, environment, seen
+                    ):
+                        if mapping.kind == "mapping":
+                            merge(mapping.members)
+                else:
+                    key = self._literal_key(key_node)
+                    if type(key) is str:
+                        merge(
+                            (str(key), item)
+                            for item in self.evaluate(
+                                value,
+                                scope_name,
+                                cutoff,
+                                environment,
+                                seen,
+                            )
+                        )
+            return (self._container("mapping", entries),)
+        if isinstance(expression, ast.BinOp) and isinstance(
+            expression.op, ast.BitOr
+        ):
+            for side in (expression.left, expression.right):
+                for mapping in self.evaluate(
+                    side, scope_name, cutoff, environment, seen
+                ):
+                    if mapping.kind == "mapping":
+                        merge(mapping.members)
+            return (self._container("mapping", entries),)
+        return ()
+
+    def _call_arguments(
+        self,
+        call: ast.Call,
+        callee: _ExecutableScope,
+        bound_offset: int,
+        caller_scope: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> dict[str, tuple[_ReviewValue, ...]]:
+        def assigned_values(expression: ast.AST) -> tuple[ast.AST, ...]:
+            key = _expression_alias_key(expression)
+            if key is None:
+                return ()
+            event = self._matching_event(caller_scope, key, cutoff)
+            if event is None or event.kind != "assignment":
+                return ()
+            return (event.node,)
+
+        arguments = {}
+        for index, parameter in enumerate(callee.positional_parameters):
+            expressions = _call_argument_values(
+                call,
+                callee,
+                index,
+                bound_offset,
+                assigned_values,
+            )
+            values = tuple(
+                value
+                for expression in expressions
+                for value in self.evaluate(
+                    expression,
+                    caller_scope,
+                    cutoff,
+                    environment,
+                    seen,
+                )
+            )
+            if values:
+                arguments[parameter] = tuple(dict.fromkeys(values))
+        return arguments
+
+    def _function_returns(
+        self,
+        function: _ReviewValue,
+        call_args: tuple[ast.Call, int] | tuple[()],
+        caller_scope: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        if function.kind != "function":
+            return ()
+        scope = self.scopes_by_name[function.name]
+        bound = int(function.detail or "0")
+        bound_environment = {}
+        if call_args:
+            bound_environment = self._call_arguments(
+                call_args[0],
+                scope,
+                call_args[1] + bound,
+                caller_scope,
+                cutoff,
+                environment,
+                seen,
+            )
+        return tuple(
+            value
+            for node in _scope_nodes(scope.node)
+            if isinstance(node, ast.Return) and node.value is not None
+            for value in self.evaluate(
+                node.value,
+                scope.name,
+                (
+                    node.lineno,
+                    node.col_offset,
+                    self._INFINITY[2],
+                ),
+                bound_environment,
+                seen,
+            )
+        )
+
+    def _call_values(
+        self,
+        expression: ast.Call,
+        scope_name: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]],
+        seen: frozenset[tuple[str, str, tuple[int, int, int]]],
+    ) -> tuple[_ReviewValue, ...]:
+        functions = self.evaluate(
+            expression.func, scope_name, cutoff, environment, seen
+        )
+        values = []
+        for function in functions:
+            if function.kind == "factory":
+                if function.name in {
+                    "classmethod",
+                    "property",
+                    "staticmethod",
+                } and expression.args:
+                    values.extend(
+                        _ReviewValue(
+                            "descriptor",
+                            function.name,
+                            members=(("wrapped", item),),
+                        )
+                        for item in self.evaluate(
+                            expression.args[0],
+                            scope_name,
+                            cutoff,
+                            environment,
+                            seen,
+                        )
+                    )
+                elif function.name == "partial" and expression.args:
+                    values.extend(
+                        self.evaluate(
+                            expression.args[0],
+                            scope_name,
+                            cutoff,
+                            environment,
+                            seen,
+                        )
+                    )
+                elif function.name == "dict":
+                    entries: list[tuple[str, _ReviewValue]] = []
+                    for argument in expression.args:
+                        for mapping in self.evaluate(
+                            argument,
+                            scope_name,
+                            cutoff,
+                            environment,
+                            seen,
+                        ):
+                            if mapping.kind == "mapping":
+                                keys = {
+                                    key for key, _value in mapping.members
+                                }
+                                entries = [
+                                    item
+                                    for item in entries
+                                    if item[0] not in keys
+                                ]
+                                entries.extend(mapping.members)
+                    for keyword in expression.keywords:
+                        if keyword.arg is None:
+                            continue
+                        entries = [
+                            item
+                            for item in entries
+                            if item[0] != keyword.arg
+                        ]
+                        entries.extend(
+                            (keyword.arg, item)
+                            for item in self.evaluate(
+                                keyword.value,
+                                scope_name,
+                                cutoff,
+                                environment,
+                                seen,
+                            )
+                        )
+                    values.append(self._container("mapping", entries))
+                elif function.name in {"list", "tuple"}:
+                    if expression.args:
+                        values.extend(
+                            self.evaluate(
+                                expression.args[0],
+                                scope_name,
+                                cutoff,
+                                environment,
+                                seen,
+                            )
+                        )
+                    else:
+                        values.append(self._container("sequence", ()))
+                elif function.name == "getattr" and len(expression.args) >= 2:
+                    attribute = self._literal_key(expression.args[1])
+                    if type(attribute) is str:
+                        receivers = self.evaluate(
+                            expression.args[0],
+                            scope_name,
+                            cutoff,
+                            environment,
+                            seen,
+                        )
+                        values.extend(
+                            self._attribute_values(
+                                receivers,
+                                attribute,
+                                scope_name,
+                                cutoff,
+                                environment,
+                                seen,
+                            )
+                        )
+                elif function.name == "vars" and expression.args:
+                    for item in self.evaluate(
+                        expression.args[0],
+                        scope_name,
+                        cutoff,
+                        environment,
+                        seen,
+                    ):
+                        if item.kind == "class":
+                            values.append(
+                                _ReviewValue("classdict", item.name)
+                            )
+            elif function.kind == "class":
+                values.append(_ReviewValue("instance", function.name))
+            elif function.kind == "function":
+                values.extend(
+                    self._function_returns(
+                        function,
+                        (expression, 0),
+                        scope_name,
+                        cutoff,
+                        environment,
+                        seen,
+                    )
+                )
+            elif function.kind == "classdict_get" and expression.args:
+                member = self._literal_key(expression.args[0])
+                if type(member) is str:
+                    values.extend(
+                        self._raw_class_member(function.name, member, seen)
+                    )
+            elif function.kind == "descriptor_get":
+                values.extend(item for _key, item in function.members)
+            else:
+                values.append(_ReviewValue("unknown", "call-result"))
+        return tuple(dict.fromkeys(values))
+
+    def evaluate(
+        self,
+        expression: ast.AST,
+        scope_name: str,
+        cutoff: tuple[int, int, int],
+        environment: dict[str, tuple[_ReviewValue, ...]] | None = None,
+        seen: frozenset[
+            tuple[str, str, tuple[int, int, int]]
+        ] = frozenset(),
+    ) -> tuple[_ReviewValue, ...]:
+        environment = environment or {}
+        if isinstance(expression, ast.Name):
+            return self._lookup_name(
+                expression.id, scope_name, cutoff, environment, seen
+            )
+        if isinstance(expression, ast.Constant):
+            if type(expression.value) in {str, int}:
+                return (
+                    _ReviewValue("literal", repr(expression.value)),
+                )
+            return (_ReviewValue("unknown", "literal"),)
+        if isinstance(expression, ast.Attribute):
+            receivers = self.evaluate(
+                expression.value,
+                scope_name,
+                cutoff,
+                environment,
+                seen,
+            )
+            return self._attribute_values(
+                receivers,
+                expression.attr,
+                scope_name,
+                cutoff,
+                environment,
+                seen,
+            )
+        if isinstance(expression, ast.Call):
+            return self._call_values(
+                expression, scope_name, cutoff, environment, seen
+            )
+        if isinstance(expression, (ast.Tuple, ast.List)):
+            entries = []
+            index = 0
+            for item in expression.elts:
+                if isinstance(item, ast.Starred):
+                    for sequence in self.evaluate(
+                        item.value,
+                        scope_name,
+                        cutoff,
+                        environment,
+                        seen,
+                    ):
+                        if sequence.kind != "sequence":
+                            continue
+                        for _key, value in sequence.members:
+                            entries.append((index, value))
+                            index += 1
+                else:
+                    for value in self.evaluate(
+                        item,
+                        scope_name,
+                        cutoff,
+                        environment,
+                        seen,
+                    ):
+                        entries.append((index, value))
+                    index += 1
+            return (self._container("sequence", entries),)
+        if isinstance(expression, (ast.Dict, ast.BinOp)):
+            mappings = self._mapping_values(
+                expression,
+                scope_name,
+                cutoff,
+                environment,
+                seen,
+            )
+            if mappings:
+                return mappings
+        if isinstance(expression, ast.Subscript):
+            path = _expression_alias_key(expression)
+            if path is not None:
+                event = self._matching_event(scope_name, path, cutoff)
+                if event is None and scope_name != "<module>":
+                    event = self._matching_event(
+                        "<module>", path, self._INFINITY
+                    )
+                if event is not None:
+                    owner = (
+                        scope_name
+                        if event in self.events[scope_name]
+                        else "<module>"
+                    )
+                    return self._event_values(
+                        event, owner, environment, seen
+                    )
+            keys = self.evaluate(
+                expression.slice,
+                scope_name,
+                cutoff,
+                environment,
+                seen,
+            )
+            selectors = tuple(
+                ast.literal_eval(value.name)
+                for value in keys
+                if value.kind == "literal"
+            )
+            containers = self.evaluate(
+                expression.value,
+                scope_name,
+                cutoff,
+                environment,
+                seen,
+            )
+            if any(
+                value.kind == "classdict" for value in containers
+            ):
+                return tuple(
+                    item
+                    for container in containers
+                    if container.kind == "classdict"
+                    for selector in selectors
+                    if type(selector) is str
+                    for item in self._raw_class_member(
+                        container.name, selector, seen
+                    )
+                )
+            return tuple(
+                dict.fromkeys(
+                    item
+                    for selector in selectors
+                    for item in self._select_values(
+                        containers, (selector,)
+                    )
+                )
+            )
+        return (_ReviewValue("unknown", type(expression).__name__),)
+
+    @staticmethod
+    def origins(
+        values: Iterable[_ReviewValue],
+    ) -> tuple[bool, frozenset[_ReviewFormal]]:
+        writer = False
+        formals = set()
+        for value in values:
+            if value.kind == "writer":
+                writer = True
+            elif value.kind == "parameter":
+                scope, parameter = value.name.rsplit(":", 1)
+                formals.add(
+                    _ReviewFormal(scope, parameter, value.selector)
+                )
+            elif value.kind == "descriptor":
+                nested_writer, nested_formals = _ReviewResolver.origins(
+                    item for _key, item in value.members
+                )
+                writer = writer or nested_writer
+                formals.update(nested_formals)
+        return writer, frozenset(formals)
+
+    def writer_scopes(self) -> frozenset[str]:
+        sinks: dict[str, set[_ReviewFormal]] = {
+            scope.name: set() for scope in self.scopes
+        }
+        writers = set()
+        edges: list[tuple[str, _ReviewValue, ast.Call]] = []
+        dependencies: set[tuple[str, str]] = set()
+        for scope in self.scopes:
+            for node in _scope_nodes(scope.node):
+                if not isinstance(node, ast.Call):
+                    continue
+                cutoff = (
+                    node.lineno,
+                    node.col_offset,
+                    self._INFINITY[2],
+                )
+                values = self.evaluate(
+                    node.func, scope.name, cutoff, {}
+                )
+                writer, formals = self.origins(values)
+                if writer:
+                    writers.add(scope.name)
+                sinks[scope.name].update(
+                    formal
+                    for formal in formals
+                    if formal.scope == scope.name
+                )
+                edges.extend(
+                    (scope.name, value, node)
+                    for value in values
+                    if value.kind == "function"
+                )
+        changed = True
+        while changed:
+            changed = False
+            for caller_name, function, call in edges:
+                callee = self.scopes_by_name[function.name]
+                cutoff = (
+                    call.lineno,
+                    call.col_offset,
+                    self._INFINITY[2],
+                )
+                for formal in tuple(sinks[callee.name]):
+                    if formal.parameter not in callee.positional_parameters:
+                        continue
+                    index = callee.positional_parameters.index(
+                        formal.parameter
+                    )
+                    arguments = self._call_arguments(
+                        call,
+                        callee,
+                        int(function.detail or "0"),
+                        caller_name,
+                        cutoff,
+                        {},
+                        frozenset(),
+                    ).get(formal.parameter, ())
+                    selected = self._select_values(
+                        arguments, formal.selector
+                    )
+                    writer, caller_formals = self.origins(selected)
+                    if writer:
+                        dependencies.add((caller_name, callee.name))
+                        before = len(writers)
+                        writers.update({caller_name, callee.name})
+                        changed = changed or len(writers) != before
+                    propagated = {
+                        item
+                        for item in caller_formals
+                        if item.scope == caller_name
+                    }
+                    if not propagated <= sinks[caller_name]:
+                        dependencies.add((caller_name, callee.name))
+                        sinks[caller_name].update(propagated)
+                        changed = True
+        changed = True
+        while changed:
+            changed = False
+            for caller_name, callee_name in dependencies:
+                if caller_name not in writers and callee_name not in writers:
+                    continue
+                before = len(writers)
+                writers.update({caller_name, callee_name})
+                changed = changed or len(writers) != before
+        return frozenset(writers)
+
+
 def review_writer_callers(
     files: Iterable[Path] = PRODUCTION_FILES,
 ) -> tuple[str, ...]:
     callers = []
     for path in files:
-        tree = _tree(path)
-        scopes = _executable_scopes(tree)
-        known_scopes = frozenset(scope.name for scope in scopes)
-        assignments = {
-            scope.name: _scope_binding_values(scope) for scope in scopes
-        }
-        class_scopes = tuple(
-            scope
-            for scope in scopes
-            if isinstance(scope.node, ast.ClassDef)
-            and scope.class_owner is not None
+        resolver = _ReviewResolver(_tree(path))
+        callers.extend(
+            f"{_relative(path)}:{scope}"
+            for scope in resolver.writer_scopes()
         )
-        classes_by_name = {
-            scope.class_owner or "": scope for scope in class_scopes
-        }
-
-        def class_derives_from(
-            derived: str,
-            target: str,
-            seen: frozenset[str] = frozenset(),
-        ) -> bool:
-            if derived == target or derived.rsplit(".", 1)[-1] == target:
-                return True
-            if derived in seen:
-                return False
-            class_scope = classes_by_name.get(derived)
-            if class_scope is None or not isinstance(
-                class_scope.node, ast.ClassDef
-            ):
-                return False
-            for base in class_scope.node.bases:
-                base_name = _expression_alias_key(base)
-                if base_name is None:
-                    continue
-                candidates = tuple(
-                    name
-                    for name in classes_by_name
-                    if name == base_name
-                    or name.rsplit(".", 1)[-1] == base_name
-                )
-                if any(
-                    class_derives_from(
-                        candidate, target, seen | {derived}
-                    )
-                    for candidate in candidates
-                ):
-                    return True
-            return False
-
-        imported_aliases = {
-            alias.asname or alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            for alias in node.names
-            if alias.name == "add_review_and_decision"
-        }
-
-        for scope in scopes:
-            nodes = _scope_nodes(scope.node)
-
-            def visible_values(expression: ast.AST) -> tuple[ast.AST, ...]:
-                return tuple(
-                    value
-                    for visible in _visible_scope_names(
-                        scope.name, known_scopes
-                    )
-                    for value in _assigned_expression_values(
-                        assignments[visible], expression
-                    )
-                )
-
-            def refers_to_class(
-                expression: ast.AST,
-                class_name: str,
-                seen: frozenset[str] = frozenset(),
-            ) -> bool:
-                path_key = _expression_alias_key(expression)
-                class_names = {class_name, class_name.rsplit(".", 1)[-1]}
-                if path_key in class_names:
-                    return True
-                receiver_names = set()
-                if (
-                    scope.class_owner is not None
-                    and class_derives_from(scope.class_owner, class_name)
-                    and scope.positional_parameters
-                    and scope.method_kind in {"instance", "class"}
-                ):
-                    receiver_names.add(scope.positional_parameters[0])
-                if path_key in receiver_names:
-                    return True
-                if isinstance(expression, ast.Call):
-                    return refers_to_class(
-                        expression.func, class_name, seen
-                    )
-                if path_key is None or path_key in seen:
-                    return False
-                return any(
-                    refers_to_class(value, class_name, seen | {path_key})
-                    for value in visible_values(expression)
-                )
-
-            def class_member_values(
-                expression: ast.AST,
-            ) -> tuple[ast.AST, ...]:
-                if not isinstance(expression, ast.Attribute):
-                    return ()
-                return tuple(
-                    value
-                    for class_scope in class_scopes
-                    if refers_to_class(
-                        expression.value, class_scope.class_owner or ""
-                    )
-                    for member_key in (
-                        expression.attr,
-                        f"{class_scope.class_owner}.{expression.attr}",
-                        f"{(class_scope.class_owner or '').rsplit('.', 1)[-1]}"
-                        f".{expression.attr}",
-                    )
-                    for visible in dict.fromkeys(
-                        (
-                            *_visible_scope_names(
-                                scope.name, known_scopes
-                            ),
-                            class_scope.name,
-                        )
-                    )
-                    for assigned_key, assigned in assignments[visible].items()
-                    if _alias_keys_overlap(member_key, assigned_key)
-                    for value in assigned
-                )
-
-            def is_writer(
-                expression: ast.AST,
-                seen: frozenset[str] = frozenset(),
-            ) -> bool:
-                if (
-                    isinstance(expression, ast.Attribute)
-                    and expression.attr == "add_review_and_decision"
-                ):
-                    return True
-                if (
-                    isinstance(expression, ast.Name)
-                    and expression.id in imported_aliases
-                ):
-                    return True
-                if (
-                    isinstance(expression, ast.Call)
-                    and isinstance(expression.func, ast.Name)
-                    and expression.func.id in {"classmethod", "staticmethod"}
-                    and expression.args
-                ):
-                    return is_writer(expression.args[0], seen)
-                path = _expression_alias_key(expression)
-                if path in seen:
-                    return False
-                resolved = [
-                    *class_member_values(expression),
-                    *_subscript_container_values(expression, visible_values),
-                ]
-                if path is not None:
-                    resolved.extend(visible_values(expression))
-                return any(
-                    is_writer(
-                        value,
-                        seen if path is None else seen | {path},
-                    )
-                    for value in resolved
-                )
-
-            calls_writer = any(
-                isinstance(node, ast.Call)
-                and is_writer(node.func)
-                for node in nodes
-            )
-            if calls_writer:
-                callers.append(f"{_relative(path)}:{scope.name}")
     return tuple(sorted(callers))
 
 
@@ -3515,6 +5245,419 @@ def test_raw_presence_writer_guard_accepts_executed_read_only_sql_sink_star(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "writers"),
+    (
+        (
+            "def execute_sql(conn, *sql_args):\n"
+            "    conn.execute(*sql_args)\n"
+            "def write(conn):\n"
+            "    sql_args = (\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n"
+            "    execute_sql(conn, *sql_args)\n",
+            ("execute_sql", "write"),
+        ),
+        (
+            "def write(conn):\n"
+            "    sinks = (conn.execute,)\n"
+            "    args = (\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n"
+            "    sinks[0](*args)\n",
+            ("write",),
+        ),
+        (
+            "def write(conn):\n"
+            "    sinks = {'write': conn.execute}\n"
+            "    args = (\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n"
+            "    sinks['write'](*args)\n",
+            ("write",),
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    conn.execute(statement, values)\n"
+            "def write(conn):\n"
+            "    left = {'conn': conn, 'statement': "
+            "            'INSERT INTO presence_decisions '"
+            "            '(candidate_id, state) VALUES (?, ?)'}\n"
+            "    right = {'values': (1, 'presence_confirmed')}\n"
+            "    kwargs = left | right\n"
+            "    execute_sql(**kwargs)\n",
+            ("execute_sql", "write"),
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    conn.execute(statement, values)\n"
+            "def write(conn):\n"
+            "    kwargs = dict({\n"
+            "        'conn': conn,\n"
+            "        'statement': 'INSERT INTO presence_decisions '"
+            "                     '(candidate_id, state) VALUES (?, ?)',\n"
+            "        'values': (1, 'presence_confirmed'),\n"
+            "    })\n"
+            "    execute_sql(**kwargs)\n",
+            ("execute_sql", "write"),
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_resolves_runtime_call_dataflow(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    writers: tuple[str, ...],
+) -> None:
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE presence_decisions "
+            "(candidate_id INTEGER, state TEXT)"
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<runtime-sql-mutation>", "exec"), namespace)
+        namespace["write"](conn)  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT candidate_id, state FROM presence_decisions"
+        ).fetchone() == (1, "presence_confirmed")
+    finally:
+        conn.close()
+
+    fake = Path("runtime-sql-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/runtime_sql.py"
+    )
+
+    expected = tuple(
+        f"workers/runtime_sql.py:{writer}" for writer in writers
+    )
+    assert presence_decision_writer_calls((fake,)) == expected
+    assert _presence_writer_details((fake,)) == {
+        writer: frozenset({"presence_confirmed"}) for writer in expected
+    }
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "def execute_sql(conn, *sql_args):\n"
+            "    return conn.execute(*sql_args).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    sql_args = ('SELECT ?', ('control',))\n"
+            "    return execute_sql(conn, *sql_args)\n"
+        ),
+        (
+            "def inspect(conn):\n"
+            "    sinks = (conn.execute,)\n"
+            "    args = ('SELECT ?', ('control',))\n"
+            "    return sinks[0](*args).fetchone()[0]\n"
+        ),
+        (
+            "def inspect(conn):\n"
+            "    sinks = {'read': conn.execute}\n"
+            "    args = ('SELECT ?', ('control',))\n"
+            "    return sinks['read'](*args).fetchone()[0]\n"
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    return conn.execute(statement, values).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    left = {'conn': conn, 'statement': 'SELECT ?'}\n"
+            "    right = {'values': ('control',)}\n"
+            "    kwargs = left | right\n"
+            "    return execute_sql(**kwargs)\n"
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    return conn.execute(statement, values).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    kwargs = dict({\n"
+            "        'conn': conn, 'statement': 'SELECT ?',\n"
+            "        'values': ('control',),\n"
+            "    })\n"
+            "    return execute_sql(**kwargs)\n"
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    return conn.execute(statement, values).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    left = {\n"
+            "        'conn': conn,\n"
+            "        'statement': 'INSERT INTO presence_decisions '"
+            "                     '(candidate_id, state) VALUES (?, ?)',\n"
+            "    }\n"
+            "    right = {\n"
+            "        'statement': 'SELECT ?', 'values': ('control',),\n"
+            "    }\n"
+            "    return execute_sql(**(left | right))\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_accepts_runtime_read_only_dataflow(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<runtime-sql-control>", "exec"), namespace)
+        assert namespace["inspect"](conn) == "control"  # type: ignore[operator]
+    finally:
+        conn.close()
+
+    fake = Path("runtime-sql-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/runtime_sql_control.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "writers"),
+    (
+        (
+            "def execute_sql(conn, prefix, *sql_args):\n"
+            "    conn.execute(sql_args[1], sql_args[2])\n"
+            "def write(conn):\n"
+            "    execute_sql(\n"
+            "        conn, 'prefix', 'unused',\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n",
+            ("execute_sql", "write"),
+        ),
+        (
+            "def execute_sql(conn, **sql_kwargs):\n"
+            "    conn.execute(\n"
+            "        sql_kwargs['statement'], sql_kwargs['values']\n"
+            "    )\n"
+            "def write(conn):\n"
+            "    execute_sql(\n"
+            "        conn,\n"
+            "        statement='INSERT INTO presence_decisions '"
+            "                  '(candidate_id, state) VALUES (?, ?)',\n"
+            "        values=(1, 'presence_confirmed'),\n"
+            "    )\n",
+            ("execute_sql", "write"),
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    conn.execute(statement, values)\n"
+            "def write(conn):\n"
+            "    kwargs = dict([\n"
+            "        ('conn', conn),\n"
+            "        ('statement', 'INSERT INTO presence_decisions '"
+            "                      '(candidate_id, state) VALUES (?, ?)'),\n"
+            "        ('values', (1, 'presence_confirmed')),\n"
+            "    ])\n"
+            "    execute_sql(**kwargs)\n",
+            ("execute_sql", "write"),
+        ),
+        (
+            "def write(conn):\n"
+            "    sinks = tuple((conn.execute,))\n"
+            "    sinks[0](\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n",
+            ("write",),
+        ),
+        (
+            "def write(conn):\n"
+            "    statement = 'SELECT ?'\n"
+            "    statement = 'INSERT INTO presence_decisions '"
+            "                '(candidate_id, state) VALUES (?, ?)'\n"
+            "    conn.execute(statement, (1, 'presence_confirmed'))\n",
+            ("write",),
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_tracks_precise_runtime_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    writers: tuple[str, ...],
+) -> None:
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE presence_decisions "
+            "(candidate_id INTEGER, state TEXT)"
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<selector-mutation>", "exec"), namespace)
+        namespace["write"](conn)  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT candidate_id, state FROM presence_decisions"
+        ).fetchall() == [(1, "presence_confirmed")]
+    finally:
+        conn.close()
+
+    fake = Path("selector-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/selectors.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == tuple(
+        f"workers/selectors.py:{writer}" for writer in writers
+    )
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "def execute_sql(conn, *sql_args):\n"
+            "    return conn.execute(\n"
+            "        sql_args[0], sql_args[1]\n"
+            "    ).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    return execute_sql(\n"
+            "        conn, 'SELECT ?', ('control',),\n"
+            "        'INSERT INTO presence_decisions DEFAULT VALUES',\n"
+            "    )\n"
+        ),
+        (
+            "def ignore(*args):\n"
+            "    return 'control'\n"
+            "def inspect(conn):\n"
+            "    sinks = (conn.execute,)\n"
+            "    sinks = (ignore,)\n"
+            "    return sinks[0](\n"
+            "        'INSERT INTO presence_decisions DEFAULT VALUES'\n"
+            "    )\n"
+        ),
+        (
+            "def dict(mapping):\n"
+            "    return {\n"
+            "        'conn': mapping['conn'],\n"
+            "        'statement': 'SELECT ?',\n"
+            "        'values': ('control',),\n"
+            "    }\n"
+            "def execute_sql(*, conn, statement, values):\n"
+            "    return conn.execute(statement, values).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    kwargs = dict({\n"
+            "        'conn': conn,\n"
+            "        'statement': 'INSERT INTO presence_decisions '"
+            "                     'DEFAULT VALUES',\n"
+            "    })\n"
+            "    return execute_sql(**kwargs)\n"
+        ),
+        (
+            "def inspect(conn):\n"
+            "    statement = 'INSERT INTO presence_decisions '"
+            "                'DEFAULT VALUES'\n"
+            "    statement = 'SELECT ?'\n"
+            "    return conn.execute(\n"
+            "        statement, ('control',)\n"
+            "    ).fetchone()[0]\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_ignores_unused_or_overridden_values(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE presence_decisions (id INTEGER)")
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<selector-control>", "exec"), namespace)
+        assert namespace["inspect"](conn) == "control"  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM presence_decisions"
+        ).fetchone() == (0,)
+    finally:
+        conn.close()
+
+    fake = Path("selector-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/selector_control.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "class Writer:\n"
+            "    @staticmethod\n"
+            "    def execute_sql(conn):\n"
+            "        conn.execute(\n"
+            "            'INSERT INTO presence_decisions DEFAULT VALUES'\n"
+            "        )\n"
+            "class Reader:\n"
+            "    @staticmethod\n"
+            "    def execute_sql(conn):\n"
+            "        return conn.execute('SELECT 1').fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    return Reader.execute_sql(conn)\n"
+        ),
+        (
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def execute_sql(conn):\n"
+            "        conn.execute(\n"
+            "            'INSERT INTO presence_decisions DEFAULT VALUES'\n"
+            "        )\n"
+            "class Reader(Base):\n"
+            "    @staticmethod\n"
+            "    def execute_sql(conn):\n"
+            "        return conn.execute('SELECT 1').fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    return Reader.execute_sql(conn)\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_respects_effective_helper_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE presence_decisions (id INTEGER)")
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<helper-receiver-control>", "exec"), namespace)
+        assert namespace["inspect"](conn) == 1  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM presence_decisions"
+        ).fetchone() == (0,)
+    finally:
+        conn.close()
+
+    fake = Path("helper-receiver-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/helper_receiver.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == (
+        "workers/helper_receiver.py:"
+        f"{'Writer' if 'class Writer' in control else 'Base'}.execute_sql",
+    )
+
+
+@pytest.mark.parametrize(
     "mutation",
     (
         "def execute_sql(conn, statement='SELECT 1'):\n"
@@ -3894,6 +6037,638 @@ def test_review_writer_guard_accepts_executed_nonwriter_alias_bindings(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "entrypoint", "writers"),
+    (
+        (
+            "def dispatch(writer, command):\n"
+            "    return writer(command)\n"
+            "def save(command):\n"
+            "    return dispatch(\n"
+            "        repository.add_review_and_decision, command\n"
+            "    )\n",
+            "save",
+            ("dispatch", "save"),
+        ),
+        (
+            "def dispatch(*, writer, command):\n"
+            "    return writer(command)\n"
+            "def save(command):\n"
+            "    return dispatch(\n"
+            "        writer=repository.add_review_and_decision,\n"
+            "        command=command,\n"
+            "    )\n",
+            "save",
+            ("dispatch", "save"),
+        ),
+        (
+            "sm = staticmethod\n"
+            "class Writer:\n"
+            "    writer = sm(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "import builtins\n"
+            "class Writer:\n"
+            "    writer = builtins.staticmethod(\n"
+            "        repository.add_review_and_decision\n"
+            "    )\n"
+            "def save(command):\n"
+            "    return Writer.writer(command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "from builtins import staticmethod as sm\n"
+            "class Writer:\n"
+            "    writer = sm(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    @property\n"
+            "    def writer(self):\n"
+            "        return repository.add_review_and_decision\n"
+            "    def save(self, command):\n"
+            "        return self.writer(command)\n"
+            "def run(command):\n"
+            "    return Writer().save(command)\n",
+            "run",
+            ("Writer.save",),
+        ),
+        (
+            "class Writer:\n"
+            "    def __init__(self):\n"
+            "        self.writer = repository.add_review_and_decision\n"
+            "    def save(self, command):\n"
+            "        return self.writer(command)\n"
+            "def run(command):\n"
+            "    return Writer().save(command)\n",
+            "run",
+            ("Writer.save",),
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "instance = Writer()\n"
+            "instance.writer = repository.add_review_and_decision\n"
+            "def save(command):\n"
+            "    return instance.writer(command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "setattr(\n"
+            "    Writer, 'writer',\n"
+            "    staticmethod(repository.add_review_and_decision),\n"
+            ")\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "instance = Writer()\n"
+            "setattr(\n"
+            "    instance, 'writer', repository.add_review_and_decision\n"
+            ")\n"
+            "def save(command):\n"
+            "    return instance.writer(command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "import functools\n"
+            "def save(command):\n"
+            "    writer = functools.partial(\n"
+            "        repository.add_review_and_decision, command\n"
+            "    )\n"
+            "    return writer()\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "def save(\n"
+            "    command,\n"
+            "    writers=dict(review=repository.add_review_and_decision),\n"
+            "):\n"
+            "    return writers['review'](command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "def save(\n"
+            "    command,\n"
+            "    writers=(*(repository.add_review_and_decision,),),\n"
+            "):\n"
+            "    return writers[0](command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return Writer.__dict__['writer'](command)\n",
+            "save",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    writer = classmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    descriptor = Writer.__dict__['writer']\n"
+            "    return descriptor.__func__(command)\n",
+            "save",
+            ("save",),
+        ),
+    ),
+)
+def test_review_writer_guard_resolves_runtime_callable_dataflow(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    entrypoint: str,
+    writers: tuple[str, ...],
+) -> None:
+    class Repository:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        def add_review_and_decision(self, command: str) -> str:
+            self.conn.execute(
+                "INSERT INTO review_effects(command) VALUES (?)", (command,)
+            )
+            return command
+
+        @staticmethod
+        def describe(command: str) -> str:
+            return f"control:{command}"
+
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE review_effects (command TEXT NOT NULL)")
+        namespace: dict[str, object] = {"repository": Repository(conn)}
+        exec(compile(tree, "<review-dataflow-mutation>", "exec"), namespace)
+        namespace[entrypoint]("confirm")  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT command FROM review_effects"
+        ).fetchall() == [("confirm",)]
+    finally:
+        conn.close()
+
+    fake = Path("review-dataflow-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_dataflow.py"
+    )
+
+    assert review_writer_callers((fake,)) == tuple(
+        f"workers/review_dataflow.py:{writer}" for writer in writers
+    )
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "class Audit:\n"
+            "    def add_review_and_decision(self, command):\n"
+            "        return repository.describe(command)\n"
+            "audit = Audit()\n"
+            "def run(command):\n"
+            "    return audit.add_review_and_decision(command)\n"
+        ),
+        (
+            "class Base:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "class Reader(Base):\n"
+            "    writer = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return Reader().writer(command)\n"
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "instance = Writer()\n"
+            "instance.writer = repository.describe\n"
+            "def run(command):\n"
+            "    return instance.writer(command)\n"
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "Writer.writer = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return Writer().writer(command)\n"
+        ),
+        (
+            "writer = repository.add_review_and_decision\n"
+            "writer = repository.describe\n"
+            "def run(command, callback=writer):\n"
+            "    return callback(command)\n"
+        ),
+        (
+            "import builtins\n"
+            "def staticmethod(callback):\n"
+            "    return builtins.staticmethod(repository.describe)\n"
+            "class Reader:\n"
+            "    reader = staticmethod(\n"
+            "        repository.add_review_and_decision\n"
+            "    )\n"
+            "def run(command):\n"
+            "    return Reader().reader(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    @property\n"
+            "    def reader(self):\n"
+            "        return repository.describe\n"
+            "    def inspect(self, command):\n"
+            "        return self.reader(command)\n"
+            "def run(command):\n"
+            "    return Reader().inspect(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    def __init__(self):\n"
+            "        self.reader = repository.describe\n"
+            "    def inspect(self, command):\n"
+            "        return self.reader(command)\n"
+            "def run(command):\n"
+            "    return Reader().inspect(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "setattr(Reader, 'writer', staticmethod(repository.describe))\n"
+            "def run(command):\n"
+            "    return Reader().writer(command)\n"
+        ),
+        (
+            "import functools\n"
+            "def run(command):\n"
+            "    reader = functools.partial(repository.describe, command)\n"
+            "    return reader()\n"
+        ),
+        (
+            "def run(\n"
+            "    command, readers=dict(review=repository.describe),\n"
+            "):\n"
+            "    return readers['review'](command)\n"
+        ),
+        (
+            "def run(\n"
+            "    command, readers=(*(repository.describe,),),\n"
+            "):\n"
+            "    return readers[0](command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    reader = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return Reader.__dict__['reader'](command)\n"
+        ),
+        (
+            "def run(command):\n"
+            "    callback = repository.add_review_and_decision\n"
+            "    callback = repository.describe\n"
+            "    return callback(command)\n"
+        ),
+    ),
+)
+def test_review_writer_guard_accepts_effective_runtime_reader_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    class Repository:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        def add_review_and_decision(self, command: str) -> str:
+            self.conn.execute(
+                "INSERT INTO review_effects(command) VALUES (?)", (command,)
+            )
+            return command
+
+        @staticmethod
+        def describe(command: str) -> str:
+            return f"control:{command}"
+
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE review_effects (command TEXT NOT NULL)")
+        namespace: dict[str, object] = {"repository": Repository(conn)}
+        exec(compile(tree, "<review-dataflow-control>", "exec"), namespace)
+        assert (
+            namespace["run"]("inspect")  # type: ignore[operator]
+            == "control:inspect"
+        )
+        assert conn.execute("SELECT COUNT(*) FROM review_effects").fetchone() == (
+            0,
+        )
+    finally:
+        conn.close()
+
+    fake = Path("review-dataflow-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_control.py"
+    )
+
+    assert review_writer_callers((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "writers"),
+    (
+        (
+            "def invoke(callback, command):\n"
+            "    return callback(command)\n"
+            "def dispatch(callback, command):\n"
+            "    return invoke(callback, command)\n"
+            "def save(command):\n"
+            "    return dispatch(\n"
+            "        repository.add_review_and_decision, command\n"
+            "    )\n",
+            ("dispatch", "invoke", "save"),
+        ),
+        (
+            "def save(command):\n"
+            "    writer = repository.add_review_and_decision\n"
+            "    return writer.__call__(command)\n",
+            ("save",),
+        ),
+        (
+            "def save(command):\n"
+            "    writer = getattr(\n"
+            "        repository, 'add_review_and_decision'\n"
+            "    )\n"
+            "    return writer(command)\n",
+            ("save",),
+        ),
+        (
+            "from builtins import setattr as assign\n"
+            "class Writer:\n"
+            "    pass\n"
+            "assign(\n"
+            "    Writer, 'writer',\n"
+            "    staticmethod(repository.add_review_and_decision),\n"
+            ")\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            ("save",),
+        ),
+        (
+            "from functools import partial as bind\n"
+            "def save(command):\n"
+            "    return bind(\n"
+            "        repository.add_review_and_decision, command\n"
+            "    )()\n",
+            ("save",),
+        ),
+        (
+            "def get_writer(self):\n"
+            "    return repository.add_review_and_decision\n"
+            "class Writer:\n"
+            "    writer = property(get_writer)\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            ("save",),
+        ),
+        (
+            "callback = repository.add_review_and_decision\n"
+            "def save(command, writer=callback):\n"
+            "    return writer(command)\n"
+            "callback = repository.describe\n",
+            ("save",),
+        ),
+        (
+            "def save(command):\n"
+            "    enabled = True\n"
+            "    if enabled:\n"
+            "        callback = repository.add_review_and_decision\n"
+            "    else:\n"
+            "        callback = repository.describe\n"
+            "    return callback(command)\n",
+            ("save",),
+        ),
+        (
+            "class WriterBase:\n"
+            "    writer = staticmethod(\n"
+            "        repository.add_review_and_decision\n"
+            "    )\n"
+            "class ReaderBase:\n"
+            "    writer = staticmethod(repository.describe)\n"
+            "class Combined(WriterBase, ReaderBase):\n"
+            "    pass\n"
+            "def save(command):\n"
+            "    return Combined().writer(command)\n",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return vars(Writer)['writer'](command)\n",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return Writer.__dict__.get('writer')(command)\n",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    descriptor = Writer.__dict__['writer']\n"
+            "    bound = descriptor.__get__(None, Writer)\n"
+            "    return bound(command)\n",
+            ("save",),
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "first = Writer()\n"
+            "second = Writer()\n"
+            "first.writer = repository.add_review_and_decision\n"
+            "second.writer = repository.describe\n"
+            "def save(command):\n"
+            "    return first.writer(command)\n",
+            ("save",),
+        ),
+        (
+            "def save(command):\n"
+            "    callback = repository.add_review_and_decision\n"
+            "    result = callback(command)\n"
+            "    callback = repository.describe\n"
+            "    return result\n",
+            ("save",),
+        ),
+    ),
+)
+def test_review_writer_guard_resolves_close_neighbor_callables(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    writers: tuple[str, ...],
+) -> None:
+    class Repository:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        def add_review_and_decision(self, command: str) -> str:
+            self.conn.execute(
+                "INSERT INTO review_effects(command) VALUES (?)", (command,)
+            )
+            return command
+
+        @staticmethod
+        def describe(command: str) -> str:
+            return f"control:{command}"
+
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE review_effects (command TEXT NOT NULL)")
+        namespace: dict[str, object] = {"repository": Repository(conn)}
+        exec(compile(tree, "<review-neighbor-mutation>", "exec"), namespace)
+        namespace["save"]("confirm")  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT command FROM review_effects"
+        ).fetchall() == [("confirm",)]
+    finally:
+        conn.close()
+
+    fake = Path("review-neighbor-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_neighbor.py"
+    )
+
+    assert review_writer_callers((fake,)) == tuple(
+        f"workers/review_neighbor.py:{writer}" for writer in writers
+    )
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "def setattr(target, name, value):\n"
+            "    target.writer = staticmethod(repository.describe)\n"
+            "class Reader:\n"
+            "    pass\n"
+            "setattr(\n"
+            "    Reader, 'writer',\n"
+            "    staticmethod(repository.add_review_and_decision),\n"
+            ")\n"
+            "def run(command):\n"
+            "    return Reader().writer(command)\n"
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "first = Writer()\n"
+            "second = Writer()\n"
+            "first.writer = repository.add_review_and_decision\n"
+            "second.writer = repository.describe\n"
+            "def run(command):\n"
+            "    return second.writer(command)\n"
+        ),
+        (
+            "class WriterBase:\n"
+            "    writer = staticmethod(\n"
+            "        repository.add_review_and_decision\n"
+            "    )\n"
+            "class ReaderBase:\n"
+            "    writer = staticmethod(repository.describe)\n"
+            "class Combined(ReaderBase, WriterBase):\n"
+            "    pass\n"
+            "def run(command):\n"
+            "    return Combined().writer(command)\n"
+        ),
+        (
+            "def partial(callback, command):\n"
+            "    return lambda: repository.describe(command)\n"
+            "def run(command):\n"
+            "    return partial(\n"
+            "        repository.add_review_and_decision, command\n"
+            "    )()\n"
+        ),
+        (
+            "def run(command):\n"
+            "    enabled = True\n"
+            "    if enabled:\n"
+            "        callback = repository.describe\n"
+            "    else:\n"
+            "        callback = repository.describe\n"
+            "    return callback(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    reader = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return getattr(Reader(), 'reader')(command)\n"
+        ),
+    ),
+)
+def test_review_writer_guard_accepts_close_neighbor_readers(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    class Repository:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        def add_review_and_decision(self, command: str) -> str:
+            self.conn.execute(
+                "INSERT INTO review_effects(command) VALUES (?)", (command,)
+            )
+            return command
+
+        @staticmethod
+        def describe(command: str) -> str:
+            return f"control:{command}"
+
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE review_effects (command TEXT NOT NULL)")
+        namespace: dict[str, object] = {"repository": Repository(conn)}
+        exec(compile(tree, "<review-neighbor-control>", "exec"), namespace)
+        assert (
+            namespace["run"]("inspect")  # type: ignore[operator]
+            == "control:inspect"
+        )
+        assert conn.execute("SELECT COUNT(*) FROM review_effects").fetchone() == (
+            0,
+        )
+    finally:
+        conn.close()
+
+    fake = Path("review-neighbor-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_neighbor_control.py"
+    )
+
+    assert review_writer_callers((fake,)) == ()
+
+
+@pytest.mark.parametrize(
     "mutation",
     (
         (
@@ -4015,6 +6790,96 @@ def test_presence_expansion_guard_ignores_nonwriter_generic_sql_helper(
         "    execute_sql(conn)\n"
     )
     fake = Path("downstream-helper-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/downstream_control.py"
+    )
+
+    assert presence_expansion_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "writers"),
+    (
+        (
+            "def execute_sql(conn, *sql_args):\n"
+            "    conn.execute(*sql_args)\n"
+            "def run(conn):\n"
+            "    args = ('INSERT INTO analysis_runs(id) VALUES (?)', (1,))\n"
+            "    execute_sql(conn, *args)\n",
+            ("execute_sql", "run"),
+        ),
+        (
+            "def run(conn):\n"
+            "    sinks = {'analysis': conn.execute}\n"
+            "    args = ('INSERT INTO analysis_runs(id) VALUES (?)', (1,))\n"
+            "    sinks['analysis'](*args)\n",
+            ("run",),
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    conn.execute(statement, values)\n"
+            "def run(conn):\n"
+            "    left = {'conn': conn}\n"
+            "    right = dict(\n"
+            "        statement='INSERT INTO analysis_runs(id) VALUES (?)',\n"
+            "        values=(1,),\n"
+            "    )\n"
+            "    execute_sql(**(left | right))\n",
+            ("execute_sql", "run"),
+        ),
+    ),
+)
+def test_presence_expansion_guard_resolves_runtime_sql_dataflow(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    writers: tuple[str, ...],
+) -> None:
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE analysis_runs (id INTEGER NOT NULL)")
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<downstream-dataflow-mutation>", "exec"), namespace)
+        namespace["run"](conn)  # type: ignore[operator]
+        assert conn.execute("SELECT id FROM analysis_runs").fetchall() == [(1,)]
+    finally:
+        conn.close()
+
+    fake = Path("downstream-dataflow-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/downstream_dataflow.py"
+    )
+
+    assert presence_expansion_writer_calls((fake,)) == tuple(
+        f"workers/downstream_dataflow.py:{writer}" for writer in writers
+    )
+
+
+def test_presence_expansion_guard_honors_runtime_mapping_overwrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(
+        "def execute_sql(*, conn, statement, values):\n"
+        "    return conn.execute(statement, values).fetchone()[0]\n"
+        "def inspect(conn):\n"
+        "    left = {\n"
+        "        'conn': conn,\n"
+        "        'statement': 'INSERT INTO analysis_runs(id) VALUES (?)',\n"
+        "    }\n"
+        "    right = dict(statement='SELECT ?', values=('control',))\n"
+        "    return execute_sql(**(left | right))\n"
+    )
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<downstream-dataflow-control>", "exec"), namespace)
+        assert namespace["inspect"](conn) == "control"  # type: ignore[operator]
+    finally:
+        conn.close()
+
+    fake = Path("downstream-dataflow-control.py")
     monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
     monkeypatch.setitem(
         globals(), "_relative", lambda _path: "workers/downstream_control.py"
