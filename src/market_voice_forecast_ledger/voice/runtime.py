@@ -188,15 +188,15 @@ def verify_runtime_startup(
         pyvenv_root = _private_child_root(
             attestation.python_pyvenv_path.parent, private_data
         )
-        python_parent = _private_child_root(
-            attestation.python_path.parent, private_data
-        )
-        if manifest_root != pyvenv_root or python_parent not in {
-            manifest_root,
-            manifest_root / "Scripts",
-        }:
+        if manifest_root != pyvenv_root:
             raise ValueError("unexpected Python runtime root")
         runtime_root = manifest_root
+        python = _private_file(attestation.python_path, runtime_root)
+        if python not in {
+            runtime_root / "python.exe",
+            runtime_root / "Scripts" / "python.exe",
+        } or _file_sha256(python) != attestation.python_sha256:
+            raise ValueError("Python executable changed")
         expected_import_root = runtime_root / "Lib" / "site-packages"
         import_root = _private_child_root(
             attestation.python_import_root, runtime_root

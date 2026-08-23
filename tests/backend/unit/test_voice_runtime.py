@@ -461,6 +461,95 @@ def test_verify_runtime_startup_accepts_supported_python_layouts(
     verify_runtime_startup(attestation, settings.data_dir)
 
 
+@pytest.mark.parametrize(
+    "create_wrong_file",
+    (
+        pytest.param(False, id="missing"),
+        pytest.param(True, id="existing"),
+    ),
+)
+def test_verify_runtime_startup_rejects_wrong_python_filename(
+    tmp_path: Path, create_wrong_file: bool
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(
+        tmp_path, python_relative=Path("Scripts/python.exe")
+    )
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+    wrong_python = settings.voice_runtime_dir / "Scripts" / "other.exe"
+    if create_wrong_file:
+        _write(wrong_python, attestation.python_path.read_bytes())
+    mutated = replace(attestation, python_path=wrong_python.absolute())
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        verify_runtime_startup(mutated, settings.data_dir)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+
+
+def test_verify_runtime_startup_rejects_late_python_hash_mutation(
+    tmp_path: Path,
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(
+        tmp_path, python_relative=Path("Scripts/python.exe")
+    )
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+    attestation.python_path.write_bytes(b"late-private-python-mutation")
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        verify_runtime_startup(attestation, settings.data_dir)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+
+
+def test_verify_runtime_startup_rejects_late_python_reparse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(
+        tmp_path, python_relative=Path("Scripts/python.exe")
+    )
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+    original_reparse = runtime._is_reparse
+    monkeypatch.setattr(
+        runtime,
+        "_is_reparse",
+        lambda path: path == attestation.python_path or original_reparse(path),
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        verify_runtime_startup(attestation, settings.data_dir)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+
+
+def test_verify_runtime_startup_rejects_late_python_escape(
+    tmp_path: Path,
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(
+        tmp_path, python_relative=Path("Scripts/python.exe")
+    )
+    attestation = attest_runtime(
+        settings, version_probe=probe, allowlists=allowlists
+    )
+    outside_python = tmp_path / "outside" / "python.exe"
+    outside_sha256 = _write(outside_python, b"outside-private-python")
+    escaped = replace(
+        attestation,
+        python_path=outside_python.resolve(),
+        python_sha256=outside_sha256,
+    )
+
+    with pytest.raises(DomainError, match="voice runtime is invalid") as caught:
+        verify_runtime_startup(escaped, settings.data_dir)
+
+    assert caught.value.code == "VOICE_RUNTIME_INVALID"
+
+
 def test_verify_runtime_startup_rejects_mismatched_startup_artifact_parents(
     tmp_path: Path,
 ) -> None:
