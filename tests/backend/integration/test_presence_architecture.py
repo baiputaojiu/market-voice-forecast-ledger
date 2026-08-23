@@ -986,9 +986,14 @@ def _sql_expression_calls(
             if is_executor and not aliases <= executor_aliases:
                 executor_aliases.update(aliases)
                 changed = True
+    assignments = _scope_assignment_values(nodes)
+
+    def assigned_values(expression: ast.AST) -> tuple[ast.AST, ...]:
+        return _assigned_expression_values(assignments, expression)
+
     calls = []
     for node in nodes:
-        if not isinstance(node, ast.Call) or not node.args:
+        if not isinstance(node, ast.Call):
             continue
         is_executor = (
             isinstance(node.func, ast.Attribute)
@@ -997,7 +1002,13 @@ def _sql_expression_calls(
             isinstance(node.func, ast.Name) and node.func.id in executor_aliases
         )
         if is_executor:
-            calls.append((node, node.args[0]))
+            calls.extend(
+                (node, option[0])
+                for option in _expanded_positional_options(
+                    node.args, assigned_values
+                )
+                if option
+            )
     return tuple(calls)
 
 
@@ -1086,6 +1097,23 @@ def _scope_assignment_values(
     nodes: tuple[ast.AST, ...],
 ) -> dict[str, tuple[ast.AST, ...]]:
     values: dict[str, list[ast.AST]] = {}
+    root = nodes[0] if nodes else None
+    if isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        positional = (*root.args.posonlyargs, *root.args.args)
+        default_parameters = (
+            positional[-len(root.args.defaults) :]
+            if root.args.defaults
+            else ()
+        )
+        for parameter, default in zip(
+            default_parameters, root.args.defaults, strict=True
+        ):
+            values.setdefault(parameter.arg, []).append(default)
+        for parameter, default in zip(
+            root.args.kwonlyargs, root.args.kw_defaults, strict=True
+        ):
+            if default is not None:
+                values.setdefault(parameter.arg, []).append(default)
     for node in nodes:
         if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
             continue
@@ -1101,6 +1129,12 @@ def _scope_assignment_values(
             for name in _binding_target_names(target):
                 values.setdefault(name, []).append(value)
     return {name: tuple(items) for name, items in values.items()}
+
+
+def _scope_binding_values(
+    scope: _ExecutableScope,
+) -> dict[str, tuple[ast.AST, ...]]:
+    return _scope_assignment_values(_scope_nodes(scope.node))
 
 
 def _expression_path(expression: ast.AST) -> str | None:
@@ -1185,30 +1219,199 @@ def _visible_scope_names(
     return tuple(visible)
 
 
-def _call_argument(
+def _sequence_expression_options(
+    expression: ast.AST,
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+    seen: frozenset[str] = frozenset(),
+) -> tuple[tuple[ast.AST, ...], ...]:
+    if isinstance(expression, (ast.List, ast.Tuple)):
+        options: tuple[tuple[ast.AST, ...], ...] = ((),)
+        for item in expression.elts:
+            item_options = (
+                _sequence_expression_options(
+                    item.value, assigned_values, seen
+                )
+                if isinstance(item, ast.Starred)
+                else ((item,),)
+            )
+            if not item_options:
+                return ()
+            options = tuple(
+                (*prefix, *suffix)
+                for prefix in options
+                for suffix in item_options
+            )
+        return options
+    key = _expression_alias_key(expression)
+    if key is None or key in seen:
+        return ()
+    return tuple(
+        option
+        for value in assigned_values(expression)
+        for option in _sequence_expression_options(
+            value, assigned_values, seen | {key}
+        )
+    )
+
+
+def _mapping_expression_values(
+    expression: ast.AST,
+    parameter: str,
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+    seen: frozenset[str] = frozenset(),
+) -> tuple[ast.AST, ...]:
+    if isinstance(expression, ast.Dict):
+        found = []
+        for key_node, value in zip(
+            expression.keys, expression.values, strict=True
+        ):
+            if key_node is None:
+                found.extend(
+                    _mapping_expression_values(
+                        value, parameter, assigned_values, seen
+                    )
+                )
+            elif (
+                isinstance(key_node, ast.Constant)
+                and type(key_node.value) is str
+                and key_node.value == parameter
+            ):
+                found.append(value)
+        return tuple(found)
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Name)
+        and expression.func.id == "dict"
+    ):
+        return tuple(
+            keyword.value
+            for keyword in expression.keywords
+            if keyword.arg == parameter
+        )
+    key = _expression_alias_key(expression)
+    if key is None or key in seen:
+        return ()
+    return tuple(
+        value
+        for assigned in assigned_values(expression)
+        for value in _mapping_expression_values(
+            assigned, parameter, assigned_values, seen | {key}
+        )
+    )
+
+
+def _expanded_positional_options(
+    arguments: Iterable[ast.AST],
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+) -> tuple[tuple[ast.AST, ...], ...]:
+    options: tuple[tuple[ast.AST, ...], ...] = ((),)
+    for argument in arguments:
+        argument_options = (
+            _sequence_expression_options(argument.value, assigned_values)
+            if isinstance(argument, ast.Starred)
+            else ((argument,),)
+        )
+        if not argument_options:
+            return ()
+        options = tuple(
+            (*prefix, *suffix)
+            for prefix in options
+            for suffix in argument_options
+        )
+    return options
+
+
+def _subscript_container_values(
+    expression: ast.AST,
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+) -> tuple[ast.AST, ...]:
+    if not isinstance(expression, ast.Subscript):
+        return ()
+    key_node = expression.slice
+    key = (
+        key_node.value
+        if isinstance(key_node, ast.Constant)
+        and type(key_node.value) in {str, int}
+        else None
+    )
+
+    def containers(
+        candidate: ast.AST,
+        seen: frozenset[str] = frozenset(),
+    ) -> tuple[ast.AST, ...]:
+        if isinstance(candidate, (ast.Dict, ast.List, ast.Tuple)):
+            return (candidate,)
+        path_key = _expression_alias_key(candidate)
+        if path_key is None or path_key in seen:
+            return ()
+        return tuple(
+            container
+            for value in assigned_values(candidate)
+            for container in containers(value, seen | {path_key})
+        )
+
+    values = []
+    for container in containers(expression.value):
+        if isinstance(container, (ast.List, ast.Tuple)):
+            if type(key) is int and -len(container.elts) <= key < len(
+                container.elts
+            ):
+                values.append(container.elts[key])
+            elif key is None:
+                values.extend(container.elts)
+        elif isinstance(container, ast.Dict):
+            for item_key, value in zip(
+                container.keys, container.values, strict=True
+            ):
+                if key is None:
+                    values.append(value)
+                elif (
+                    isinstance(item_key, ast.Constant)
+                    and item_key.value == key
+                    and type(item_key.value) is type(key)
+                ):
+                    values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
+def _call_argument_values(
     call: ast.Call,
     callee: _ExecutableScope,
     parameter_index: int,
     bound_offset: int,
-) -> ast.AST | None:
+    assigned_values: Callable[[ast.AST], tuple[ast.AST, ...]],
+) -> tuple[ast.AST, ...]:
     if parameter_index < bound_offset:
-        return None
+        return ()
     positional_index = parameter_index - bound_offset
-    if (
-        parameter_index < callee.positional_count
-        and 0 <= positional_index < len(call.args)
-    ):
-        return call.args[positional_index]
+    if parameter_index < callee.positional_count:
+        options = _expanded_positional_options(call.args, assigned_values)
+        positional = tuple(
+            option[positional_index]
+            for option in options
+            if 0 <= positional_index < len(option)
+        )
+        if positional:
+            return tuple(dict.fromkeys(positional))
     parameter_name = callee.positional_parameters[parameter_index]
-    keyword = next(
-        (
-            keyword.value
-            for keyword in call.keywords
-            if keyword.arg == parameter_name
-        ),
-        None,
+    keywords = tuple(
+        keyword.value
+        for keyword in call.keywords
+        if keyword.arg == parameter_name
     )
-    return keyword or callee.default_for(parameter_name)
+    unpacked = tuple(
+        value
+        for keyword in call.keywords
+        if keyword.arg is None
+        for value in _mapping_expression_values(
+            keyword.value, parameter_name, assigned_values
+        )
+    )
+    supplied = tuple(dict.fromkeys((*keywords, *unpacked)))
+    if supplied:
+        return supplied
+    default = callee.default_for(parameter_name)
+    return () if default is None else (default,)
 
 
 def _presence_writer_details(
@@ -1234,9 +1437,7 @@ def _presence_writer_details(
             constants = dict(module_constants)
             constants.update(_string_constants(nodes_by_name[scope.name]))
             constants_by_name[scope.name] = constants
-            assignments_by_name[scope.name] = _scope_assignment_values(
-                nodes_by_name[scope.name]
-            )
+            assignments_by_name[scope.name] = _scope_binding_values(scope)
         sql_call_ids_by_name = {
             scope.name: {
                 id(call)
@@ -1422,6 +1623,18 @@ def _presence_writer_details(
                 for state in argument_states(child, scope_name, seen)
             )
 
+        def visible_assigned_values(
+            expression: ast.AST,
+            scope_name: str,
+        ) -> tuple[ast.AST, ...]:
+            return tuple(
+                value
+                for visible in _visible_scope_names(scope_name, known_scopes)
+                for value in _assigned_expression_values(
+                    assignments_by_name[visible], expression
+                )
+            )
+
         sink_parameters: dict[str, set[int]] = {
             scope.name: set() for scope in scopes
         }
@@ -1481,15 +1694,20 @@ def _presence_writer_details(
                 caller = scopes_by_name[caller_name]
                 callee = scopes_by_name[callee_name]
                 for index in tuple(sink_parameters[callee_name]):
-                    expression = _call_argument(
-                        call, callee, index, resolved.bound_offset
+                    expressions = _call_argument_values(
+                        call,
+                        callee,
+                        index,
+                        resolved.bound_offset,
+                        lambda expression: visible_assigned_values(
+                            expression, caller_name
+                        ),
                     )
-                    if expression is None:
-                        continue
-                    propagated = parameter_indexes(expression, caller)
-                    if not propagated <= sink_parameters[caller_name]:
-                        sink_parameters[caller_name].update(propagated)
-                        changed = True
+                    for expression in expressions:
+                        propagated = parameter_indexes(expression, caller)
+                        if not propagated <= sink_parameters[caller_name]:
+                            sink_parameters[caller_name].update(propagated)
+                            changed = True
 
         for scope in scopes:
             for index in sink_parameters[scope.name]:
@@ -1510,15 +1728,23 @@ def _presence_writer_details(
             callee_name = resolved.name
             callee = scopes_by_name[callee_name]
             for index in sink_parameters[callee_name]:
-                expression = _call_argument(
-                    call, callee, index, resolved.bound_offset
+                expressions = _call_argument_values(
+                    call,
+                    callee,
+                    index,
+                    resolved.bound_offset,
+                    lambda expression: visible_assigned_values(
+                        expression, caller_name
+                    ),
                 )
-                if expression is None:
-                    continue
-                rendered = _static_string(
-                    expression, constants_by_name[caller_name]
-                )
-                if rendered is not None and writes_sql(rendered):
+                if any(
+                    (rendered := _static_string(
+                        expression, constants_by_name[caller_name]
+                    ))
+                    is not None
+                    and writes_sql(rendered)
+                    for expression in expressions
+                ):
                     active_edges.add((caller_name, callee_name))
                     writer_names.update({caller_name, callee_name})
 
@@ -1532,14 +1758,19 @@ def _presence_writer_details(
                 caller = scopes_by_name[caller_name]
                 callee = scopes_by_name[callee_name]
                 for index in sink_parameters[callee_name]:
-                    expression = _call_argument(
-                        call, callee, index, resolved.bound_offset
+                    expressions = _call_argument_values(
+                        call,
+                        callee,
+                        index,
+                        resolved.bound_offset,
+                        lambda expression: visible_assigned_values(
+                            expression, caller_name
+                        ),
                     )
-                    if expression is None:
-                        continue
-                    if not (
+                    if not any(
                         parameter_indexes(expression, caller)
                         & sink_parameters[caller_name]
+                        for expression in expressions
                     ):
                         continue
                     edge = (caller_name, callee_name)
@@ -1619,6 +1850,54 @@ def review_writer_callers(
     callers = []
     for path in files:
         tree = _tree(path)
+        scopes = _executable_scopes(tree)
+        known_scopes = frozenset(scope.name for scope in scopes)
+        assignments = {
+            scope.name: _scope_binding_values(scope) for scope in scopes
+        }
+        class_scopes = tuple(
+            scope
+            for scope in scopes
+            if isinstance(scope.node, ast.ClassDef)
+            and scope.class_owner is not None
+        )
+        classes_by_name = {
+            scope.class_owner or "": scope for scope in class_scopes
+        }
+
+        def class_derives_from(
+            derived: str,
+            target: str,
+            seen: frozenset[str] = frozenset(),
+        ) -> bool:
+            if derived == target or derived.rsplit(".", 1)[-1] == target:
+                return True
+            if derived in seen:
+                return False
+            class_scope = classes_by_name.get(derived)
+            if class_scope is None or not isinstance(
+                class_scope.node, ast.ClassDef
+            ):
+                return False
+            for base in class_scope.node.bases:
+                base_name = _expression_alias_key(base)
+                if base_name is None:
+                    continue
+                candidates = tuple(
+                    name
+                    for name in classes_by_name
+                    if name == base_name
+                    or name.rsplit(".", 1)[-1] == base_name
+                )
+                if any(
+                    class_derives_from(
+                        candidate, target, seen | {derived}
+                    )
+                    for candidate in candidates
+                ):
+                    return True
+            return False
+
         imported_aliases = {
             alias.asname or alias.name
             for node in ast.walk(tree)
@@ -1626,10 +1905,80 @@ def review_writer_callers(
             for alias in node.names
             if alias.name == "add_review_and_decision"
         }
-        module_assignments = _scope_assignment_values(_scope_nodes(tree))
-        for name, scope in _function_scopes(tree):
-            nodes = _scope_nodes(scope)
-            local_assignments = _scope_assignment_values(nodes)
+
+        for scope in scopes:
+            nodes = _scope_nodes(scope.node)
+
+            def visible_values(expression: ast.AST) -> tuple[ast.AST, ...]:
+                return tuple(
+                    value
+                    for visible in _visible_scope_names(
+                        scope.name, known_scopes
+                    )
+                    for value in _assigned_expression_values(
+                        assignments[visible], expression
+                    )
+                )
+
+            def refers_to_class(
+                expression: ast.AST,
+                class_name: str,
+                seen: frozenset[str] = frozenset(),
+            ) -> bool:
+                path_key = _expression_alias_key(expression)
+                class_names = {class_name, class_name.rsplit(".", 1)[-1]}
+                if path_key in class_names:
+                    return True
+                receiver_names = set()
+                if (
+                    scope.class_owner is not None
+                    and class_derives_from(scope.class_owner, class_name)
+                    and scope.positional_parameters
+                    and scope.method_kind in {"instance", "class"}
+                ):
+                    receiver_names.add(scope.positional_parameters[0])
+                if path_key in receiver_names:
+                    return True
+                if isinstance(expression, ast.Call):
+                    return refers_to_class(
+                        expression.func, class_name, seen
+                    )
+                if path_key is None or path_key in seen:
+                    return False
+                return any(
+                    refers_to_class(value, class_name, seen | {path_key})
+                    for value in visible_values(expression)
+                )
+
+            def class_member_values(
+                expression: ast.AST,
+            ) -> tuple[ast.AST, ...]:
+                if not isinstance(expression, ast.Attribute):
+                    return ()
+                return tuple(
+                    value
+                    for class_scope in class_scopes
+                    if refers_to_class(
+                        expression.value, class_scope.class_owner or ""
+                    )
+                    for member_key in (
+                        expression.attr,
+                        f"{class_scope.class_owner}.{expression.attr}",
+                        f"{(class_scope.class_owner or '').rsplit('.', 1)[-1]}"
+                        f".{expression.attr}",
+                    )
+                    for visible in dict.fromkeys(
+                        (
+                            *_visible_scope_names(
+                                scope.name, known_scopes
+                            ),
+                            class_scope.name,
+                        )
+                    )
+                    for assigned_key, assigned in assignments[visible].items()
+                    if _alias_keys_overlap(member_key, assigned_key)
+                    for value in assigned
+                )
 
             def is_writer(
                 expression: ast.AST,
@@ -1645,18 +1994,28 @@ def review_writer_callers(
                     and expression.id in imported_aliases
                 ):
                     return True
+                if (
+                    isinstance(expression, ast.Call)
+                    and isinstance(expression.func, ast.Name)
+                    and expression.func.id in {"classmethod", "staticmethod"}
+                    and expression.args
+                ):
+                    return is_writer(expression.args[0], seen)
                 path = _expression_alias_key(expression)
-                if path is None or path in seen:
+                if path in seen:
                     return False
+                resolved = [
+                    *class_member_values(expression),
+                    *_subscript_container_values(expression, visible_values),
+                ]
+                if path is not None:
+                    resolved.extend(visible_values(expression))
                 return any(
-                    is_writer(value, seen | {path})
-                    for assignments in (
-                        local_assignments,
-                        module_assignments,
+                    is_writer(
+                        value,
+                        seen if path is None else seen | {path},
                     )
-                    for value in _assigned_expression_values(
-                        assignments, expression
-                    )
+                    for value in resolved
                 )
 
             calls_writer = any(
@@ -1665,7 +2024,7 @@ def review_writer_callers(
                 for node in nodes
             )
             if calls_writer:
-                callers.append(f"{_relative(path)}:{name}")
+                callers.append(f"{_relative(path)}:{scope.name}")
     return tuple(sorted(callers))
 
 
@@ -2958,6 +3317,206 @@ def test_raw_presence_writer_guard_resolves_complete_helper_calls(
 @pytest.mark.parametrize(
     "mutation",
     (
+        (
+            "def execute_sql(conn, statement, values):\n"
+            "    conn.execute(statement, values)\n"
+            "def write(conn):\n"
+            "    statement = 'INSERT INTO presence_decisions '"
+            "                '(candidate_id, state) VALUES (?, ?)'\n"
+            "    values = (1, 'presence_confirmed')\n"
+            "    args = (conn, statement, values)\n"
+            "    execute_sql(*args)\n"
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    conn.execute(statement, values)\n"
+            "def write(conn):\n"
+            "    statement = 'INSERT INTO presence_decisions '"
+            "                '(candidate_id, state) VALUES (?, ?)'\n"
+            "    values = (1, 'presence_confirmed')\n"
+            "    kwargs = {\n"
+            "        'conn': conn, 'statement': statement, 'values': values\n"
+            "    }\n"
+            "    execute_sql(**kwargs)\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_expands_executed_argument_containers(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE presence_decisions "
+            "(candidate_id INTEGER, state TEXT)"
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<argument-container-mutation>", "exec"), namespace)
+        namespace["write"](conn)  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT candidate_id, state FROM presence_decisions"
+        ).fetchone() == (1, "presence_confirmed")
+    finally:
+        conn.close()
+
+    fake = Path("argument-container-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/argument_container.py"
+    )
+
+    writers = (
+        "workers/argument_container.py:execute_sql",
+        "workers/argument_container.py:write",
+    )
+    assert presence_decision_writer_calls((fake,)) == writers
+    assert _presence_writer_details((fake,)) == {
+        writer: frozenset({"presence_confirmed"}) for writer in writers
+    }
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "def execute_sql(conn, statement, values):\n"
+            "    return conn.execute(statement, values).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    args = (conn, 'SELECT ?', ('control',))\n"
+            "    return execute_sql(*args)\n"
+        ),
+        (
+            "def execute_sql(*, conn, statement, values):\n"
+            "    return conn.execute(statement, values).fetchone()[0]\n"
+            "def inspect(conn):\n"
+            "    kwargs = {\n"
+            "        'conn': conn, 'statement': 'SELECT ?',\n"
+            "        'values': ('control',)\n"
+            "    }\n"
+            "    return execute_sql(**kwargs)\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_accepts_executed_read_only_containers(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<argument-container-control>", "exec"), namespace)
+        assert namespace["inspect"](conn) == "control"  # type: ignore[operator]
+    finally:
+        conn.close()
+
+    fake = Path("argument-container-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/container_control.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        (
+            "def write(conn):\n"
+            "    args = (\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n"
+            "    conn.execute(*args)\n"
+        ),
+        (
+            "def write(conn):\n"
+            "    execute_sql = conn.execute\n"
+            "    args = (\n"
+            "        'INSERT INTO presence_decisions '"
+            "        '(candidate_id, state) VALUES (?, ?)',\n"
+            "        (1, 'presence_confirmed'),\n"
+            "    )\n"
+            "    execute_sql(*args)\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_expands_executed_sql_sink_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE presence_decisions "
+            "(candidate_id INTEGER, state TEXT)"
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<sql-sink-argument-mutation>", "exec"), namespace)
+        namespace["write"](conn)  # type: ignore[operator]
+        assert conn.execute(
+            "SELECT candidate_id, state FROM presence_decisions"
+        ).fetchone() == (1, "presence_confirmed")
+    finally:
+        conn.close()
+
+    fake = Path("sql-sink-argument-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/sql_sink_args.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == (
+        "workers/sql_sink_args.py:write",
+    )
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "def inspect(conn):\n"
+            "    args = ('SELECT ?', ('control',))\n"
+            "    return conn.execute(*args).fetchone()[0]\n"
+        ),
+        (
+            "def inspect(conn):\n"
+            "    execute_sql = conn.execute\n"
+            "    args = ('SELECT ?', ('control',))\n"
+            "    return execute_sql(*args).fetchone()[0]\n"
+        ),
+    ),
+)
+def test_raw_presence_writer_guard_accepts_executed_read_only_sql_sink_star(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    tree = ast.parse(control)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        namespace: dict[str, object] = {}
+        exec(compile(tree, "<sql-sink-argument-control>", "exec"), namespace)
+        assert namespace["inspect"](conn) == "control"  # type: ignore[operator]
+    finally:
+        conn.close()
+
+    fake = Path("sql-sink-argument-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/sql_sink_control.py"
+    )
+
+    assert presence_decision_writer_calls((fake,)) == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
         "def execute_sql(conn, statement='SELECT 1'):\n"
         "    conn.execute(statement)\n"
         "def inspect(conn):\n"
@@ -3122,6 +3681,216 @@ def test_review_writer_caller_guard_follows_module_container_aliases(
     assert review_writer_callers((fake,)) == (
         "workers/review_alias.py:save",
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "caller"),
+    (
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "    def save(self, command):\n"
+            "        return self.writer(command)\n",
+            "Writer.save",
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return Writer.writer(command)\n",
+            "save",
+        ),
+        (
+            "class Writer:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            "save",
+        ),
+        (
+            "class Base:\n"
+            "    writer = staticmethod(repository.add_review_and_decision)\n"
+            "class Writer(Base):\n"
+            "    def save(self, command):\n"
+            "        return self.writer(command)\n",
+            "Writer.save",
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "Writer.writer = staticmethod(\n"
+            "    repository.add_review_and_decision\n"
+            ")\n"
+            "def save(command):\n"
+            "    return Writer().writer(command)\n",
+            "save",
+        ),
+        (
+            "class Writer:\n"
+            "    pass\n"
+            "Writer.writer = staticmethod(\n"
+            "    repository.add_review_and_decision\n"
+            ")\n"
+            "instance = Writer()\n"
+            "def save(command):\n"
+            "    return instance.writer(command)\n",
+            "save",
+        ),
+        (
+            "def save(command, writer=repository.add_review_and_decision):\n"
+            "    return writer(command)\n",
+            "save",
+        ),
+        (
+            "def save(command, *, writer=repository.add_review_and_decision):\n"
+            "    return writer(command)\n",
+            "save",
+        ),
+        (
+            "def save(\n"
+            "    command, writers=(repository.add_review_and_decision,)\n"
+            "):\n"
+            "    return writers[0](command)\n",
+            "save",
+        ),
+        (
+            "def save(\n"
+            "    command, writers={'review': repository.add_review_and_decision}\n"
+            "):\n"
+            "    return writers['review'](command)\n",
+            "save",
+        ),
+    ),
+)
+def test_review_writer_guard_resolves_executed_class_and_default_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    caller: str,
+) -> None:
+    class Repository:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        def add_review_and_decision(self, command: str) -> str:
+            self.conn.execute(
+                "INSERT INTO review_effects(command) VALUES (?)", (command,)
+            )
+            return command
+
+    tree = ast.parse(mutation)
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE review_effects (command TEXT NOT NULL)")
+        namespace: dict[str, object] = {"repository": Repository(conn)}
+        exec(compile(tree, "<review-alias-mutation>", "exec"), namespace)
+        if caller == "Writer.save":
+            result = namespace["Writer"]().save("confirm")  # type: ignore[operator]
+        else:
+            result = namespace["save"]("confirm")  # type: ignore[operator]
+        assert result == "confirm"
+        assert conn.execute(
+            "SELECT command FROM review_effects"
+        ).fetchone() == ("confirm",)
+    finally:
+        conn.close()
+
+    fake = Path("review-binding-mutation.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_binding.py"
+    )
+
+    assert review_writer_callers((fake,)) == (
+        f"workers/review_binding.py:{caller}",
+    )
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        (
+            "class Reader:\n"
+            "    reader = staticmethod(repository.describe)\n"
+            "    def inspect(self, command):\n"
+            "        return self.reader(command)\n"
+            "def run(command):\n"
+            "    return Reader().inspect(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    reader = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return Reader.reader(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    reader = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return Reader().reader(command)\n"
+        ),
+        (
+            "class Base:\n"
+            "    reader = staticmethod(repository.describe)\n"
+            "class Reader(Base):\n"
+            "    def inspect(self, command):\n"
+            "        return self.reader(command)\n"
+            "def run(command):\n"
+            "    return Reader().inspect(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    pass\n"
+            "Reader.reader = staticmethod(repository.describe)\n"
+            "def run(command):\n"
+            "    return Reader().reader(command)\n"
+        ),
+        (
+            "class Reader:\n"
+            "    pass\n"
+            "Reader.reader = staticmethod(repository.describe)\n"
+            "instance = Reader()\n"
+            "def run(command):\n"
+            "    return instance.reader(command)\n"
+        ),
+        (
+            "def run(command, reader=repository.describe):\n"
+            "    return reader(command)\n"
+        ),
+        (
+            "def run(command, *, reader=repository.describe):\n"
+            "    return reader(command)\n"
+        ),
+        (
+            "def run(command, readers=(repository.describe,)):\n"
+            "    return readers[0](command)\n"
+        ),
+        (
+            "def run(command, readers={'review': repository.describe}):\n"
+            "    return readers['review'](command)\n"
+        ),
+    ),
+)
+def test_review_writer_guard_accepts_executed_nonwriter_alias_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    class Repository:
+        @staticmethod
+        def describe(command: str) -> str:
+            return f"control:{command}"
+
+    tree = ast.parse(control)
+    namespace: dict[str, object] = {"repository": Repository()}
+    exec(compile(tree, "<review-alias-control>", "exec"), namespace)
+    assert namespace["run"]("inspect") == "control:inspect"  # type: ignore[operator]
+
+    fake = Path("review-binding-control.py")
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda _path: "workers/review_control.py"
+    )
+
+    assert review_writer_callers((fake,)) == ()
 
 
 @pytest.mark.parametrize(
