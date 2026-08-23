@@ -671,6 +671,40 @@ def approve_complete_reference_set(
             )
 
 
+def test_list_all_candidates_is_read_only_and_orders_four_active_subjects(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, _, media, _, _, _ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+
+    listed = VoiceReferenceService(db).list_all_candidates()
+
+    assert [(item.subject_id, item.ordinal) for item in listed] == [
+        (subject_id, ordinal)
+        for subject_id in seed.subject_ids
+        for ordinal in range(1, 7)
+    ]
+    assert media.calls == []
+
+
+def test_list_all_candidates_rejects_noncanonical_active_profile_set(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    seed = seed_calibration_candidates(db)
+    service, _, _, _, _, _ = task5_service(db, tmp_path)
+    approve_complete_reference_set(service, seed)
+    db.execute(
+        "UPDATE discovery_profiles SET is_active=0 WHERE id=?",
+        (seed.profile_ids[0],),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        service.list_all_candidates()
+    assert caught.value.code == "VOICE_REFERENCE_STORED_INVALID"
+
 def calibration_models(tmp_path: Path):
     campplus, _ = fake_runtime_attestation(tmp_path / "campplus")
     resnet, _ = fake_runtime_attestation(tmp_path / "resnet")

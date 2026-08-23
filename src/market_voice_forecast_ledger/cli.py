@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import math
 import os
 import re
 import sys
@@ -37,7 +38,28 @@ _PUBLIC_CLI_ERROR_CODES = frozenset(
         "YOUTUBE_SCHEDULE_STATUS_UNAVAILABLE",
     }
 )
+_PUBLIC_PRESENCE_CLI_ERRORS = {
+    "VOICE_REFERENCE_INVALID": "Presence reference unavailable.",
+    "VOICE_REFERENCE_STORED_INVALID": "Presence reference unavailable.",
+    "VOICE_REFERENCE_CALIBRATION_FAILED": "Presence calibration unavailable.",
+    "PRESENCE_PILOT_INSUFFICIENT": "Presence pilot unavailable.",
+    "PRESENCE_REVIEW_INVALID": "Presence review unavailable.",
+    "PRESENCE_REVIEW_UNAVAILABLE": "Presence review unavailable.",
+    "PRESENCE_REVIEW_FAILED": "Presence review unavailable.",
+    "PRESENCE_REVIEW_STALE": "Presence review unavailable.",
+    "VOICE_PROCESSING_FAILED": "Presence worker unavailable.",
+    "PRESENCE_COMMAND_UNAVAILABLE": "Presence command failed.",
+    "PRESENCE_COMMAND_FAILED": "Presence command failed.",
+}
 _SCHEDULE_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_POSITIVE_CLI_INTEGER = re.compile(r"^[1-9]\d*$")
+_SAFE_CLI_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_PRIVATE_PATH = re.compile(
+    r"(?i)(?:(?<![A-Za-z0-9])[a-z]:[\\/]"
+    r"|(?<![\\/])(?:\\\\|//)[^\\/\s]"
+    r"|(?<![A-Za-z0-9/])/(?!/)[^/\s])"
+)
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -97,6 +119,18 @@ def _parse_schedule_time(value: str) -> time:
     return time(hour=int(value[:2]), minute=int(value[3:]))
 
 
+def _parse_positive_cli_integer(value: str) -> int:
+    if (
+        type(value) is not str
+        or _POSITIVE_CLI_INTEGER.fullmatch(value) is None
+    ):
+        raise argparse.ArgumentTypeError("positive integer required")
+    parsed = int(value)
+    if parsed > 2**63 - 1:
+        raise argparse.ArgumentTypeError("positive integer required")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(prog="market-voice-forecast-ledger")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -150,6 +184,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         required=True,
     )
+    presence = commands.add_parser("presence")
+    presence_commands = presence.add_subparsers(
+        dest="presence_command", required=True
+    )
+    reference = presence_commands.add_parser("reference")
+    reference_commands = reference.add_subparsers(
+        dest="presence_reference_command", required=True
+    )
+    reference_commands.add_parser("list-candidates")
+    approve = reference_commands.add_parser("approve")
+    for option in ("subject_id", "video_id", "start_ms", "end_ms"):
+        approve.add_argument(
+            f"--{option.replace('_', '-')}",
+            dest=option,
+            type=_parse_positive_cli_integer,
+            action=_SingleUseAction,
+            required=True,
+        )
+    presence_commands.add_parser("calibrate")
+    pilot = presence_commands.add_parser("pilot")
+    pilot_commands = pilot.add_subparsers(
+        dest="presence_pilot_command", required=True
+    )
+    pilot_commands.add_parser("create")
+    presence_worker = presence_commands.add_parser("worker")
+    presence_worker.add_argument(
+        "--once",
+        action=_SingleUseAction,
+        nargs=0,
+        const=True,
+        default=False,
+        required=True,
+    )
+    review = presence_commands.add_parser("review")
+    review_commands = review.add_subparsers(
+        dest="presence_review_command", required=True
+    )
+    review_commands.add_parser("list")
+    show = review_commands.add_parser("show")
+    show.add_argument("run_id", type=_parse_positive_cli_integer)
+    for action in ("confirm", "reject", "hold"):
+        action_parser = review_commands.add_parser(action)
+        action_parser.add_argument("run_id", type=_parse_positive_cli_integer)
+        action_parser.add_argument(
+            "--reason",
+            type=str,
+            action=_SingleUseAction,
+            required=True,
+        )
     return parser
 
 
@@ -159,8 +242,20 @@ def main(
     credential_store_factory: Callable[[], CredentialStore] | None = None,
     task_scheduler_factory: Callable[[], object] | None = None,
     worker_runner: Callable[[Settings], object] | None = None,
+    reference_service_factory: Callable[[], object] | None = None,
+    presence_service_factory: Callable[[], object] | None = None,
+    calibration_runner: Callable[[], object] | None = None,
+    presence_worker_runner: Callable[[], object] | None = None,
 ) -> int:
-    arguments = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    if (
+        arguments.command == "presence"
+        and arguments.presence_command == "reference"
+        and arguments.presence_reference_command == "approve"
+        and arguments.start_ms >= arguments.end_ms
+    ):
+        parser.error("invalid reference interval")
     if arguments.command == "serve":
         host = validate_bind_host(arguments.host)
         port = validate_port(arguments.port)
@@ -228,7 +323,224 @@ def main(
             worker_runner = run_once
         worker_runner(default_settings())
         return 0
+    if arguments.command == "presence":
+        try:
+            return _run_presence_command(
+                arguments,
+                reference_service_factory=reference_service_factory,
+                presence_service_factory=presence_service_factory,
+                calibration_runner=calibration_runner,
+                presence_worker_runner=presence_worker_runner,
+            )
+        except DomainError as error:
+            if error.code in _PUBLIC_PRESENCE_CLI_ERRORS:
+                raise
+            raise DomainError(
+                "PRESENCE_COMMAND_FAILED", "presence command failed"
+            ) from None
+        except Exception:
+            raise DomainError(
+                "PRESENCE_COMMAND_FAILED", "presence command failed"
+            ) from None
     raise DomainError("CLI_COMMAND_INVALID", "CLI command is invalid")
+
+
+def _run_presence_command(
+    arguments: argparse.Namespace,
+    *,
+    reference_service_factory: Callable[[], object] | None,
+    presence_service_factory: Callable[[], object] | None,
+    calibration_runner: Callable[[], object] | None,
+    presence_worker_runner: Callable[[], object] | None,
+) -> int:
+    if arguments.presence_command == "reference":
+        if reference_service_factory is None:
+            _presence_dependency_unavailable()
+        service = reference_service_factory()
+        if arguments.presence_reference_command == "list-candidates":
+            clips = service.list_all_candidates()
+            for clip in clips:
+                print(_format_reference_candidate(clip))
+            return 0
+        if arguments.presence_reference_command == "approve":
+            from market_voice_forecast_ledger.domain.voice_verification import (
+                ReferenceClipCommand,
+            )
+
+            clip = service.approve_clip(
+                ReferenceClipCommand(
+                    subject_id=arguments.subject_id,
+                    video_id=arguments.video_id,
+                    start_ms=arguments.start_ms,
+                    end_ms=arguments.end_ms,
+                    actor="local_user",
+                    reason="approved_reference_clip",
+                )
+            )
+            _require_positive_int(clip.subject_id)
+            _require_positive_int(clip.video_id)
+            print(
+                "Presence reference approved: "
+                f"subject {clip.subject_id}, video {clip.video_id}."
+            )
+            return 0
+    if arguments.presence_command == "calibrate":
+        if calibration_runner is None:
+            _presence_dependency_unavailable()
+        calibration_runner()
+        print("Presence calibration completed.")
+        return 0
+    if arguments.presence_command == "pilot":
+        if presence_service_factory is None:
+            _presence_dependency_unavailable()
+        service = presence_service_factory()
+        preview = service.preview_pilot()
+        preview_hash = preview.preview_hash
+        if (
+            type(preview_hash) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", preview_hash) is None
+        ):
+            raise ValueError("invalid pilot preview")
+        creation = service.create_pilot(preview_hash)
+        job_ids = creation.job_ids
+        if (
+            type(job_ids) is not tuple
+            or any(type(job_id) is not int or job_id <= 0 for job_id in job_ids)
+        ):
+            raise ValueError("invalid pilot creation")
+        print(f"Presence pilot created: {len(job_ids)} jobs.")
+        return 0
+    if arguments.presence_command == "worker" and arguments.once is True:
+        if presence_worker_runner is None:
+            _presence_dependency_unavailable()
+        presence_worker_runner()
+        print("Presence worker completed.")
+        return 0
+    if arguments.presence_command == "review":
+        if presence_service_factory is None:
+            _presence_dependency_unavailable()
+        service = presence_service_factory()
+        if arguments.presence_review_command == "list":
+            details = service.list_pending_reviews()
+            for detail in details:
+                print(_format_review_detail(detail))
+            return 0
+        if arguments.presence_review_command == "show":
+            print(_format_review_detail(service.show_review(arguments.run_id)))
+            return 0
+        from market_voice_forecast_ledger.domain.voice_verification import (
+            ReviewAction,
+        )
+        from market_voice_forecast_ledger.services.voice_verification import (
+            ReviewCommand,
+        )
+        service.review(
+            ReviewCommand(
+                run_id=arguments.run_id,
+                action=ReviewAction(arguments.presence_review_command),
+                reason=arguments.reason,
+                actor="local_user",
+            )
+        )
+        print(
+            "Presence review recorded: "
+            f"{arguments.presence_review_command}."
+        )
+        return 0
+    raise DomainError("PRESENCE_COMMAND_FAILED", "presence command failed")
+
+
+def _presence_dependency_unavailable() -> None:
+    raise DomainError(
+        "PRESENCE_COMMAND_UNAVAILABLE", "presence command unavailable"
+    )
+
+
+def _require_positive_int(value: object) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError("invalid public identifier")
+
+
+def _format_reference_candidate(clip: object) -> str:
+    subject_id = getattr(clip, "subject_id")
+    video_id = getattr(clip, "video_id")
+    start_ms = getattr(clip, "start_ms")
+    end_ms = getattr(clip, "end_ms")
+    ordinal = getattr(clip, "ordinal")
+    clip_kind = getattr(clip, "clip_kind")
+    for value in (subject_id, video_id, end_ms, ordinal):
+        _require_positive_int(value)
+    if type(start_ms) is not int or start_ms < 0 or start_ms >= end_ms or (
+        type(clip_kind) is not str
+        or _SAFE_CLI_TOKEN.fullmatch(clip_kind) is None
+    ):
+        raise ValueError("invalid reference candidate")
+    return (
+        "Presence reference candidate: "
+        f"subject {subject_id}, video {video_id}, {clip_kind} {ordinal}, "
+        f"{start_ms}-{end_ms} ms."
+    )
+
+
+def _format_review_detail(detail: object) -> str:
+    run_id = getattr(detail, "run_id")
+    name = getattr(detail, "person_display_name")
+    watch_url = getattr(detail, "watch_url")
+    youtube_video_id = getattr(detail, "youtube_video_id")
+    proposal = getattr(detail, "proposal")
+    model_name = getattr(detail, "model_name")
+    model_version = getattr(detail, "model_version")
+    adapter_version = getattr(detail, "adapter_version")
+    threshold_version = getattr(detail, "threshold_version")
+    segments = getattr(detail, "segments")
+    _require_positive_int(run_id)
+    if (
+        type(name) is not str
+        or not name
+        or len(name) > 120
+        or "\n" in name
+        or _PRIVATE_PATH.search(name) is not None
+        or "file://" in name.casefold()
+        or type(youtube_video_id) is not str
+        or _YOUTUBE_VIDEO_ID.fullmatch(youtube_video_id) is None
+        or watch_url != f"https://www.youtube.com/watch?v={youtube_video_id}"
+        or type(segments) is not tuple
+        or not 1 <= len(segments) <= 64
+    ):
+        raise ValueError("invalid review detail")
+    tokens = (model_name, model_version, adapter_version, threshold_version)
+    if any(
+        type(value) is not str or _SAFE_CLI_TOKEN.fullmatch(value) is None
+        for value in tokens
+    ):
+        raise ValueError("invalid review detail")
+    proposal_value = getattr(proposal, "value", proposal)
+    if (
+        type(proposal_value) is not str
+        or _SAFE_CLI_TOKEN.fullmatch(proposal_value) is None
+    ):
+        raise ValueError("invalid review detail")
+    rendered_segments = []
+    for segment in segments:
+        start_ms = getattr(segment, "start_ms")
+        end_ms = getattr(segment, "end_ms")
+        score = getattr(segment, "score")
+        _require_positive_int(end_ms)
+        if (
+            type(start_ms) is not int
+            or start_ms < 0
+            or start_ms >= end_ms
+            or type(score) not in (int, float)
+            or not math.isfinite(score)
+        ):
+            raise ValueError("invalid review detail")
+        rendered_segments.append(f"{start_ms}-{end_ms}ms={score:.4f}")
+    return (
+        f"Presence review: run {run_id}, {name}, {watch_url}, "
+        f"proposal {proposal_value}, model {model_name} {model_version}, "
+        f"adapter {adapter_version}, threshold {threshold_version}, "
+        f"segments {', '.join(rendered_segments)}."
+    )
 
 
 def run_cli(
@@ -237,6 +549,10 @@ def run_cli(
     credential_store_factory: Callable[[], CredentialStore] | None = None,
     task_scheduler_factory: Callable[[], object] | None = None,
     worker_runner: Callable[[Settings], object] | None = None,
+    reference_service_factory: Callable[[], object] | None = None,
+    presence_service_factory: Callable[[], object] | None = None,
+    calibration_runner: Callable[[], object] | None = None,
+    presence_worker_runner: Callable[[], object] | None = None,
 ) -> int:
     try:
         return main(
@@ -244,8 +560,16 @@ def run_cli(
             credential_store_factory=credential_store_factory,
             task_scheduler_factory=task_scheduler_factory,
             worker_runner=worker_runner,
+            reference_service_factory=reference_service_factory,
+            presence_service_factory=presence_service_factory,
+            calibration_runner=calibration_runner,
+            presence_worker_runner=presence_worker_runner,
         )
     except DomainError as error:
+        presence_message = _PUBLIC_PRESENCE_CLI_ERRORS.get(error.code)
+        if presence_message is not None:
+            print(presence_message, file=sys.stderr)
+            return 1
         code = (
             error.code
             if error.code in _PUBLIC_CLI_ERROR_CODES

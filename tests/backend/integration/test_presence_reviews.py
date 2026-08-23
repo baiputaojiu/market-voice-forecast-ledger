@@ -220,6 +220,7 @@ def test_model_proposal_never_changes_pointer_and_detail_is_public_safe(
 
     assert type(detail) is ReviewDetail
     assert tuple(item.name for item in fields(ReviewDetail)) == (
+        "run_id",
         "person_display_name",
         "watch_url",
         "youtube_video_id",
@@ -236,6 +237,7 @@ def test_model_proposal_never_changes_pointer_and_detail_is_public_safe(
         "score",
     )
     assert detail == ReviewDetail(
+        run_id=run_id,
         person_display_name="木野内栄治",
         watch_url="https://www.youtube.com/watch?v=abcdefghijk",
         youtube_video_id="abcdefghijk",

@@ -581,6 +581,37 @@ class VoiceReferenceService:
             raise stored_error
         raise _stored_reference_invalid_error()
 
+    def list_all_candidates(self) -> tuple[ApprovedReferenceClip, ...]:
+        """Return the approved slots for the exact active-person cohort."""
+        try:
+            subject_ids = self._active_subject_ids()
+            if (
+                len(subject_ids) != 4
+                or len(set(subject_ids)) != 4
+                or any(not _positive_int(subject_id) for subject_id in subject_ids)
+            ):
+                raise ValueError("invalid active subject cohort")
+            approvals = tuple(
+                approval
+                for subject_id in subject_ids
+                for approval in self.list_candidates(subject_id)
+            )
+            identities = tuple(
+                (item.subject_id, item.ordinal) for item in approvals
+            )
+            if (
+                len(identities) != len(set(identities))
+                or tuple(sorted(identities)) != identities
+            ):
+                raise ValueError("duplicate reference approval")
+            return approvals
+        except DomainError as cause:
+            if cause.code == "VOICE_REFERENCE_STORED_INVALID":
+                raise
+            raise _stored_reference_invalid_error() from None
+        except (sqlite3.DatabaseError, LookupError, TypeError, ValueError):
+            raise _stored_reference_invalid_error() from None
+
     def calibrate(
         self, model_candidates: Sequence[RuntimeAttestation]
     ) -> CalibrationResult:

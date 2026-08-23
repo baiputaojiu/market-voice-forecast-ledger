@@ -140,6 +140,7 @@ class ReviewSegmentDetail:
 
 @dataclass(frozen=True, slots=True)
 class ReviewDetail:
+    run_id: int
     person_display_name: str
     watch_url: str
     youtube_video_id: str
@@ -379,6 +380,7 @@ class PresenceVerificationService:
             raise ValueError("presence review segments are unavailable")
         snapshot = artifacts.manifest.snapshot
         return ReviewDetail(
+            run_id=run.id,
             person_display_name=identity["canonical_name"],
             watch_url=(
                 "https://www.youtube.com/watch?v="
