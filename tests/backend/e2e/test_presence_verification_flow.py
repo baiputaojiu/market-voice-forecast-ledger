@@ -62,20 +62,7 @@ PILOT_JOB_COUNT = 20
 PILOT_UNIT_COUNT = 140
 REFERENCE_ARTIFACT_COUNT = 144
 PILOT_ARTIFACT_COUNT = 60
-ANALYSIS_OUTPUT_TABLES = (
-    "analysis_asset_mappings",
-    "analysis_forecast_statement_links",
-    "analysis_forecasts",
-    "analysis_input_snapshots",
-    "analysis_run_events",
-    "analysis_run_job_attempts",
-    "analysis_run_outputs",
-    "analysis_run_segments",
-    "analysis_runs",
-    "analysis_scopes",
-    "analysis_statement_evidence_links",
-    "analysis_statement_periods",
-    "analysis_statements",
+NON_PRESENCE_OUTPUT_TABLES = (
     "current_asset_mappings",
     "current_forecasts",
     "current_result_sets",
@@ -98,8 +85,8 @@ AUTOMATIC_COLLECTION_TABLES = (
 )
 COUNTED_TABLES = frozenset(
     {
-        *ANALYSIS_OUTPUT_TABLES,
         *AUTOMATIC_COLLECTION_TABLES,
+        *NON_PRESENCE_OUTPUT_TABLES,
         "audit_events",
         "discovery_observations",
         "job_unit_attempts",
@@ -143,6 +130,48 @@ def table_count(db: sqlite3.Connection, table: str) -> int:
     if table not in COUNTED_TABLES:
         raise AssertionError("table inventory is not allowlisted")
     return int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def _analysis_inventory(
+    db: sqlite3.Connection,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    names = tuple(
+        row["name"]
+        for row in db.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name GLOB 'analysis_*'
+            ORDER BY name
+            """
+        )
+    )
+    assert names
+    inventory = {}
+    for name in names:
+        quoted = name.replace('"', '""')
+        inventory[name] = tuple(
+            tuple(row)
+            for row in db.execute(
+                f'SELECT * FROM "{quoted}" ORDER BY rowid'
+            )
+        )
+    return inventory
+
+
+def _assert_exact_analysis_inventory(
+    db: sqlite3.Connection,
+    baseline: dict[str, tuple[tuple[object, ...], ...]],
+) -> None:
+    current = _analysis_inventory(db)
+    assert set(current) == set(baseline)
+    reference_tables = frozenset({"analysis_subjects"})
+    assert reference_tables <= set(baseline)
+    for table in reference_tables:
+        if current[table] != baseline[table]:
+            raise AssertionError(f"analysis reference table changed: {table}")
+    for table in set(baseline) - reference_tables:
+        if baseline[table] or current[table]:
+            raise AssertionError(f"analysis runtime table gained rows: {table}")
 
 
 def _seed_exact_candidates(
@@ -258,15 +287,23 @@ def _assert_exact_pilot_jobs(
     *,
     source_job_id: int,
     pilot_job_ids: tuple[int, ...],
+    pilot_status: str,
 ) -> None:
-    rows = tuple(db.execute("SELECT id, job_kind FROM jobs ORDER BY id"))
-    assert tuple(row["id"] for row in rows) == (
-        source_job_id,
-        *pilot_job_ids,
+    rows = tuple(
+        db.execute(
+            """
+            SELECT id, job_kind, status, total_units
+            FROM jobs ORDER BY id
+            """
+        )
     )
-    assert tuple(row["job_kind"] for row in rows) == (
-        "youtube_sync",
-        *("video_pipeline" for _ in range(PILOT_JOB_COUNT)),
+    assert len(pilot_job_ids) == PILOT_JOB_COUNT
+    assert tuple(tuple(row) for row in rows) == (
+        (source_job_id, "youtube_sync", "succeeded", 1),
+        *(
+            (job_id, "video_pipeline", pilot_status, len(PRESENCE_UNITS))
+            for job_id in pilot_job_ids
+        ),
     )
 
 
@@ -370,6 +407,60 @@ def hold_pointer_changes(
     return sum(after[item] != before[item] for item in hold_candidate_ids)
 
 
+def _assert_exact_review_pointers(
+    db: sqlite3.Connection,
+    *,
+    frozen_pointers: dict[int, int],
+    expected_actions: dict[int, ReviewAction],
+) -> None:
+    rows = tuple(
+        db.execute(
+            """
+            SELECT review.id AS review_id, review.action,
+                   review.prior_presence_decision_id, review.review_hash,
+                   run.candidate_id,
+                   candidate.current_presence_decision_id,
+                   decision.candidate_id AS decision_candidate_id,
+                   decision.state, decision.decision_origin,
+                   decision.evidence_ref, decision.evidence_hash
+            FROM voice_verification_reviews AS review
+            JOIN voice_verification_runs AS run ON run.id=review.run_id
+            JOIN subject_video_candidates AS candidate
+              ON candidate.id=run.candidate_id
+            JOIN presence_decisions AS decision
+              ON decision.id=candidate.current_presence_decision_id
+            ORDER BY run.candidate_id
+            """
+        )
+    )
+    assert len(rows) == PILOT_CANDIDATE_COUNT
+    assert set(expected_actions) == set(frozen_pointers)
+    assert {row["candidate_id"] for row in rows} == set(frozen_pointers)
+    assert Counter(row["action"] for row in rows) == {
+        ReviewAction.CONFIRM.value: 8,
+        ReviewAction.REJECT.value: 7,
+        ReviewAction.HOLD.value: 5,
+    }
+    for row in rows:
+        candidate_id = row["candidate_id"]
+        action = expected_actions[candidate_id]
+        assert row["action"] == action.value
+        assert row["prior_presence_decision_id"] == frozen_pointers[candidate_id]
+        if action is ReviewAction.HOLD:
+            assert row["current_presence_decision_id"] == frozen_pointers[candidate_id]
+            assert row["state"] == PresenceState.UNVERIFIED.value
+            continue
+        assert row["current_presence_decision_id"] != frozen_pointers[candidate_id]
+        assert row["decision_candidate_id"] == candidate_id
+        assert row["decision_origin"] == PresenceOrigin.VOICE_VERIFICATION.value
+        assert row["evidence_ref"] == str(row["review_id"])
+        assert row["evidence_hash"] == row["review_hash"]
+        assert row["state"] == {
+            ReviewAction.CONFIRM: PresenceState.CONFIRMED.value,
+            ReviewAction.REJECT: PresenceState.REJECTED.value,
+        }[action]
+
+
 def test_complete_four_person_five_candidate_presence_acceptance(
     presence_db: sqlite3.Connection,
     tmp_path: Path,
@@ -385,6 +476,7 @@ def test_complete_four_person_five_candidate_presence_acceptance(
     monkeypatch.setattr(subprocess, "run", reject_external)
     monkeypatch.setattr(socket, "create_connection", reject_external)
     monkeypatch.setattr(urllib.request, "urlopen", reject_external)
+    analysis_baseline = _analysis_inventory(presence_db)
     source_job_id, candidates = _seed_exact_candidates(presence_db)
     assert len(candidates) == 4
     assert tuple(len(items) for items in candidates.values()) == (5, 5, 5, 5)
@@ -462,6 +554,7 @@ def test_complete_four_person_five_candidate_presence_acceptance(
         presence_db,
         source_job_id=source_job_id,
         pilot_job_ids=creation.job_ids,
+        pilot_status="queued",
     )
 
     presence_db.execute("SAVEPOINT hidden_job_mutation")
@@ -480,6 +573,7 @@ def test_complete_four_person_five_candidate_presence_acceptance(
                 presence_db,
                 source_job_id=source_job_id,
                 pilot_job_ids=creation.job_ids,
+                pilot_status="queued",
             )
     finally:
         presence_db.execute("ROLLBACK TO hidden_job_mutation")
@@ -488,6 +582,7 @@ def test_complete_four_person_five_candidate_presence_acceptance(
         presence_db,
         source_job_id=source_job_id,
         pilot_job_ids=creation.job_ids,
+        pilot_status="queued",
     )
 
     frozen_pointers = _presence_pointers(presence_db)
@@ -668,6 +763,7 @@ def test_complete_four_person_five_candidate_presence_acceptance(
     )
     pointer_before_reviews = _presence_pointers(presence_db)
     hold_candidate_ids: list[int] = []
+    expected_review_actions: dict[int, ReviewAction] = {}
     for row, action in zip(run_rows, review_actions, strict=True):
         result = service.review(
             ReviewCommand(
@@ -684,6 +780,7 @@ def test_complete_four_person_five_candidate_presence_acceptance(
         }[action]
         assert result.action is action
         assert result.current_state is expected_state
+        expected_review_actions[row["candidate_id"]] = action
         if action is ReviewAction.HOLD:
             hold_candidate_ids.append(row["candidate_id"])
 
@@ -704,6 +801,40 @@ def test_complete_four_person_five_candidate_presence_acceptance(
     ) == 0
     assert len(service.list_pending_reviews()) == 0
     assert table_count(presence_db, "presence_decisions") == 35
+    _assert_exact_review_pointers(
+        presence_db,
+        frozen_pointers=frozen_pointers,
+        expected_actions=expected_review_actions,
+    )
+    confirmed_candidate_id = next(
+        candidate_id
+        for candidate_id, action in expected_review_actions.items()
+        if action is ReviewAction.CONFIRM
+    )
+    presence_db.execute("SAVEPOINT missing_review_pointer_mutation")
+    try:
+        presence_db.execute(
+            """
+            UPDATE subject_video_candidates
+            SET current_presence_decision_id=?
+            WHERE id=?
+            """,
+            (frozen_pointers[confirmed_candidate_id], confirmed_candidate_id),
+        )
+        with pytest.raises(AssertionError):
+            _assert_exact_review_pointers(
+                presence_db,
+                frozen_pointers=frozen_pointers,
+                expected_actions=expected_review_actions,
+            )
+    finally:
+        presence_db.execute("ROLLBACK TO missing_review_pointer_mutation")
+        presence_db.execute("RELEASE missing_review_pointer_mutation")
+    _assert_exact_review_pointers(
+        presence_db,
+        frozen_pointers=frozen_pointers,
+        expected_actions=expected_review_actions,
+    )
 
     decision_rows = tuple(
         presence_db.execute(
@@ -750,8 +881,25 @@ def test_complete_four_person_five_candidate_presence_acceptance(
     assert table_count(presence_db, "speaker_assignments") == 0
     assert all(
         table_count(presence_db, table) == 0
-        for table in ANALYSIS_OUTPUT_TABLES
+        for table in NON_PRESENCE_OUTPUT_TABLES
     )
+    _assert_exact_analysis_inventory(presence_db, analysis_baseline)
+    presence_db.execute("SAVEPOINT extra_analysis_subject_mutation")
+    try:
+        presence_db.execute(
+            """
+            INSERT INTO analysis_subjects(
+                canonical_name, is_active, created_at
+            ) VALUES ('Synthetic extra subject', 1, ?)
+            """,
+            (utc_iso(NOW + timedelta(hours=2)),),
+        )
+        with pytest.raises(AssertionError):
+            _assert_exact_analysis_inventory(presence_db, analysis_baseline)
+    finally:
+        presence_db.execute("ROLLBACK TO extra_analysis_subject_mutation")
+        presence_db.execute("RELEASE extra_analysis_subject_mutation")
+    _assert_exact_analysis_inventory(presence_db, analysis_baseline)
     assert all(
         table_count(presence_db, table) == 0
         for table in AUTOMATIC_COLLECTION_TABLES
@@ -762,6 +910,46 @@ def test_complete_four_person_five_candidate_presence_acceptance(
         presence_db,
         source_job_id=source_job_id,
         pilot_job_ids=creation.job_ids,
+        pilot_status="succeeded",
+    )
+    presence_db.execute("SAVEPOINT corrupt_terminal_status_mutation")
+    try:
+        presence_db.execute(
+            "UPDATE jobs SET status='failed' WHERE id=?",
+            (creation.job_ids[0],),
+        )
+        with pytest.raises(AssertionError):
+            _assert_exact_pilot_jobs(
+                presence_db,
+                source_job_id=source_job_id,
+                pilot_job_ids=creation.job_ids,
+                pilot_status="succeeded",
+            )
+    finally:
+        presence_db.execute("ROLLBACK TO corrupt_terminal_status_mutation")
+        presence_db.execute("RELEASE corrupt_terminal_status_mutation")
+    presence_db.execute("SAVEPOINT corrupt_total_units_mutation")
+    try:
+        presence_db.execute("DROP TRIGGER jobs_manifest_immutable")
+        presence_db.execute(
+            "UPDATE jobs SET total_units=6 WHERE id=?",
+            (creation.job_ids[0],),
+        )
+        with pytest.raises(AssertionError):
+            _assert_exact_pilot_jobs(
+                presence_db,
+                source_job_id=source_job_id,
+                pilot_job_ids=creation.job_ids,
+                pilot_status="succeeded",
+            )
+    finally:
+        presence_db.execute("ROLLBACK TO corrupt_total_units_mutation")
+        presence_db.execute("RELEASE corrupt_total_units_mutation")
+    _assert_exact_pilot_jobs(
+        presence_db,
+        source_job_id=source_job_id,
+        pilot_job_ids=creation.job_ids,
+        pilot_status="succeeded",
     )
 
     worker_audio_root = resumed.work_root
