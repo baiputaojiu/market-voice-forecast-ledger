@@ -331,15 +331,19 @@ class PresenceVerificationService:
         return row["job_id"]
 
     def _require_cleanup_receipt(self, job_id: int) -> None:
+        job = self._jobs.get(job_id)
         cleanup = self._job_state.unit(job_id, "audio:cleanup")
         if (
             cleanup.status is not UnitStatus.SUCCESS
+            or cleanup.external_input_hash is None
             or cleanup.output_hash is None
         ):
             raise ValueError("presence review cleanup is incomplete")
         self._retention.require_presence_cleanup_receipt(
             job_id,
-            cleanup.output_hash,
+            manifest_hash=job.manifest_hash,
+            expected_external_input_hash=cleanup.external_input_hash,
+            expected_output_hash=cleanup.output_hash,
         )
 
     def _review_detail(self, run_id: int) -> ReviewDetail:

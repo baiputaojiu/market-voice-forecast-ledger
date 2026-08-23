@@ -1,16 +1,20 @@
+import json
 import os
 import queue
 import sqlite3
 import threading
 from dataclasses import fields
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal, cast, get_type_hints
 
 import pytest
 
 from market_voice_forecast_ledger.db.connection import open_database
+from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.discovery import PresenceState
 from market_voice_forecast_ledger.domain.errors import DomainError
+from market_voice_forecast_ledger.domain.jobs import effective_input_hash
 from market_voice_forecast_ledger.domain.voice_verification import (
     ReviewAction,
     VoiceProposal,
@@ -130,6 +134,76 @@ def assert_review_unchanged(
     ).fetchone()[0] == decision_count
     assert current_presence(db, job.reference.candidate_id)["id"] == (
         job.reference.decision_id
+    )
+
+
+def replace_cleanup_output_with_current_inventory(
+    db: sqlite3.Connection,
+    job_id: int,
+) -> None:
+    artifacts = tuple(
+        db.execute(
+            "SELECT id, deleted_at, retry_count "
+            "FROM local_artifacts ORDER BY id"
+        )
+    )
+    output_hash = sha256_text(
+        canonical_json(
+            {
+                "artifacts": [
+                    {
+                        "deleted_at": datetime.fromisoformat(
+                            item["deleted_at"].replace("Z", "+00:00")
+                        ).isoformat(),
+                        "id": item["id"],
+                        "retry_count": item["retry_count"],
+                    }
+                    for item in artifacts
+                ],
+                "schema": "presence-audio-cleanup.v1",
+            }
+        )
+    )
+    db.execute("DROP TRIGGER job_unit_attempts_no_update")
+    db.execute(
+        "UPDATE job_units SET output_hash=? "
+        "WHERE job_id=? AND unit_key='audio:cleanup'",
+        (output_hash, job_id),
+    )
+    db.execute(
+        "UPDATE job_unit_attempts SET output_hash=? "
+        "WHERE job_id=? AND unit_key='audio:cleanup'",
+        (output_hash, job_id),
+    )
+
+
+def replace_cleanup_external_hash(
+    db: sqlite3.Connection,
+    job_id: int,
+) -> None:
+    external_hash = "f" * 64
+    cleanup = db.execute(
+        "SELECT declared_input_hash, dependency_keys_json "
+        "FROM job_units WHERE job_id=? AND unit_key='audio:cleanup'",
+        (job_id,),
+    ).fetchone()
+    dependency_outputs = tuple(
+        db.execute(
+            "SELECT output_hash FROM job_units WHERE job_id=? AND unit_key=?",
+            (job_id, unit_key),
+        ).fetchone()[0]
+        for unit_key in json.loads(cleanup["dependency_keys_json"])
+    )
+    bound_hash = effective_input_hash(
+        cleanup["declared_input_hash"],
+        dependency_outputs,
+        external_hash,
+    )
+    db.execute("DROP TRIGGER job_units_input_binding_immutable")
+    db.execute(
+        "UPDATE job_units SET external_input_hash=?, bound_input_hash=? "
+        "WHERE job_id=? AND unit_key='audio:cleanup'",
+        (external_hash, bound_hash, job_id),
     )
 
 
@@ -385,14 +459,18 @@ def test_review_requires_exact_command_action_and_actor_types(
         "PRIVATE\u0000CONTROL",
         "audio_path contains private content",
         "file://private/audio.wav",
+        "private-location:" + "\\\\" + "server\\share\\audio.wav",
         "Author" + "ization: Bear" + "er synthetic-private-credential-000001",
         "Author" + "ization: Basic c3ludGhldGljOnByaXZhdGU=",
         "Cook" + "ie: session=synthetic-private-cookie",
         "Set-Cook" + "ie: session=synthetic-private-cookie",
         "provider_api_" + "key=synthetic-private-key",
+        "provider API " + "key = synthetic-private-key",
         "access_" + "token: synthetic-private-token",
+        "cook" + "ie = session=synthetic-private-cookie",
         "password" + "=synthetic-private-password",
         "-----BEGIN " + "PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED " + "PRIVATE KEY-----",
     ),
 )
 def test_review_rejects_empty_long_or_unsafe_reason_before_mutation(
@@ -594,8 +672,15 @@ def test_corrupt_job_artifact_identity_is_never_shown_or_reviewed(
         "row_status",
         "row_error_state",
         "row_timestamp_order",
+        "duplicate_inventory",
+        "missing_inventory",
+        "renamed_inventory",
+        "foreign_root",
+        "row_id_order",
+        "external_hash",
+        "output_hash",
         "file_resurrection",
-        "output_linkage",
+        "symlink_resurrection",
     ),
 )
 def test_review_revalidates_exact_cleanup_receipt_before_any_write(
@@ -635,10 +720,58 @@ def test_review_revalidates_exact_cleanup_receipt_before_any_write(
             "UPDATE local_artifacts SET deleted_at=? WHERE id=?",
             ("2020-01-01T00:00:00.000000Z", artifact["id"]),
         )
-    elif mutation == "file_resurrection":
-        resurrected_path = Path(artifact["local_path"])
-        resurrected_path.write_bytes(b"synthetic-resurrected-media")
-    else:
+    elif mutation == "duplicate_inventory":
+        db.execute(
+            """
+            INSERT INTO local_artifacts(
+                kind, local_path, status, retry_count, safe_error_code,
+                created_at, deleted_at
+            )
+            SELECT kind, local_path, status, retry_count, safe_error_code,
+                   created_at, deleted_at
+            FROM local_artifacts WHERE id=?
+            """,
+            (artifact["id"],),
+        )
+        replace_cleanup_output_with_current_inventory(db, job.job_id)
+    elif mutation == "missing_inventory":
+        db.execute("DROP TRIGGER local_artifacts_no_delete")
+        db.execute("DELETE FROM local_artifacts WHERE id=?", (artifact["id"],))
+        replace_cleanup_output_with_current_inventory(db, job.job_id)
+    elif mutation == "renamed_inventory":
+        db.execute("DROP TRIGGER local_artifacts_limited_update")
+        renamed = str(Path(artifact["local_path"]).with_name("renamed.wav"))
+        db.execute(
+            "UPDATE local_artifacts SET local_path=? WHERE id=?",
+            (renamed, artifact["id"]),
+        )
+    elif mutation == "foreign_root":
+        db.execute("DROP TRIGGER local_artifacts_limited_update")
+        rows = tuple(
+            db.execute("SELECT id, local_path FROM local_artifacts ORDER BY id")
+        )
+        for row in rows:
+            source = Path(row["local_path"])
+            foreign = (
+                tmp_path
+                / "foreign-presence-root"
+                / source.parent.name
+                / source.name
+            )
+            db.execute(
+                "UPDATE local_artifacts SET local_path=? WHERE id=?",
+                (str(foreign), row["id"]),
+            )
+    elif mutation == "row_id_order":
+        db.execute("DROP TRIGGER local_artifacts_limited_update")
+        db.execute(
+            "UPDATE local_artifacts SET id=id + 1000 WHERE id=?",
+            (artifact["id"],),
+        )
+        replace_cleanup_output_with_current_inventory(db, job.job_id)
+    elif mutation == "external_hash":
+        replace_cleanup_external_hash(db, job.job_id)
+    elif mutation == "output_hash":
         db.execute("DROP TRIGGER job_unit_attempts_no_update")
         db.execute(
             "UPDATE job_units SET output_hash=? "
@@ -650,6 +783,16 @@ def test_review_revalidates_exact_cleanup_receipt_before_any_write(
             "WHERE job_id=? AND unit_key='audio:cleanup'",
             ("f" * 64, job.job_id),
         )
+    elif mutation == "file_resurrection":
+        resurrected_path = Path(artifact["local_path"])
+        resurrected_path.write_bytes(b"synthetic-resurrected-media")
+    else:
+        resurrected_path = Path(artifact["local_path"])
+        target = tmp_path / "missing-synthetic-symlink-target"
+        try:
+            resurrected_path.symlink_to(target)
+        except OSError as cause:
+            pytest.skip(f"symlink creation unavailable: {type(cause).__name__}")
     before_review = tuple(db.iterdump())
     statements: list[str] = []
     db.set_trace_callback(statements.append)

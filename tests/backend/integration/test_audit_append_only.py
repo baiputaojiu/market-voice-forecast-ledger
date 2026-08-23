@@ -130,6 +130,7 @@ def test_audit_append_rejects_malformed_scalar_fields(db, field, value):
         "C:\\private\\ledger.sqlite3",
         "source:C:\\private\\ledger.sqlite3",
         "\\\\server\\private\\audio.wav",
+        "private-location:" + "\\\\" + "server\\share\\audio.wav",
         "/var/private/ledger.sqlite3",
         "source=/var/private/ledger.sqlite3",
         "file:///C:/private/ledger.sqlite3",
@@ -161,9 +162,12 @@ def test_audit_append_rejects_unsafe_reason_shapes_without_echo(db, reason):
         "Cook" + "ie: session=synthetic-private-cookie",
         "Set-Cook" + "ie: session=synthetic-private-cookie",
         "provider_api_" + "key=synthetic-private-key",
+        "provider API " + "key = synthetic-private-key",
         "access_" + "token: synthetic-private-token",
+        "cook" + "ie = session=synthetic-private-cookie",
         "password" + "=synthetic-private-password",
         "-----BEGIN " + "PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED " + "PRIVATE KEY-----",
     ),
 )
 def test_audit_append_rejects_concrete_credential_reason_without_echo(
@@ -188,6 +192,7 @@ def test_audit_append_rejects_concrete_credential_reason_without_echo(
         "review token remained local and was not copied",
         "public cookie policy was mentioned during review",
         "key speaker listened to the cited segment",
+        "API key and token vocabulary was discussed without a value",
         "watched 木野内栄治 at https://www.youtube.com/watch?v=abcdefghijk",
         "YouTube video ID abcdefghijk matched the public page",
         "speaker-model 1.0 adapter-v1 threshold-v1 were displayed",

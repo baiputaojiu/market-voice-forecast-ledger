@@ -22,7 +22,8 @@ _SAFE_AUDIT_TOKEN: Final = re.compile(
 )
 _ABSOLUTE_PATH: Final = re.compile(
     r"(?i)(?:(?<![A-Za-z0-9])[a-z]:[\\/]"
-    r"|(?<![\\/:])(?:\\\\|//)[^\\/\s]"
+    r"|(?<![\\/])\\\\[^\\/\s]"
+    r"|(?<![\\/:])//[^\\/\s]"
     r"|(?<![A-Za-z0-9/])/(?!/)[^/\s])"
 )
 _CREDENTIAL_REASON: Final = (
@@ -31,18 +32,18 @@ _CREDENTIAL_REASON: Final = (
         r"zation\s*:\s*(?:bearer|basic)\s+\S+"
     ),
     re.compile(
-        r"(?i)(?<![A-Za-z0-9_-])(?:set-)?cookie\s*:\s*"
+        r"(?i)(?<![A-Za-z0-9_-])(?:set-)?cookie\s*[:=]\s*"
         r"[^\s;=]+\s*=\s*[^\s;]+"
     ),
     re.compile(
-        r"(?i)(?<![A-Za-z0-9])(?:[a-z][a-z0-9]*[_-])*"
-        r"(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
-        r"refresh[_-]?token|secret[_-]?key|client[_-]?secret|token|"
+        r"(?i)(?<![A-Za-z0-9])(?:[a-z][a-z0-9]*[ _-]+)*"
+        r"(?:api[ _-]?(?:key|token)|access[ _-]?token|auth[ _-]?token|"
+        r"refresh[ _-]?token|secret[ _-]?key|client[ _-]?secret|token|"
         r"password|passwd)\s*[:=]\s*"
         r"(?:\"[^\"\r\n]+\"|'[^'\r\n]+'|[^\s,;]+)"
     ),
     re.compile(
-        r"(?i)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE "
+        r"(?i)-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE "
         r"KEY-----"
     ),
 )

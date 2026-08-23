@@ -347,12 +347,19 @@ class RetentionRepository:
     def require_presence_cleanup_receipt(
         self,
         job_id: int,
+        *,
+        manifest_hash: str,
+        expected_external_input_hash: str,
         expected_output_hash: str,
     ) -> tuple[LocalArtifact, ...]:
         if (
             not self._conn.in_transaction
             or type(job_id) is not int
             or job_id <= 0
+            or type(manifest_hash) is not str
+            or _SHA256.fullmatch(manifest_hash) is None
+            or type(expected_external_input_hash) is not str
+            or _SHA256.fullmatch(expected_external_input_hash) is None
             or type(expected_output_hash) is not str
             or _SHA256.fullmatch(expected_output_hash) is None
         ):
@@ -393,7 +400,7 @@ class RetentionRepository:
             workspace_paths.add(path.parent)
             seen_filenames.add(path.name)
         if (
-            not selected_rows
+            len(selected_rows) != len(_PRESENCE_AUDIO_FILENAMES)
             or len(workspace_paths) != 1
             or seen_filenames != _PRESENCE_AUDIO_FILENAMES
         ):
@@ -413,6 +420,26 @@ class RetentionRepository:
             or os.path.lexists(artifact.local_path)
             for artifact in artifacts
         ):
+            _presence_cleanup_invalid()
+        external_input_hash = sha256_text(
+            canonical_json(
+                {
+                    "artifacts": [
+                        {
+                            "id": artifact.id,
+                            "path_hash": sha256_text(
+                                str(artifact.local_path)
+                            ),
+                        }
+                        for artifact in artifacts
+                    ],
+                    "manifest_hash": manifest_hash,
+                    "schema": "presence-worker-external-input.v1",
+                    "unit_key": "audio:cleanup",
+                }
+            )
+        )
+        if external_input_hash != expected_external_input_hash:
             _presence_cleanup_invalid()
         receipt_hash = sha256_text(
             canonical_json(
