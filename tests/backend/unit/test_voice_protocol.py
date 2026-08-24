@@ -3,6 +3,7 @@ import ast
 import hashlib
 import json
 import math
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -695,6 +696,165 @@ def _reference_identity() -> dict[str, object]:
         "model_sha256": "a" * 64,
         "model_version": "sherpa-onnx-1.13.4",
     }
+
+
+class _StrictSpeakerStream:
+    def __init__(self) -> None:
+        self.state = "created"
+
+    def accept_waveform(
+        self, sample_rate: int, samples: tuple[float, ...]
+    ) -> None:
+        if self.state != "created" or sample_rate != 16_000 or not samples:
+            raise AssertionError("waveform was not accepted exactly once")
+        self.state = "accepted"
+
+    def input_finished(self) -> None:
+        if self.state != "accepted":
+            raise AssertionError("input was finished before waveform acceptance")
+        self.state = "finished"
+
+
+class _StrictSpeakerExtractor:
+    def __init__(self, *, ready: bool = True) -> None:
+        self._ready = ready
+
+    def create_stream(self) -> _StrictSpeakerStream:
+        return _StrictSpeakerStream()
+
+    def is_ready(self, stream: _StrictSpeakerStream) -> bool:
+        if stream.state != "finished":
+            raise AssertionError("readiness was checked before input finished")
+        if not self._ready:
+            return False
+        stream.state = "ready"
+        return True
+
+    def compute(self, stream: _StrictSpeakerStream) -> tuple[float, float]:
+        if stream.state != "ready":
+            raise AssertionError("embedding was computed before readiness")
+        stream.state = "computed"
+        return (0.6, 0.8)
+
+
+def _strict_sherpa_module(*, ready: bool = True) -> SimpleNamespace:
+    extractor = _StrictSpeakerExtractor(ready=ready)
+    return SimpleNamespace(
+        SileroVadModelConfig=SimpleNamespace,
+        SpeakerEmbeddingExtractor=lambda config: extractor,
+        SpeakerEmbeddingExtractorConfig=SimpleNamespace,
+        VadModelConfig=SimpleNamespace,
+        VoiceActivityDetector=(
+            lambda config, buffer_size_in_seconds: SimpleNamespace()
+        ),
+    )
+
+
+def _write_reference_wav(path: Path) -> ReferenceAudioInput:
+    samples = b"\x00\x10" * (16_000 * 3)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(samples)
+    return ReferenceAudioInput(
+        approval_hash="1" * 64,
+        audio_duration_ms=3_000,
+        audio_path=str(path.resolve(strict=True)),
+        audio_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        clip_kind="enrollment",
+        end_ms=3_000,
+        ordinal=1,
+        start_ms=0,
+        subject_id=1,
+        video_id=1,
+    )
+
+
+def test_reference_embedding_checks_stream_readiness_after_input_finished(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_path = tmp_path / "campplus.onnx"
+    model_path.write_bytes(b"synthetic-model")
+    audio = _write_reference_wav(tmp_path / "reference.wav")
+    request = ReferenceEnrollmentRequest.with_canonical_hash(
+        adapter_contract_version="voice-adapter-v1",
+        model_name="3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+        model_path=str(model_path.resolve(strict=True)),
+        model_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
+        model_version="sherpa-onnx-1.13.4",
+        operation="reference_enrollment",
+        audios=(
+            audio,
+            audio.model_copy(
+                update={"approval_hash": "2" * 64, "ordinal": 2}
+            ),
+        ),
+    )
+    sherpa = _strict_sherpa_module()
+    monkeypatch.setattr(
+        "importlib.import_module",
+        lambda name: sherpa if name == "sherpa_onnx" else None,
+    )
+
+    runtime = adapter_main._ReferenceEmbeddingRuntime.initialize(request)
+
+    assert runtime.embedding(audio) == (0.6, 0.8)
+
+
+def test_presence_embedding_checks_stream_readiness_after_input_finished() -> None:
+    backend = adapter_main._SherpaBackend.initialize(
+        sherpa=_strict_sherpa_module(),
+        request=_request(),
+        samples=(0.1, 0.2),
+        reference=(0.6, 0.8),
+    )
+
+    assert backend._embedding((0.1, 0.2)) == (0.6, 0.8)
+
+
+def test_reference_embedding_rejects_a_finished_stream_that_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_path = tmp_path / "campplus.onnx"
+    model_path.write_bytes(b"synthetic-model")
+    audio = _write_reference_wav(tmp_path / "reference.wav")
+    request = ReferenceEnrollmentRequest.with_canonical_hash(
+        adapter_contract_version="voice-adapter-v1",
+        model_name="3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+        model_path=str(model_path.resolve(strict=True)),
+        model_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
+        model_version="sherpa-onnx-1.13.4",
+        operation="reference_enrollment",
+        audios=(
+            audio,
+            audio.model_copy(
+                update={"approval_hash": "2" * 64, "ordinal": 2}
+            ),
+        ),
+    )
+    sherpa = _strict_sherpa_module(ready=False)
+    monkeypatch.setattr(
+        "importlib.import_module",
+        lambda name: sherpa if name == "sherpa_onnx" else None,
+    )
+
+    runtime = adapter_main._ReferenceEmbeddingRuntime.initialize(request)
+
+    with pytest.raises(ValueError, match="speaker extractor is not ready"):
+        runtime.embedding(audio)
+
+
+def test_presence_embedding_rejects_a_finished_stream_that_is_not_ready() -> None:
+    backend = adapter_main._SherpaBackend.initialize(
+        sherpa=_strict_sherpa_module(ready=False),
+        request=_request(),
+        samples=(0.1, 0.2),
+        reference=(0.6, 0.8),
+    )
+
+    with pytest.raises(ValueError, match="speaker extractor is not ready"):
+        backend._embedding((0.1, 0.2))
 
 
 def test_reference_operations_bind_ranges_features_and_child_cpu() -> None:

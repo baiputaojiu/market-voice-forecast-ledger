@@ -303,9 +303,6 @@ class _ReferenceEmbeddingRuntime:
             provider="cpu",
         )
         extractor = sherpa.SpeakerEmbeddingExtractor(config)
-        readiness = getattr(extractor, "is_ready", None)
-        if callable(readiness) and not readiness():
-            raise ValueError("speaker extractor is not ready")
         return cls(extractor)
 
     def embedding(self, audio: ReferenceAudioInput) -> tuple[float, ...]:
@@ -339,6 +336,8 @@ class _ReferenceEmbeddingRuntime:
         stream = self._extractor.create_stream()
         stream.accept_waveform(16_000, samples)
         stream.input_finished()
+        if not self._extractor.is_ready(stream):
+            raise ValueError("speaker extractor is not ready")
         result = tuple(float(value) for value in self._extractor.compute(stream))
         if not result or any(not math.isfinite(value) for value in result):
             raise ValueError("invalid speaker embedding")
@@ -418,9 +417,6 @@ class _SherpaBackend:
             provider="cpu",
         )
         extractor = sherpa.SpeakerEmbeddingExtractor(extractor_config)
-        readiness = getattr(extractor, "is_ready", None)
-        if callable(readiness) and not readiness():
-            raise ValueError("speaker extractor is not ready")
         silero = sherpa.SileroVadModelConfig(
             model=request.vad_model_path,
             threshold=0.5,
@@ -512,6 +508,8 @@ class _SherpaBackend:
         stream = self._extractor.create_stream()
         stream.accept_waveform(16_000, samples)
         stream.input_finished()
+        if not self._extractor.is_ready(stream):
+            raise ValueError("speaker extractor is not ready")
         result = tuple(float(value) for value in self._extractor.compute(stream))
         if not result or any(not math.isfinite(value) for value in result):
             raise ValueError("invalid speaker embedding")
