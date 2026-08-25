@@ -1,6 +1,6 @@
 # 作業状態
 
-最終更新: 2026-08-22 JST
+最終更新: 2026-08-25 JST
 
 この文書の状態は、このファイルを含むcommitに対応する。SHAは本文へ埋め込まず、Gitから取得する。
 
@@ -103,6 +103,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 旧Market Masters channelのuploads playlistがprovider側で失効し、現行公開channelが`UCXvjRTXoDa8tKwdkTaukGug`であることを安全診断した。migration `0019`は旧configに完全一致するprofileだけへ新versionを追記し、旧versionとjob manifestを保持したままcurrent pointerと監査eventを更新する。旧job 1は`failed`から`stopped`へ移し、再試行していない。
 - 現行profile version 5で新規full-discovery job 2を作成した。実応答で判明した1 MiB response境界は`videos.list`を最大10 IDへ分割し、provider descriptionのCR/CRLFはLFへcanonical化するRED/GREEN修正で解消した。job 2は7/7 unitが`success`、jobは`succeeded`、7 checkpointと7 source cursorが同じ固定upper boundまで完了した。
 - 初回実収集は2,718 video、2,718 metadata snapshot、3,364 observation、2,729 person candidate、2,729件すべて`collection_initial`/`presence_unverified` decisionとなった。共有動画はvideoを重複作成せず人物別candidateへ分岐する。transcript segment、speaker assignment、analysis run/statement/forecast、video-pipeline binding、local artifactはすべて0件で、collection停止境界を維持した。実DBの`PRAGMA integrity_check`は`ok`だった。
+- 2026-08-25に、期間指定なしの通常予想を公開日基準の2か月へ割り当てること、本人が明示した真の期間不明だけを「時期不明」にすること、明示期間は公開後2か月だけで削除しないこと、重なる期間の反転を元発言を保持した `見解変更` とすること、本人の売買・助言発言を直接予想と区別した強い方向シグナルとして扱うことをユーザー承認済み要件・DEC-044へ記録した。
 
 ## 作業中（In Progress）
 
@@ -113,6 +114,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 複数日・複数profileでの実YouTube収集網羅性と長期運用受入。
 - 音声取得、音声処理、本人声確認の詳細設計。collectionはこれらのjobを自動生成しない。
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
+- 期間指定なしの2か月既定、売買・助言由来シグナル、重なる期間の見解変更表示に対応するdomain contract、永続化、再投影、API、UI、回帰試験の設計と実装。今回確定したのは要件と判断方針であり、実装済みとは扱わない。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
 - MVPで固定する音声モデル名・バージョン、具体的な生スコア尺度・閾値値、閾値設定バージョンの初期値、保留話者の手動レビュー手順。
 - 次subproject。候補は音声・本人声確認、Codex adapter、UIで、ユーザーの明示承認までは着手しない。
