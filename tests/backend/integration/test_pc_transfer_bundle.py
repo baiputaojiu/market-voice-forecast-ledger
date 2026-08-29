@@ -99,14 +99,14 @@ def transfer_source(
     git_root = tmp_path / "git"
     git_root.mkdir()
     _, repository = create_pushed_repository(git_root)
-    operator_state = (
-        repository / ".superpowers/sdd/2026-08-22-presence-verification"
-    )
+    ignored_state_root = repository / ".superpowers/sdd"
+    write_file(ignored_state_root / ".gitignore", b"*\n!.gitignore\n")
+    git(repository, "add", ".superpowers/sdd/.gitignore")
+    git(repository, "commit", "-m", "ignore local operator state")
+    git(repository, "push", "origin", "feature/test")
+    operator_state = tmp_path / "operator-state"
     write_file(operator_state / "progress.md", b"# Progress\nReady to migrate.\n")
     write_file(operator_state / "rulings.md", b"# Rulings\nFinite checks.\n")
-    git(repository, "add", ".superpowers")
-    git(repository, "commit", "-m", "record operator state")
-    git(repository, "push", "origin", "feature/test")
     commit_sha = git(repository, "rev-parse", "HEAD")
 
     settings = Settings.for_data_dir(tmp_path / "private-data")

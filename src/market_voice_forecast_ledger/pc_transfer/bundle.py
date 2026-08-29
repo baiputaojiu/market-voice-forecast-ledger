@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import stat
 import tempfile
 import zipfile
@@ -13,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from market_voice_forecast_ledger.config import Settings
 from market_voice_forecast_ledger.domain.errors import DomainError
@@ -95,6 +96,23 @@ class VerifiedBundle:
     manifest: TransferManifest
 
 
+@dataclass(frozen=True, slots=True)
+class ImportRequest:
+    bundle_path: Path
+    repository_root: Path
+    data_root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ImportResult:
+    data_root: Path
+    operator_state_dir: Path
+    manifest: TransferManifest
+    runtime_required: bool
+    credential_required: bool
+    schedule_required: bool
+
+
 def _bundle_error() -> DomainError:
     return DomainError(
         "PC_TRANSFER_BUNDLE_INVALID",
@@ -113,6 +131,27 @@ def _destination_exists_error() -> DomainError:
     return DomainError(
         "PC_TRANSFER_DESTINATION_EXISTS",
         "transfer destination already exists",
+    )
+
+
+def _destination_not_empty_error() -> DomainError:
+    return DomainError(
+        "PC_TRANSFER_DESTINATION_NOT_EMPTY",
+        "transfer destination is not empty",
+    )
+
+
+def _git_mismatch_error() -> DomainError:
+    return DomainError(
+        "PC_TRANSFER_GIT_MISMATCH",
+        "Git checkout does not match transfer bundle",
+    )
+
+
+def _partial_import_error() -> DomainError:
+    return DomainError(
+        "PC_TRANSFER_IMPORT_PARTIAL",
+        "transfer data was restored but operator state placement is incomplete",
     )
 
 
@@ -582,11 +621,230 @@ def verify_bundle(bundle_path: Path) -> VerifiedBundle:
         raise _bundle_error() from exc
 
 
+def imported_member_path(data_root: Path, member: BundleMember) -> Path:
+    path = PurePosixPath(member.path)
+    if member.role == "database":
+        return data_root / "ledger.sqlite3"
+    if member.role == "model":
+        return data_root / "voice-models" / path.name
+    if member.role in {"runtime-requirements", "runtime-wheel"}:
+        return data_root / "voice-wheelhouse" / path.name
+    if member.role in {"runtime-tool", "project-wheel"}:
+        return data_root / "voice-work" / "install" / path.name
+    raise _bundle_error()
+
+
+def _repository_urls_match(left: str, right: str) -> bool:
+    left_path = Path(left)
+    right_path = Path(right)
+    left_local = left_path.is_absolute()
+    right_local = right_path.is_absolute()
+    if left_local or right_local:
+        if not left_local or not right_local:
+            return False
+        try:
+            return left_path.resolve(strict=True) == right_path.resolve(strict=True)
+        except OSError:
+            return False
+    return left.rstrip("/") == right.rstrip("/")
+
+
+def _require_matching_checkpoint(
+    repository_root: Path,
+    manifest: TransferManifest,
+) -> object:
+    try:
+        checkpoint = inspect_git_checkpoint(repository_root)
+    except DomainError:
+        raise _git_mismatch_error() from None
+    if (
+        not _repository_urls_match(
+            checkpoint.repository_url,
+            manifest.repository_url,
+        )
+        or checkpoint.branch != manifest.branch
+        or checkpoint.commit_sha != manifest.commit_sha
+        or checkpoint.remote_sha != manifest.commit_sha
+    ):
+        raise _git_mismatch_error()
+    return checkpoint
+
+
+def _require_absent_or_empty(path: Path) -> bool:
+    if path.is_symlink() or _is_reparse(path):
+        raise _destination_not_empty_error()
+    if not path.exists():
+        return False
+    if not path.is_dir() or next(path.iterdir(), None) is not None:
+        raise _destination_not_empty_error()
+    return True
+
+
+def _extract_exact_member(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    member: BundleMember,
+    destination: Path,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    with archive.open(info, "r") as reader, destination.open("xb") as writer:
+        while block := reader.read(_BLOCK_BYTES):
+            size += len(block)
+            if size > member.size_bytes:
+                raise _bundle_error()
+            digest.update(block)
+            writer.write(block)
+    if size != member.size_bytes or digest.hexdigest() != member.sha256:
+        raise _bundle_error()
+
+
+def _operator_relative_path(member: BundleMember) -> Path:
+    prefix = "operator-state/presence-verification/"
+    if member.role != "operator-state" or not member.path.startswith(prefix):
+        raise _bundle_error()
+    relative = PurePosixPath(member.path.removeprefix(prefix))
+    if not relative.parts:
+        raise _bundle_error()
+    return Path(*relative.parts)
+
+
+def _after_staged_extract() -> None:
+    return None
+
+
+def _place_operator_staging(source: Path, destination: Path) -> None:
+    source.rename(destination)
+
+
+def _remove_staging(path: Path | None, parent: Path, prefix: str) -> None:
+    if path is None or not path.exists():
+        return
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(parent)
+        if resolved.parent != parent or not resolved.name.startswith(prefix):
+            return
+        shutil.rmtree(resolved)
+    except OSError:
+        return
+
+
+def import_bundle(request: ImportRequest) -> ImportResult:
+    if (
+        type(request) is not ImportRequest
+        or not isinstance(request.bundle_path, Path)
+        or not isinstance(request.repository_root, Path)
+        or not isinstance(request.data_root, Path)
+    ):
+        raise _bundle_error()
+    verified = verify_bundle(request.bundle_path)
+    manifest = verified.manifest
+    _require_matching_checkpoint(request.repository_root, manifest)
+    data_staging: Path | None = None
+    operator_staging: Path | None = None
+    data_placed = False
+    try:
+        repository = request.repository_root.resolve(strict=True)
+        if not repository.is_dir() or _is_reparse(repository):
+            raise _git_mismatch_error()
+        raw_data_root = request.data_root.absolute()
+        data_parent = raw_data_root.parent.resolve(strict=True)
+        if not data_parent.is_dir() or _is_reparse(data_parent):
+            raise _destination_not_empty_error()
+        data_root = data_parent / raw_data_root.name
+        operator_raw = repository / Path(manifest.operator_state_destination)
+        operator_destination = operator_raw.resolve(strict=False)
+        operator_destination.relative_to(repository)
+        operator_parent = operator_destination.parent.resolve(strict=True)
+        if not operator_parent.is_dir() or _is_reparse(operator_parent):
+            raise _destination_not_empty_error()
+        data_was_empty = _require_absent_or_empty(data_root)
+        operator_was_empty = _require_absent_or_empty(operator_destination)
+        if data_was_empty:
+            data_root.rmdir()
+        if operator_was_empty:
+            operator_destination.rmdir()
+
+        data_staging = Path(
+            tempfile.mkdtemp(dir=data_parent, prefix=".mvfl-import-")
+        )
+        operator_staging = Path(
+            tempfile.mkdtemp(dir=operator_parent, prefix=".mvfl-operator-")
+        )
+        with zipfile.ZipFile(verified.bundle_path, "r") as archive:
+            infos = _safe_archive_infos(archive)
+            expected_names = {"manifest.json"} | {
+                member.path for member in manifest.members
+            }
+            if set(infos) != expected_names:
+                raise _bundle_error()
+            for member in manifest.members:
+                if member.role == "operator-state":
+                    destination = operator_staging / _operator_relative_path(member)
+                else:
+                    destination = imported_member_path(data_staging, member)
+                _extract_exact_member(
+                    archive,
+                    infos[member.path],
+                    member,
+                    destination,
+                )
+        try:
+            validate_database_snapshot(
+                data_staging / "ledger.sqlite3",
+                manifest.database,
+            )
+        except DomainError:
+            raise _bundle_error() from None
+        _after_staged_extract()
+        _require_matching_checkpoint(repository, manifest)
+        second_verification = verify_bundle(verified.bundle_path)
+        if second_verification.manifest != manifest:
+            raise _bundle_error()
+        data_staging.rename(data_root)
+        data_placed = True
+        data_staging = None
+        try:
+            _place_operator_staging(operator_staging, operator_destination)
+        except OSError as exc:
+            raise _partial_import_error() from exc
+        operator_staging = None
+        return ImportResult(
+            data_root=data_root,
+            operator_state_dir=operator_destination,
+            manifest=manifest,
+            runtime_required=manifest.runtime_rebuild_required,
+            credential_required=manifest.credential_registration_required,
+            schedule_required=manifest.schedule_install_required,
+        )
+    except DomainError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile, zlib.error) as exc:
+        if data_placed:
+            raise _partial_import_error() from exc
+        raise _bundle_error() from exc
+    finally:
+        if data_staging is not None:
+            _remove_staging(data_staging, data_parent, ".mvfl-import-")
+        if operator_staging is not None:
+            _remove_staging(
+                operator_staging,
+                operator_parent,
+                ".mvfl-operator-",
+            )
+
+
 __all__ = [
     "ExportDependencies",
     "ExportRequest",
     "ExportResult",
+    "ImportRequest",
+    "ImportResult",
     "VerifiedBundle",
     "export_bundle",
+    "import_bundle",
+    "imported_member_path",
     "verify_bundle",
 ]
