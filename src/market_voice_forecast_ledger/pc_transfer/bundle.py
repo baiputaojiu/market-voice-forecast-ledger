@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 import zlib
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import resources
 from pathlib import Path, PurePosixPath
@@ -50,7 +50,6 @@ from market_voice_forecast_ledger.voice.runtime import VersionProbe
 from market_voice_forecast_ledger.windows.task_scheduler import (
     ScheduledTaskStatus,
     TaskScheduleReader,
-    TaskSchedulerAdapter,
 )
 
 
@@ -78,9 +77,7 @@ class ExportDependencies:
     version_probe: VersionProbe
     process_runner: ProcessRunner = run_process
     command_runner: CommandRunner = run_command
-    schedule_reader: TaskScheduleReader = field(
-        default_factory=TaskSchedulerAdapter
-    )
+    schedule_reader: TaskScheduleReader | None = None
     after_temporary_verify: Callable[[], None] = _no_operation
 
 

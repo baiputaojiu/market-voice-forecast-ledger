@@ -381,6 +381,9 @@ def _scheduler_imports_outside(
         allowed_imports=(
             ("voice/media.py", "subprocess", "direct"),
             ("voice/process.py", "subprocess", "direct"),
+            ("pc_transfer/checkpoint.py", "subprocess", "direct"),
+            ("pc_transfer/portable.py", "subprocess", "direct"),
+            ("pc_transfer/runtime_rebuild.py", "subprocess", "direct"),
         ),
     )
 
@@ -513,6 +516,7 @@ def test_scheduler_native_imports_stay_in_approved_composition_roots():
             "cli.py",
             "api/dependencies.py",
             "workers/scheduled_sync.py",
+            "pc_transfer/cli.py",
         )
     ) == ()
 
@@ -659,6 +663,31 @@ def test_scheduler_guard_allows_only_exact_voice_subprocess_imports(monkeypatch)
         ("voice/other.py", 1, "subprocess"),
         ("voice/other.py", 2, "win32com"),
     }
+
+
+def test_scheduler_guard_allows_only_exact_transfer_process_adapters(
+    monkeypatch,
+):
+    paths = tuple(
+        Path(name)
+        for name in ("checkpoint", "portable", "runtime", "bundle")
+    )
+    relatives = {
+        "checkpoint": "pc_transfer/checkpoint.py",
+        "portable": "pc_transfer/portable.py",
+        "runtime": "pc_transfer/runtime_rebuild.py",
+        "bundle": "pc_transfer/bundle.py",
+    }
+    tree = ast.parse("import subprocess\n")
+    monkeypatch.setitem(globals(), "_python_files", lambda _roots: paths)
+    monkeypatch.setitem(
+        globals(), "_relative", lambda path: relatives[path.name]
+    )
+    monkeypatch.setitem(globals(), "_tree", lambda _path: tree)
+
+    assert _scheduler_imports_outside(()) == (
+        ("pc_transfer/bundle.py", 1, "subprocess"),
+    )
 
 
 def test_scheduler_guard_rejects_imported_subprocess_symbol_in_voice_root(
