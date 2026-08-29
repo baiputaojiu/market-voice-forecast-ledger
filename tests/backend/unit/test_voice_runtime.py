@@ -299,6 +299,8 @@ def test_voice_private_paths_are_derived_only_from_settings_data_dir(tmp_path: P
     assert settings.voice_runtime_dir == settings.data_dir / "voice-runtime"
     assert settings.voice_model_dir == settings.data_dir / "voice-models"
     assert settings.voice_work_dir == settings.data_dir / "voice-work"
+    assert settings.voice_wheelhouse_dir == settings.data_dir / "voice-wheelhouse"
+    assert settings.voice_install_dir == settings.data_dir / "voice-work" / "install"
 
 
 @pytest.mark.parametrize("mutation", ("cuda", "hash", "version", "path_escape", "symlink"))

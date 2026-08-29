@@ -402,7 +402,7 @@ def collect_portable_inventory(
             ):
                 raise _portable_error()
 
-        wheelhouse = data_root / "voice-wheelhouse"
+        wheelhouse = settings.voice_wheelhouse_dir
         expected_wheel_names = {
             Path(path).name for path in EXACT_RUNTIME_WHEEL_MEMBERS
         }

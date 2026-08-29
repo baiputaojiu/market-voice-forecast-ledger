@@ -539,7 +539,7 @@ def rebuild_voice_runtime(
         project_member = _member_by_role(request.manifest, "project-wheel")[0]
         requirements = _require_member_file(data_root, requirements_member)
         project_wheel = _require_member_file(data_root, project_member)
-        wheelhouse = data_root / "voice-wheelhouse"
+        wheelhouse = Settings.for_data_dir(data_root).voice_wheelhouse_dir
         environment = _offline_environment()
         for command in _offline_install_commands(
             runtime_python,

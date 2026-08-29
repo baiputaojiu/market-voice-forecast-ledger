@@ -20,6 +20,14 @@ class Settings:
     def voice_work_dir(self) -> Path:
         return self.data_dir / "voice-work"
 
+    @property
+    def voice_wheelhouse_dir(self) -> Path:
+        return self.data_dir / "voice-wheelhouse"
+
+    @property
+    def voice_install_dir(self) -> Path:
+        return self.voice_work_dir / "install"
+
     @classmethod
     def for_data_dir(cls, data_dir: Path) -> "Settings":
         return cls(data_dir, data_dir / "ledger.sqlite3", data_dir / "temp-audio")
