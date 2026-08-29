@@ -182,6 +182,32 @@ def test_runtime_attests_exact_private_artifacts_and_fixed_probe_argv(tmp_path: 
     ]
 
 
+def test_attest_runtime_accepts_only_a_finite_candidate_lock(
+    tmp_path: Path,
+) -> None:
+    settings, probe, allowlists = _runtime_fixture(tmp_path)
+    default_lock = settings.voice_runtime_dir / "runtime-lock.json"
+    candidate = settings.voice_runtime_dir / "runtime-lock.campplus.json"
+    candidate.write_bytes(default_lock.read_bytes())
+
+    result = attest_runtime(
+        settings,
+        version_probe=probe,
+        allowlists=allowlists,
+        lock_name="runtime-lock.campplus.json",
+    )
+
+    assert result.model_name == "model.onnx"
+    with pytest.raises(DomainError) as error:
+        attest_runtime(
+            settings,
+            version_probe=probe,
+            allowlists=allowlists,
+            lock_name="../runtime-lock.json",
+        )
+    assert error.value.code == "VOICE_RUNTIME_INVALID"
+
+
 @pytest.mark.parametrize(
     ("executable", "argument", "output"),
     (

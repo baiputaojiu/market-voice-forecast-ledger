@@ -39,6 +39,13 @@ _PYTHON_VERSION = "3.14.6"
 _YT_DLP_VERSION = "2026.08.19"
 _DENO_VERSION = "2.9.5"
 _FFMPEG_VERSION = "9.0.1"
+_TRANSFERABLE_LOCK_NAMES = frozenset(
+    {
+        "runtime-lock.json",
+        "runtime-lock.campplus.json",
+        "runtime-lock.wespeaker.json",
+    }
+)
 
 VersionProbe = Callable[[tuple[str, ...]], str]
 
@@ -89,15 +96,24 @@ def attest_runtime(
     *,
     version_probe: VersionProbe,
     allowlists: RuntimeAllowlists = RuntimeAllowlists(),
+    lock_name: str = "runtime-lock.json",
 ) -> RuntimeAttestation:
     try:
-        if not isinstance(settings, Settings) or not isinstance(allowlists, RuntimeAllowlists):
+        if (
+            not isinstance(settings, Settings)
+            or not isinstance(allowlists, RuntimeAllowlists)
+            or type(lock_name) is not str
+            or lock_name not in _TRANSFERABLE_LOCK_NAMES
+        ):
             raise ValueError("invalid runtime inputs")
         _validate_allowlists(allowlists)
         data_root = _private_root(settings.data_dir)
         runtime_root = _private_child_root(settings.voice_runtime_dir, data_root)
         model_root = _private_child_root(settings.voice_model_dir, data_root)
-        lock_path = _private_file(settings.voice_runtime_dir / "runtime-lock.json", runtime_root)
+        lock_path = _private_file(
+            settings.voice_runtime_dir / lock_name,
+            runtime_root,
+        )
         lock = _read_lock(lock_path)
         python = _artifact(lock["python"], runtime_root, {"path", "sha256", "version"})
         startup = _startup_attestation(lock["python_startup"], runtime_root)
