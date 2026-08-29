@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### PC移行subproject: GitHub正本と自己検証bundle
+### PC移行完了・presence verification修復待ち
 
-M0、M1、M2中核バックエンドとYouTube収集Task 1～13は完了済みである。現在は`feature/presence-verification`の未完了作業、本番DB、固定voice runtime、非公開operator stateを別PCへ安全に移す一つの連続作業を進めている。GitHubだけを開発状態の正本とし、Google Driveは完成した自己検証ZIPの一時搬送路に限定する。承認済みの[設計](../superpowers/specs/2026-08-29-pc-transfer-handoff-design.md)と[実行計画](../superpowers/plans/2026-08-29-pc-transfer-handoff.md)に従い、実装・全検証・remote checkpoint・旧PC export・新PC acceptanceの順で完了させる。新PC受入前は移行完了としない。
+M0、M1、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 1～12は完了済みである。`feature/presence-verification`のGit状態、本番DB、固定voice runtime、非公開operator stateを新PCへ非上書きで復元し、Git/live remote、bundle、DB、runtime、credential、06:00 schedule、fresh tests、合成round-trip E2Eの受入を完了した。GitHubだけを開発状態の正本とし、Google Drive/Downloadsの完成ZIPと旧PC private dataは回復元として保持する。次はユーザーのpre-work summary確認後に、`vad-v2` contractと無効な既存20 pilot runの限定修復へ進む。
 
 ## 完了済み（Completed）
 
@@ -75,22 +75,22 @@ M0、M1、M2中核バックエンドとYouTube収集Task 1～13は完了済み�
 - Task 10のarchitecture方針は有限の規約検査に限定する。repository外の明白な直接SQL・保護table参照と、protected module内のwriter alias・dynamic dispatch・`getattr`/`setattr`・`partial`・`eval`/`exec`を拒否するが、point-sensitive Python意味解析やdescriptor/property/callable/複雑aliasの架空迂回を拡張しない。真の整合性境界はDB制約、transaction、canonical hash reread、実SQLite integration、合成E2Eとする。
 - PC移行Task 9でsave/resume extension、operator手順、DEC-045、公開data/ZIP境界を実装し、`40742f1`へcommitした。
 - 同一task内の有限reviewでoperator cache/log除外とnative process ownershipのImportant 2件をTDD修正した。最終transfer matrix 76 passed、全backend 2,412 passed・既存skip 4件、work-state 260 passed・0 failed、compile/state-doc/公開安全/diffが成功し、未解決findingは0件となった。
+- PC移行Task 10のsource checkpoint `25b203c841d68d97e742a2bd2f683e5686df1b18`をsame-name remote branchへpushし、Task 11で旧PC writer/scheduleを停止したまま自己検証bundleをGoogle Driveへexportした。Task 12でnew PC Downloads上の同一ZIPを検証し、未作成のdata/operator destinationへ非上書きimportした。
+- Python 3.14.6でvoice runtimeをoffline再構築し、active/CAMPPlus/WeSpeakerの3 lockをattestした。DB snapshot SHA、integrity、migration、重要19 table count、reference feature 4件、active artifact 0をmanifestと照合し、Credential Managerの`configured`と06:00 scheduleのcatch-up/Queue/`.venv` actionを確認した。Task 12 transfer suite 76 tests、work-state 260 tests、state-doc、公開安全254 files、synthetic round-trip E2Eが成功した。
 
 ## 作業中（In Progress）
 
-- PC移行Task 10のreadiness文書をcommitし、same-name remote branchへ通常pushしてlive remote SHAを確認する。
-- 続けてTask 11の旧PC凍結・実bundle export・Drive上の可視性確認を行う。別タスクへ分割せず同じ作業として進める。
+- PC移行後のpre-work summaryをユーザーへ提示し、最初のproduct修復へ進む明示確認を待つ。確認前は既存20 runや関連rowを変更しない。
 
 ## 未着手（Not Started）
 
 ### M2後続・M3以降
 
-PC移行の残りと、その後のproduct作業は次の順序とする。
+PC移行後のproduct作業は次の順序とする。
 
-1. 新PCでTask 12のGit/bundle/DB/runtime/credential/schedule/test/first-E2E受入を行い、旧PCとZIPを保持したまま移行完了を記録する。
-2. `vad-v2` contractを導入し、既存の無効な20 pilot runに属するrun/job/manifest/segment/cleanup行だけを限定削除し、同じ20 candidate jobを再作成する。
-3. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
-4. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
-5. 実server/socket、UI、電源断・disk failure、性能の統合検証。
+1. `vad-v2` contractを導入し、既存の無効な20 pilot runに属するrun/job/manifest/segment/cleanup行だけを限定削除し、同じ20 candidate jobを再作成する。
+2. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
+3. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
+4. 実server/socket、UI、電源断・disk failure、性能の統合検証。
 
 3年より古い動画の網羅性と複数日にわたる日次同期確認は、ユーザー判断により完成条件へ含めない。

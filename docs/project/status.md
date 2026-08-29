@@ -1,18 +1,17 @@
 # 作業状態
 
-最終更新: 2026-08-29 JST
+最終更新: 2026-08-30 JST
 
 この文書の状態は、このファイルを含むcommitに対応する。SHAは本文へ埋め込まず、Gitから取得する。
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンド、YouTube収集Task 1～13は完了済みである。現在は`feature/presence-verification`の作業状態とGitHubへ置けない本番データを、GitHub正本・Google Drive一時搬送の自己検証bundleで別PCへ移すsubprojectを実行中である。PC移行specと詳細計画は承認済みで、streaming VAD checkpoint、manifest、checkpoint/SQLite検証、portable runtime、atomic export、非上書きimport、offline rebuild、CLI、合成round-trip E2E、save/resume文書契約、全backend/work-state検証、有限review修正までcommit済みである。remote push、旧PCの実export、Drive同期可視性、新PCの実受入は未完了であり、移行完了またはアプリ全体の完成は主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 1～12は完了済みである。`feature/presence-verification`のGit状態、本番DB、固定voice runtime、非公開operator stateを、GitHub正本・Google Drive一時搬送の自己検証bundleから新PCへ非上書きで復元し、credential、06:00 schedule、DB/runtime、work-state、公開安全、合成round-trip E2Eまで受け入れた。次のproduct作業は、ユーザーがこの受入要約を確認した後の`vad-v2` contract導入と無効な既存20 pilot runの限定修復である。アプリ全体の完成は主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- 現在branch: `feature/presence-verification`。2026-08-29のreadiness文書更新直前に確認した`HEAD`は`cd242c5d89ed3ade51520bb75a803689d788bb16` (`fix: isolate PC transfer process adapters`)。
-- 現在branchにはupstreamが未設定で、同時点では`origin/main`に対し59 commits ahead・0 behindである。remote checkpointとlive remote SHA一致はまだ完了していない。
+- 現在branch: `feature/presence-verification`、upstream: `origin/feature/presence-verification`。移行payloadのsource checkpointは`25b203c841d68d97e742a2bd2f683e5686df1b18`で、Task 12開始時にlocal HEAD・upstream・live remoteが一致することを確認した。この文書を含むacceptance commitのSHAはGitから取得し、push後のlive remote一致を検証する。
 - `origin/main`の公開済みruntime base: `5db7dbf580464674dbc6b11dc74cd055978d48d4` (`fix: normalize YouTube scheduler XML`)
 - local `main`: 状態文書を含めてlive `origin/main`へ反映する。現在SHAとahead/behindはGit検査scriptを正本とする。
 - YouTube収集squash統合: `157f739` (`feat: add durable YouTube collection pipeline (#1)`)
@@ -27,7 +26,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - whole-branch Fix G: `188617e7bdc31229d161c1efab1d4269b007d67e` (`fix: align public ignore policy`)。
 - M2統合: `feature/m2-core-backend`をローカル`main`へfast-forward統合後、統合済みworktreeとbranchを通常削除した。
 - YouTube収集subprojectと追加scheduler修正は`main`へ統合・push済みで、PRを作らずlive remote SHA一致確認後にfeature branch/worktreeをcleanupした。
-- ローカル環境: main直下の`.venv`はGit除外対象で、既存offline `setuptools 83`から再構築した。収集データや秘密情報を含まず、push対象ではない。
+- ローカル環境: repository直下のGit除外`.venv`は64-bit Python 3.14.6で新規構築した。移行ZIP固定の`pydantic 2.13.4`・`pydantic-core 2.46.4`、同ZIPのsource checkpoint project wheel、`pyproject.toml`範囲内のapp/dev依存を使用し、`pip check`は成功した。収集データや秘密情報を含まず、push対象ではない。
 - visibility: `PUBLIC`
 - commit SHAとahead/behindは本文へ固定せず、`scripts/work-state/inspect-git-state.ps1 -Json`で取得する。
 - 保存完了は`scripts/work-state/verify-remote-head.ps1`によるlive remote SHA一致を条件とする。
@@ -111,16 +110,15 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - Task 10のarchitecture rulingを有限化した。通常の実装ミスとrefactor逸脱を対象に、repository外の明白な直接SQL・保護table参照とprotected module内のwriter alias/dynamic dispatch/`getattr`/`setattr`/`partial`/`eval`/`exec`だけを規約検査する。point-sensitive dataflow、MRO/descriptor/property/callable/container/branchの完全意味解析や架空の迂回表現を再開せず、canonical repository集約をsecurity proofとは扱わない。真の整合性境界はDB `CHECK`/FK/`UNIQUE`/trigger、transaction、canonical hash reread、実SQLite integration、合成E2Eとする。
 - PC移行Task 9のsave/resume extension、README、要件、DEC-045、計画、状態、公開方針、transfer ZIPのignore/scannerを`40742f1`へcommitした。通常のGitHub保存・再開契約は維持した。
 - ユーザー判断に従って別task/subagentへ分けず、Tasks 1～9を同一task内で有限reviewした。Critical 0、Important 2、Minor 0で、operator stateのcache/log等除外を`b08438a`、native Task Scheduler生成とPC移行process adapter所有境界を`cd242c5`でTDD修正し、未解決findingは0件である。
+- PC移行Task 10のreadiness checkpointを`25b203c841d68d97e742a2bd2f683e5686df1b18`へcommitし、same-name remote branchへpushしてlive SHA一致を確認した。Task 11では旧PC writerとmanaged scheduleを停止したままbundleをexportし、Google Drive搬送先から新PCの通常Downloadsへ取得した。
+- PC移行Task 12でbundle `7b84d7ef50ee836e0394a0b82d1660696cb56f2be776f578c7d566a90d4cf0d2`を検証し、未作成の`%LOCALAPPDATA%\MarketVoiceForecastLedger`とGit除外operator-stateへ非上書きimportした。Python 3.14.6でvoice runtimeをoffline再構築し、active/CAMPPlus/WeSpeakerの3 attestation、Credential Managerの`configured`、Task Schedulerの06:00・`StartWhenAvailable=true`・`Queue`・`.venv` actionを受け入れた。旧PC dataとDrive/DownloadsのZIPは削除していない。
 
 ## 作業中（In Progress）
 
-- PC移行Task 10のreadiness evidenceをcommitし、same-name remote branchへ通常pushしてlive remote SHA一致を確認する。
-- 同じ作業のままTask 11の旧PC凍結・実bundle export・Drive上の新PC可視性確認へ続ける。
-- 新PC acceptanceだけは新PC上で実行する。Git/remote、bundle、DB、runtime、credential、06:00 schedule、fresh tests、最初のE2Eがすべて成功するまで移行完了としない。
+- PC移行後のpre-work summaryをユーザーへ提示し、`vad-v2`と既存20 pilot run限定修復へ進むかの確認を待つ。確認前にproduct dataの削除・再作成は行わない。
 
 ## 未着手（Not Started）
 
-- 新PCでのPC移行Task 12実受入。
 - `vad-v2` contract導入と、末尾segmentだけが残った既存20 pilot runに限定したrun/job/manifest/segment/cleanup行の削除、および同一20 candidate jobの再作成。これは移行受入後の最初のproduct作業とする。
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - 期間指定なしの2か月既定、売買・助言由来シグナル、重なる期間の見解変更表示に対応するdomain contract、永続化、再投影、API、UI、回帰試験の設計と実装。今回確定したのは要件と判断方針であり、実装済みとは扱わない。
@@ -135,6 +133,8 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 最初の06:00 scheduled worker: Task Schedulerは2026-08-22 06:00:01 JSTに実行、終了コード0、次回06:00、missed run 0。DB更新は06:00:04 JSTで、日次job 1件・manifest profile 4件・unit 7件を確認した。quota reservationは`channels_list` 1件と`playlist_items_list` 1件、最初のseed unitだけが`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗し、残り6 unitは未実行だった。checkpoint完了0、search window完了0、observation/candidate/presence decision/cursorはいずれも0で、部分結果の昇格はなかった。
 - seed修正後の実収集: 旧job 1=`stopped`、新job 2=`succeeded`、7 unitすべて`success`、7 checkpoint完了、7 proposed/current cursor整合、DB integrity=`ok`。保存結果はvideo/snapshot各2,718、observation 3,364、candidate/presence decision各2,729で、presenceは全件`collection_initial`/`presence_unverified`。transcript/speaker/analysis/video-pipeline/local-artifactは全0件だった。
 - PC移行Tasks 1～10 readiness: 最終transfer matrixは76 passed・0 failed。全backendは2,416件中2,412 passed・既存のreal opt-in 2件とWindows symlink capability 2件をskip・failure 0。work-state Allは260 passed・0 failed。`compileall -q src tests`、state-doc、WorkingTree公開安全254ファイル、Staged公開安全0ファイル、`git diff --check`がすべてexit 0だった。最初の全backend runで既存YouTube architecture guardの未登録PC移行境界1件を検出し、`cd242c5`修正後のfresh全backend再実行で解消した。
+- PC移行Task 12実受入: ZIP `MarketVoiceForecastLedger-transfer-20260829T140113Z-25b203c841d6.zip`は175,067,178 bytes、whole-file SHA-256 `2E000F5AEC64D44252FB107832DBB3B38BD18562888CED906C0845A4390D596B`、source branch/SHAとbundle IDが一致した。DB snapshot SHA-256 `ec3c78985c2ccf72bca13e7cbca482d271ea620d68b233eb53a5360b8c2af79a`、`integrity=ok`、migration `0020_presence_verification.sql`まで、重要19 tableの全count、reference feature 4件の各blob hash、active artifact 0件がmanifestと一致した。主要countはjobs 30、candidates/decisions各2,764、voice verification runs/segments各20である。
+- 新PC runtime/運用受入: Python 3.14.6、sherpa-onnx 1.13.4、yt-dlp 2026.08.19、Deno 2.9.5、FFmpeg 9.0.1、Silero VAD、CPUExecutionProvider、`voice-adapter-v1`を復元した。`vad_contract_version`は意図どおり`vad-v1`のままで、active lockとCAMPPlus/WeSpeaker candidate lockの計3件を再attestした。Credentialは`configured`、managed scheduleは06:00・`StartWhenAvailable=true`・`Queue`・Python 3.14.6 `.venv` actionである。Task 12指定transfer suiteは76 tests・failure 0（合成round-trip E2E 1件を含む）、work-stateは260 passed・0 failed、state-doc、WorkingTree公開安全254ファイルが成功した。
 - 文書構造: 最初に必須文書欠落によるREDを確認し、追加後はGREEN。検証説明追加時も4件のREDを確認してから修正した。
 - 補助スクリプト: 未作成によるREDを確認後、Git状態・公開安全・状態文書・remote SHA検査18件がGREEN。
 - 公開安全の境界: `credentials/`強制stageの抜けをREDで再現し、禁止ディレクトリ追加後にGREEN。
@@ -200,7 +200,9 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - Task 19は完全合成・process内API試験であり、実YouTube、音声、Codex CLI/model/tool、HTTP server/socket、UIを検証していない。
 - Task 13のreal smokeは常時収集され、明示opt-inがない通常実行では`real YouTube operational acceptance not requested`としてskipする。明示opt-inの単発read-only smokeは成功済みである。3年より古い動画の網羅性と複数日にわたる日次同期確認はユーザー判断により完成条件へ含めない。
 - YouTube collectionは音声、字幕、全文文字起こし、本人声判定、speaker assignment、予想分析を実行しない。それらのcollection連動acceptanceは後続subprojectである。
-- 電源断・disk failure、hostileな同時junction差し替え、remote publication、実Google Drive同期、新PCでのoffline runtime再構築と移行受入、完成製品の受け入れは検証していない。
+- 電源断・disk failure、hostileな同時junction差し替え、完成製品の受け入れは検証していない。
+- fresh Python 3.14.6ではPC移行CLIが起動時にvoice protocol経由で`pydantic`を先読みし、標準libraryだけでは`verify/import`をbootstrapできなかった。Task 12では検証済みZIP内の固定`pydantic` wheelだけを一時3.14.6環境へoffline導入して解決した。transfer CLIの遅延importまたはbootstrap依存境界は後続修正候補である。
+- 新規cloneには`.superpowers/sdd`親とローカルignoreがなく、importのoperator stagingが二度目のGit clean検査で自己検出された。新PCでは空の親を作り、repository固有`.git/info/exclude`へ`/.superpowers/sdd/`を1行追加してHEADを変えず解決した。共有cloneの初期化契約として明示する修正は後続候補である。
 
 ## 未解決事項（Open Questions）
 
@@ -211,9 +213,9 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. PC移行readiness文書をcommitし、branchを通常pushしてlive remote SHAを確認する。
-2. 旧PCのschedule時刻を記録して解除し、app/worker停止とDB quiescenceを確認して実bundleをGoogle Drive搬送folderへexport・verifyする。新PCから同じ完成ZIPが見えることを確認するまでDrive同期済みとは報告しない。
-3. 新PCでTask 12を受け入れた後、最初のproduct作業として`vad-v2`と無効な20 runの限定削除・同一candidate再作成を実施する。
+1. ユーザーがPC移行後のpre-work summaryを確認する。旧PC dataとDrive/DownloadsのZIPは保持し、旧PC writerを再開しない。
+2. ユーザー承認後、最初のproduct作業として`vad-v2`を導入し、無効な既存20 runに属するrun/job/manifest/segment/cleanup行だけを限定削除して同一20 candidate jobを再作成する。
+3. 修復後にruntime contract、DB整合性、20 candidateの再作成結果、fresh presence E2Eを検証する。
 
 ## 重要ファイル（Important Files）
 
