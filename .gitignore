@@ -30,6 +30,7 @@ analysis-snapshots/
 *.sqlite3
 *.sqlite3-*
 *.sqlite-*
+MarketVoiceForecastLedger-transfer-*.zip
 *.wav
 *.mp3
 *.m4a

@@ -74,6 +74,37 @@ Codexはリポジトリ内の `$resume-work-state` スキルを使い、Git、�
 
 「別PCへ引き継げるようにして」または「今日の作業内容をGitHubへ反映して」と依頼します。`$save-work-state` は状態文書と公開安全性を検査し、対象を限定してcommit・pushした後、remoteへの反映まで確認します。
 
+## PC移行
+
+GitHubをコード・仕様・進捗の正本とし、Google DriveはGitHubへ置けないデータを
+完成済みの自己検証ZIPとして一時搬送する場合だけ使います。live DBやrepositoryを
+Drive同期フォルダーで直接運用しません。詳細な停止条件と受入条件は
+[PC移行設計](docs/superpowers/specs/2026-08-29-pc-transfer-handoff-design.md)を参照してください。
+
+```powershell
+# Old PC, after Git checkpoint and managed-schedule removal
+python scripts/pc-transfer/pc-transfer.py export `
+  --destination 'G:\My Drive\PC-transfer' `
+  --schedule-local-time '06:00'
+python scripts/pc-transfer/pc-transfer.py verify `
+  --bundle 'G:\My Drive\PC-transfer\MarketVoiceForecastLedger-transfer-<timestamp>-<commit>.zip'
+
+# New PC, after cloning the manifest branch/commit
+python scripts/pc-transfer/pc-transfer.py verify --bundle '<completed-zip>'
+python scripts/pc-transfer/pc-transfer.py import --bundle '<completed-zip>'
+python scripts/pc-transfer/pc-transfer.py rebuild-runtime --bundle '<completed-zip>'
+python scripts/pc-transfer/pc-transfer.py verify-runtime --bundle '<completed-zip>'
+python -m market_voice_forecast_ledger.cli youtube credential set
+python -m market_voice_forecast_ledger.cli youtube credential status
+python -m market_voice_forecast_ledger.cli youtube schedule install --time 06:00
+python -m market_voice_forecast_ledger.cli youtube schedule status
+```
+
+山括弧のplaceholderは`export`が表示した完成ZIPの実パスへ置き換えます。例示名を
+そのままコピーしないでください。旧PCのデータとZIPは、新PCでDB・runtime・credential・
+schedule・fresh test・最初のE2Eが成功するまで削除せず、旧PCのapp・worker・scheduleも
+再開しません。ローカルZIPの作成だけではDrive同期済みとは扱いません。
+
 ## Windowsでバックエンドを検証する
 
 Python 3.11以上を用意し、リポジトリのルートで次を実行します。

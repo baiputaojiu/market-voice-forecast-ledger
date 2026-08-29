@@ -54,6 +54,14 @@
 4. 実在人物へ架空の発言・予想を割り当てた公開用資料がないこと。
 5. 検査失敗時はcommitとpushを行わず、対象を報告すること。
 
+## PC Transfer Bundles
+
+Transfer ZIPは非公開のローカル成果物である。本番database、参照声特徴、ONNX model、
+固定実行ファイル、wheel、非公開operator記録を含み得るため、Gitで常にignoreし、stage・
+commitしてはならない。bundleからはcredential、`.codex`、live SQLite sidecar、
+`voice-runtime`、旧archive、一時音声、cache、logを除外する。Google Driveは完成ZIPの
+一時搬送だけに使い、同期先をlive data rootまたはrepositoryとして使わない。
+
 ## 大きな節目のアーカイブ
 
 通常のPC切り替えでは新規状態ファイルを作らない。要件の大規模改定やMVPリリースなど、現在文書から重要な前提を削除する必要がある節目だけ、削除前の情報がGit履歴だけでは発見しづらいと判断した場合に設計アーカイブを作る。作成理由と対象範囲を `decisions.md` に記録する。

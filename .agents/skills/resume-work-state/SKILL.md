@@ -38,6 +38,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/work-state/verify-re
 
 If fetch, fast-forward, or remote verification fails, do not claim the latest state is loaded. Local documents may be summarized as unverified, but implementation must not start from a possibly stale checkout.
 
+## Explicit PC Transfer Resume
+
+Use this extension only when the user explicitly asks to restore a completed PC
+transfer bundle. Git checkout must be verified before import.
+
+1. Complete the normal clean-tree synchronization and verify that local `HEAD`
+   equals the live upstream SHA named by the transfer bundle.
+2. Confirm that the completed ZIP is visible on the new PC, then run
+   `scripts/pc-transfer/pc-transfer.py verify --bundle <completed-zip>` before
+   extracting anything.
+3. Require the destination data and operator-state directories to be absent or
+   empty, then run `scripts/pc-transfer/pc-transfer.py import`. Never overwrite
+   an existing database, runtime, or operator state.
+4. Run `scripts/pc-transfer/pc-transfer.py rebuild-runtime`, followed by
+   `scripts/pc-transfer/pc-transfer.py verify-runtime`. Do not substitute newer
+   package or model versions for the versions attested by the bundle.
+5. Configure the credential outside the bundle and verify its status. Install
+   the managed schedule from the transferred manifest and verify the task name,
+   command, interval, status, and next-run time.
+6. Run the required project and transfer tests, compare the imported state with
+   the manifest, and include the result in the pre-work summary before starting
+   product work.
+
+Do not report migration complete until the imported database, voice runtime,
+credential, schedule, and first end-to-end run have passed on the new PC. Keep
+the old-PC data and completed ZIP unchanged until that acceptance succeeds.
+
 ## Reconstruct and Verify Context
 
 After obtaining the verified checkout, read in this order:

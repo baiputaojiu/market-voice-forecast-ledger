@@ -53,6 +53,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/work-state/verify-re
 
 8. Report branch, local commit SHA, included scope, test results, excluded user changes, remote verification, and the next concrete action.
 
+## Explicit PC Transfer Extension
+
+Use this extension only when the user explicitly asks to move the project and its
+non-Git local data to another PC. GitHub checkpoint must complete before export.
+Google Drive is transport, not canonical storage.
+
+1. Complete the ordinary save contract, including a clean tree and live remote
+   SHA equality. An unfinished product feature may be checkpointed only when its
+   exact state and first resume action are in `docs/project/status.md`.
+2. Read the managed schedule status and record its exact local time. Stop any
+   project app or worker without force, remove the managed task, and verify it is
+   no longer installed.
+3. Run `scripts/pc-transfer/pc-transfer.py export --destination <Drive-folder>
+   --schedule-local-time <HH:MM>`.
+4. Run `scripts/pc-transfer/pc-transfer.py verify --bundle <completed-zip>`.
+5. Report the bundle ID, commit SHA, completed local ZIP path, old-PC frozen
+   state, and retained old data. A local export proves neither upload nor
+   visibility on the second PC; do not report cloud synchronization from local export.
+
+Never put credentials, `.codex`, the repository, a live SQLite file,
+`voice-runtime`, archive databases, temporary audio, or logs into the bundle.
+Do not restart the old scheduler, app, or workers before new-PC acceptance. Do
+not delete the ZIP or old private data without a later explicit instruction.
+
 ## Completion States
 
 | Observed state | Report |

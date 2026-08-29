@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'Docs', 'Scripts', 'PublicSafety', 'Integration', 'SaveSkill', 'ResumeSkill')]
+    [ValidateSet('All', 'Docs', 'Scripts', 'PublicSafety', 'Integration', 'SaveSkill', 'ResumeSkill', 'PcTransfer')]
     [string]$Suite = 'All'
 )
 
@@ -211,7 +211,8 @@ function Test-Scripts {
         [PSCustomObject]@{ Path = 'ledger.sqlite3'; Message = '.gitignore still excludes SQLite3 databases' },
         [PSCustomObject]@{ Path = 'ledger.sqlite-journal'; Message = '.gitignore still excludes SQLite sidecars' },
         [PSCustomObject]@{ Path = 'ledger.db-wal'; Message = '.gitignore still excludes DB sidecars' },
-        [PSCustomObject]@{ Path = '.coverage'; Message = '.gitignore still excludes the base coverage file' }
+        [PSCustomObject]@{ Path = '.coverage'; Message = '.gitignore still excludes the base coverage file' },
+        [PSCustomObject]@{ Path = 'MarketVoiceForecastLedger-transfer-test.zip'; Message = '.gitignore excludes completed PC transfer bundles' }
     )
     foreach ($case in $ignorePolicyCases) {
         $previousErrorAction = $ErrorActionPreference
@@ -281,6 +282,12 @@ function Test-Scripts {
         $databaseResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '1024')
         Assert-True ($databaseResult.ExitCode -ne 0) 'check-public-safety rejects a database file'
         Remove-Item -LiteralPath (Join-Path $safeData 'production.sqlite') -Force
+
+        $transferFixture = Join-Path $safeData 'MarketVoiceForecastLedger-transfer-test.zip'
+        Set-Content -LiteralPath $transferFixture -Encoding ASCII -Value 'not a real archive'
+        $transferResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '1024')
+        Assert-True ($transferResult.ExitCode -ne 0) 'check-public-safety rejects a PC transfer bundle'
+        Remove-Item -LiteralPath $transferFixture -Force
 
         Set-Content -LiteralPath (Join-Path $safeData 'large.txt') -Encoding ASCII -Value ('x' * 256)
         $largeResult = Invoke-ScriptProcess -ScriptPath $scriptPaths.Safety -Arguments @('-Path', $safeData, '-MaxFileBytes', '100')
@@ -946,6 +953,54 @@ function Test-ResumeSkill {
     }
 }
 
+function Test-PcTransfer {
+    $required = @(
+        'scripts/pc-transfer/pc-transfer.py',
+        'docs/superpowers/specs/2026-08-29-pc-transfer-handoff-design.md',
+        'docs/superpowers/plans/2026-08-29-pc-transfer-handoff.md'
+    )
+    foreach ($relativePath in $required) {
+        Assert-True (
+            Test-Path -LiteralPath (Join-Path $ProjectRoot $relativePath) -PathType Leaf
+        ) "$relativePath exists"
+    }
+
+    $save = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+        Join-Path $ProjectRoot '.agents/skills/save-work-state/SKILL.md'
+    )
+    $resume = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+        Join-Path $ProjectRoot '.agents/skills/resume-work-state/SKILL.md'
+    )
+    foreach ($phrase in @(
+        'GitHub checkpoint must complete before export',
+        'Google Drive is transport, not canonical storage',
+        'pc-transfer.py export',
+        'do not report cloud synchronization from local export'
+    )) {
+        Assert-True ($save -match [regex]::Escape($phrase)) "save skill contains '$phrase'"
+    }
+    foreach ($phrase in @(
+        'Git checkout must be verified before import',
+        'pc-transfer.py verify',
+        'pc-transfer.py import',
+        'pc-transfer.py rebuild-runtime',
+        'pc-transfer.py verify-runtime',
+        'credential',
+        'schedule',
+        'pre-work summary'
+    )) {
+        Assert-True ($resume -match [regex]::Escape($phrase)) "resume skill contains '$phrase'"
+    }
+
+    $agents = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+        Join-Path $ProjectRoot 'AGENTS.md'
+    )
+    $pcMigration = 'PC' + [char]0x79FB + [char]0x884C
+    Assert-True (
+        $agents -match [regex]::Escape($pcMigration)
+    ) 'AGENTS.md routes explicit PC migration'
+}
+
 if ($Suite -in @('All', 'Docs')) {
     Test-Docs
 }
@@ -963,6 +1018,9 @@ if ($Suite -in @('All', 'SaveSkill')) {
 }
 if ($Suite -in @('All', 'ResumeSkill')) {
     Test-ResumeSkill
+}
+if ($Suite -in @('All', 'PcTransfer')) {
+    Test-PcTransfer
 }
 
 Write-Host "RESULT: $script:Passes passed, $script:Failures failed"

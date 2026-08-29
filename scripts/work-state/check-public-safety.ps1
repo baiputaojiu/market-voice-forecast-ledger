@@ -268,6 +268,11 @@ foreach ($relativePath in $relativeFiles) {
     $isCoverageFile = $fileName -eq '.coverage' -or $fileName -like '.coverage.*'
     $isDatabaseSidecar = $fileName -like '*.db-*' -or
         $fileName -like '*.sqlite-*' -or $fileName -like '*.sqlite3-*'
+    $isTransferBundle = $fileName -like 'MarketVoiceForecastLedger-transfer-*.zip'
+    if ($isTransferBundle) {
+        $violations.Add("Forbidden file type: $normalized")
+        continue
+    }
     if ($forbiddenExtensions -contains $extension -or
         $forbiddenFileNames -contains $fileName -or
         $isCoverageFile -or $isDatabaseSidecar -or

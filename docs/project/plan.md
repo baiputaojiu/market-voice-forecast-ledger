@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### YouTube収集subproject: scheduler統合と運用受入
+### PC移行subproject: GitHub正本と自己検証bundle
 
-M0、M1、M2中核バックエンドは完了済みである。YouTube収集subprojectは、4人を設定差だけのperson DiscoveryProfileとして扱うclean cutover、Windows credential、read-only client、seed/search/manual discovery、durable job・cursor、loopback API、Task Scheduler/CLI、完全合成E2E、architecture guardをTask 1～13で実装・独立reviewし、`main`へ統合済みである。Credentialはconfigured、日次Taskはinstalled 06:00である。2026-08-22の最初のscheduled workerで旧Market Masters seedの失効を検出した後、旧jobを再試行せず停止し、migration `0019`で現行seedの新profile versionを追記した。新規job 2は7/7 unitと7 source cursorを完了し、2,729 candidateを全件`presence_unverified`で停止した。複数日の収集運用、音声・本人声確認・分析、live server、UIは受入済みとはしない。
+M0、M1、M2中核バックエンドとYouTube収集Task 1～13は完了済みである。現在は`feature/presence-verification`の未完了作業、本番DB、固定voice runtime、非公開operator stateを別PCへ安全に移す一つの連続作業を進めている。GitHubだけを開発状態の正本とし、Google Driveは完成した自己検証ZIPの一時搬送路に限定する。承認済みの[設計](../superpowers/specs/2026-08-29-pc-transfer-handoff-design.md)と[実行計画](../superpowers/plans/2026-08-29-pc-transfer-handoff.md)に従い、実装・全検証・remote checkpoint・旧PC export・新PC acceptanceの順で完了させる。新PC受入前は移行完了としない。
 
 ## 完了済み（Completed）
 
@@ -70,19 +70,25 @@ M0、M1、M2中核バックエンドは完了済みである。YouTube収集subp
 - WindowsのTask Schedulerが登録XMLから終了期限のない定期task設定を正規化し、照会時にUTF-16宣言とnative code-page bytesを混在させる挙動を再現した。source `9adef31`でrecurring XML、宣言、既定Enabled、LeastPrivilege、Unified Scheduling Engineをfail-closedに正規化し、関連216 testsと全backend 1747件を検証した後、local `main`へ`5db7dbf`として取り込んだ。通常pushとlive SHA一致確認後にlocal/remote feature branchとworktreeをcleanupした。
 - 公開動画をYouTube公開検索と公式oEmbedで確認し、11文字video IDをprocess環境だけに設定した明示opt-in real smokeを実行した。Credential Manager経由の`channels.list`・`videos.list`を含む3 testsが成功し、secret・provider本文を表示せず、envを終了時に削除した。
 - 旧Market Masters seedを監査付きprofile versionで現行channelへ置換し、旧failed jobを`stopped`へ移して新規jobを作成した。実provider応答から`videos.list`最大10 IDとdescription改行canonical化を追加し、新job 2の7/7 unit、7 cursor、2,729件の`presence_unverified` candidate、および下流artifact 0件を実DBで確認した。
+- presence verificationの音声入力を固定windowごとにdrainするstreaming VAD修正を`11a9c76`へcommitした。`vad-v2`へのcontract更新と、tailだけが残った既存20 pilot runの限定削除・同一candidate再作成は移行後の最初のproduct作業として未実施のまま保持した。
+- PC移行の承認済みspecと12段階の詳細計画を作成した。checkpoint/SQLite snapshot、portable runtime inventory、atomic export、非上書きimport、offline runtime rebuild、CLI、完全合成round-trip E2EをTask 1～8として実装し、各focused testを通過させた。
+- Task 10のarchitecture方針は有限の規約検査に限定する。repository外の明白な直接SQL・保護table参照と、protected module内のwriter alias・dynamic dispatch・`getattr`/`setattr`・`partial`・`eval`/`exec`を拒否するが、point-sensitive Python意味解析やdescriptor/property/callable/複雑aliasの架空迂回を拡張しない。真の整合性境界はDB制約、transaction、canonical hash reread、実SQLite integration、合成E2Eとする。
 
 ## 作業中（In Progress）
 
-- なし。次のsubprojectはユーザー承認後に選択する。
+- PC移行Task 9のsave/resume契約、README、恒久状態文書、transfer ZIP公開拒否を完成させる。
+- 続けてTask 10の全backend/work-state検証と有限architecture review、remote push、Task 11の旧PC凍結・実bundle export・Drive上の可視性確認を行う。別タスクへ分割せず同じ作業として進める。
 
 ## 未着手（Not Started）
 
 ### M2後続・M3以降
 
-次のsubprojectは未承認であり、以下の順序もユーザー判断前には確定しない。
+PC移行の残りと、その後のproduct作業は次の順序とする。
 
-1. 複数日・複数profileでの実YouTube収集網羅性と長期運用受入。
-2. 音声取得、固定音声モデル、閾値設定、分割文字起こし、参照声本人確認の詳細specと実装。
+1. 新PCでTask 12のGit/bundle/DB/runtime/credential/schedule/test/first-E2E受入を行い、旧PCとZIPを保持したまま移行完了を記録する。
+2. `vad-v2` contractを導入し、既存の無効な20 pilot runに属するrun/job/manifest/segment/cleanup行だけを限定削除し、同じ20 candidate jobを再作成する。
 3. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
 4. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
-5. 実server/socket、UI、電源断・disk failure、性能・セキュリティの統合検証。
+5. 実server/socket、UI、電源断・disk failure、性能の統合検証。
+
+3年より古い動画の網羅性と複数日にわたる日次同期確認は、ユーザー判断により完成条件へ含めない。

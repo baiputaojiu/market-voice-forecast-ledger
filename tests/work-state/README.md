@@ -12,9 +12,10 @@ Run every deterministic suite from the project root:
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/work-state/run-tests.ps1 -Suite All
 ```
 
-Individual suites are `Docs`, `Scripts`, `Integration`, `SaveSkill`, and
-`ResumeSkill`. `All` includes the temporary Git integration test but does not
-invoke Codex CLI.
+Individual suites are `Docs`, `Scripts`, `Integration`, `SaveSkill`,
+`ResumeSkill`, and `PcTransfer`. `PcTransfer` checks the explicit save/import
+handoff contract. `All` includes the temporary Git integration test but does
+not invoke Codex CLI.
 
 The integration suite creates a uniquely named directory below the system temp
 directory, verifies its resolved path and prefix, and removes it in a `finally`
