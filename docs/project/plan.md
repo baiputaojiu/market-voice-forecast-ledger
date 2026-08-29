@@ -73,11 +73,13 @@ M0、M1、M2中核バックエンドとYouTube収集Task 1～13は完了済み�
 - presence verificationの音声入力を固定windowごとにdrainするstreaming VAD修正を`11a9c76`へcommitした。`vad-v2`へのcontract更新と、tailだけが残った既存20 pilot runの限定削除・同一candidate再作成は移行後の最初のproduct作業として未実施のまま保持した。
 - PC移行の承認済みspecと12段階の詳細計画を作成した。checkpoint/SQLite snapshot、portable runtime inventory、atomic export、非上書きimport、offline runtime rebuild、CLI、完全合成round-trip E2EをTask 1～8として実装し、各focused testを通過させた。
 - Task 10のarchitecture方針は有限の規約検査に限定する。repository外の明白な直接SQL・保護table参照と、protected module内のwriter alias・dynamic dispatch・`getattr`/`setattr`・`partial`・`eval`/`exec`を拒否するが、point-sensitive Python意味解析やdescriptor/property/callable/複雑aliasの架空迂回を拡張しない。真の整合性境界はDB制約、transaction、canonical hash reread、実SQLite integration、合成E2Eとする。
+- PC移行Task 9でsave/resume extension、operator手順、DEC-045、公開data/ZIP境界を実装し、`40742f1`へcommitした。
+- 同一task内の有限reviewでoperator cache/log除外とnative process ownershipのImportant 2件をTDD修正した。最終transfer matrix 76 passed、全backend 2,412 passed・既存skip 4件、work-state 260 passed・0 failed、compile/state-doc/公開安全/diffが成功し、未解決findingは0件となった。
 
 ## 作業中（In Progress）
 
-- PC移行Task 9のsave/resume契約、README、恒久状態文書、transfer ZIP公開拒否を完成させる。
-- 続けてTask 10の全backend/work-state検証と有限architecture review、remote push、Task 11の旧PC凍結・実bundle export・Drive上の可視性確認を行う。別タスクへ分割せず同じ作業として進める。
+- PC移行Task 10のreadiness文書をcommitし、same-name remote branchへ通常pushしてlive remote SHAを確認する。
+- 続けてTask 11の旧PC凍結・実bundle export・Drive上の可視性確認を行う。別タスクへ分割せず同じ作業として進める。
 
 ## 未着手（Not Started）
 

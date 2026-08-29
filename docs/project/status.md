@@ -6,13 +6,13 @@
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンド、YouTube収集Task 1～13は完了済みである。現在は`feature/presence-verification`の作業状態とGitHubへ置けない本番データを、GitHub正本・Google Drive一時搬送の自己検証bundleで別PCへ移すsubprojectを実行中である。PC移行specと詳細計画は承認済みで、streaming VAD checkpoint、manifest、checkpoint/SQLite検証、portable runtime、atomic export、非上書きimport、offline rebuild、CLI、合成round-trip E2Eまでcommit済みである。全backend検証、有限architecture review、remote push、旧PCの実export、Drive同期可視性、新PCの実受入は未完了であり、移行完了またはアプリ全体の完成は主張しない。
+M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンド、YouTube収集Task 1～13は完了済みである。現在は`feature/presence-verification`の作業状態とGitHubへ置けない本番データを、GitHub正本・Google Drive一時搬送の自己検証bundleで別PCへ移すsubprojectを実行中である。PC移行specと詳細計画は承認済みで、streaming VAD checkpoint、manifest、checkpoint/SQLite検証、portable runtime、atomic export、非上書きimport、offline rebuild、CLI、合成round-trip E2E、save/resume文書契約、全backend/work-state検証、有限review修正までcommit済みである。remote push、旧PCの実export、Drive同期可視性、新PCの実受入は未完了であり、移行完了またはアプリ全体の完成は主張しない。
 
 ## Git状態（Git State）
 
 - 公開リポジトリ: `https://github.com/baiputaojiu/market-voice-forecast-ledger`
-- 現在branch: `feature/presence-verification`。2026-08-29の文書更新直前に確認した実装checkpoint `HEAD`は`cea305b4a61643010b5f8d7dd0efb85dd18ff610` (`feat: add PC transfer command workflow`)。
-- 現在branchにはupstreamが未設定で、同時点では`origin/main`に対し56 commits ahead・0 behindである。remote checkpointとlive remote SHA一致はまだ完了していない。
+- 現在branch: `feature/presence-verification`。2026-08-29のreadiness文書更新直前に確認した`HEAD`は`cd242c5d89ed3ade51520bb75a803689d788bb16` (`fix: isolate PC transfer process adapters`)。
+- 現在branchにはupstreamが未設定で、同時点では`origin/main`に対し59 commits ahead・0 behindである。remote checkpointとlive remote SHA一致はまだ完了していない。
 - `origin/main`の公開済みruntime base: `5db7dbf580464674dbc6b11dc74cd055978d48d4` (`fix: normalize YouTube scheduler XML`)
 - local `main`: 状態文書を含めてlive `origin/main`へ反映する。現在SHAとahead/behindはGit検査scriptを正本とする。
 - YouTube収集squash統合: `157f739` (`feat: add durable YouTube collection pipeline (#1)`)
@@ -109,11 +109,13 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - presence検証で全VAD入力を一度に送って動画末尾のsegmentだけを保持していた原因を特定し、固定windowごとにrecognizerをdrainするstreaming修正を`11a9c76`へcommitした。移行中は`vad_contract_version`を`vad-v2`へ変更せず、影響を受けた既存20 pilot runの削除・再作成も行っていない。
 - PC移行の設計を`ef1b276`、詳細計画を`03d4ee5`へcommitした。Tasks 1～8は`aefffe3`～`cea305b`で、clean/live Git checkpoint、read-only SQLite backupとhash reread、portable資材inventory、自己検証ZIP、非上書きimport、offline runtime rebuild/attestation、CLI、合成E2Eを実装した。
 - Task 10のarchitecture rulingを有限化した。通常の実装ミスとrefactor逸脱を対象に、repository外の明白な直接SQL・保護table参照とprotected module内のwriter alias/dynamic dispatch/`getattr`/`setattr`/`partial`/`eval`/`exec`だけを規約検査する。point-sensitive dataflow、MRO/descriptor/property/callable/container/branchの完全意味解析や架空の迂回表現を再開せず、canonical repository集約をsecurity proofとは扱わない。真の整合性境界はDB `CHECK`/FK/`UNIQUE`/trigger、transaction、canonical hash reread、実SQLite integration、合成E2Eとする。
+- PC移行Task 9のsave/resume extension、README、要件、DEC-045、計画、状態、公開方針、transfer ZIPのignore/scannerを`40742f1`へcommitした。通常のGitHub保存・再開契約は維持した。
+- ユーザー判断に従って別task/subagentへ分けず、Tasks 1～9を同一task内で有限reviewした。Critical 0、Important 2、Minor 0で、operator stateのcache/log等除外を`b08438a`、native Task Scheduler生成とPC移行process adapter所有境界を`cd242c5`でTDD修正し、未解決findingは0件である。
 
 ## 作業中（In Progress）
 
-- PC移行Task 9のsave/resume skill、README、要件・決定・計画・状態・公開方針、transfer ZIPのignore/scanner境界を更新中である。通常のGitHub保存・再開契約は弱めない。
-- 同じ作業のままTask 10の全検証と有限review、remote checkpoint、Task 11の旧PC凍結・実bundle export・Drive上の新PC可視性確認へ続ける。
+- PC移行Task 10のreadiness evidenceをcommitし、same-name remote branchへ通常pushしてlive remote SHA一致を確認する。
+- 同じ作業のままTask 11の旧PC凍結・実bundle export・Drive上の新PC可視性確認へ続ける。
 - 新PC acceptanceだけは新PC上で実行する。Git/remote、bundle、DB、runtime、credential、06:00 schedule、fresh tests、最初のE2Eがすべて成功するまで移行完了としない。
 
 ## 未着手（Not Started）
@@ -132,7 +134,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 実YouTube read-only smoke: Credential statusは`configured`。公開video IDをprocess環境だけに設定したopt-in実行は3 passed、exit 0だった。`channels.list`と`videos.list`のresponse shapeを検証し、secret・provider値は出力されず、実行後にenv 2件が不存在であることを確認した。
 - 最初の06:00 scheduled worker: Task Schedulerは2026-08-22 06:00:01 JSTに実行、終了コード0、次回06:00、missed run 0。DB更新は06:00:04 JSTで、日次job 1件・manifest profile 4件・unit 7件を確認した。quota reservationは`channels_list` 1件と`playlist_items_list` 1件、最初のseed unitだけが`YOUTUBE_PROVIDER_REQUEST_FAILED`で失敗し、残り6 unitは未実行だった。checkpoint完了0、search window完了0、observation/candidate/presence decision/cursorはいずれも0で、部分結果の昇格はなかった。
 - seed修正後の実収集: 旧job 1=`stopped`、新job 2=`succeeded`、7 unitすべて`success`、7 checkpoint完了、7 proposed/current cursor整合、DB integrity=`ok`。保存結果はvideo/snapshot各2,718、observation 3,364、candidate/presence decision各2,729で、presenceは全件`collection_initial`/`presence_unverified`。transcript/speaker/analysis/video-pipeline/local-artifactは全0件だった。
-- PC移行Tasks 1～8: checkpoint/snapshot、portable inventory、bundle export/verify、import、runtime rebuild/verify、CLI integration、完全合成round-tripのfocused matrixは各実装commit前に成功した。2026-08-29のTask 9ではSaveSkill 17 passed、ResumeSkill 17 passed、PcTransfer 16 passed、Scripts 143 passed・0 failedをfreshに確認した。全backend・work-state AllはTask 10で未実行である。
+- PC移行Tasks 1～10 readiness: 最終transfer matrixは76 passed・0 failed。全backendは2,416件中2,412 passed・既存のreal opt-in 2件とWindows symlink capability 2件をskip・failure 0。work-state Allは260 passed・0 failed。`compileall -q src tests`、state-doc、WorkingTree公開安全254ファイル、Staged公開安全0ファイル、`git diff --check`がすべてexit 0だった。最初の全backend runで既存YouTube architecture guardの未登録PC移行境界1件を検出し、`cd242c5`修正後のfresh全backend再実行で解消した。
 - 文書構造: 最初に必須文書欠落によるREDを確認し、追加後はGREEN。検証説明追加時も4件のREDを確認してから修正した。
 - 補助スクリプト: 未作成によるREDを確認後、Git状態・公開安全・状態文書・remote SHA検査18件がGREEN。
 - 公開安全の境界: `credentials/`強制stageの抜けをREDで再現し、禁止ディレクトリ追加後にGREEN。
@@ -209,7 +211,7 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. PC移行Task 9をcommitし、Task 10の全backend/work-state検証と有限architecture reviewを通した後、branchを通常pushしてlive remote SHAを確認する。
+1. PC移行readiness文書をcommitし、branchを通常pushしてlive remote SHAを確認する。
 2. 旧PCのschedule時刻を記録して解除し、app/worker停止とDB quiescenceを確認して実bundleをGoogle Drive搬送folderへexport・verifyする。新PCから同じ完成ZIPが見えることを確認するまでDrive同期済みとは報告しない。
 3. 新PCでTask 12を受け入れた後、最初のproduct作業として`vad-v2`と無効な20 runの限定削除・同一candidate再作成を実施する。
 
