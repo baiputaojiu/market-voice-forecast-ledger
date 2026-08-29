@@ -737,6 +737,37 @@ class _StrictSpeakerExtractor:
         return (0.6, 0.8)
 
 
+class _SingleSlotStreamingVad:
+    def __init__(self) -> None:
+        self._front: SimpleNamespace | None = None
+        self._next_start = 0
+
+    def accept_waveform(self, samples: tuple[float, ...]) -> None:
+        for offset in range(0, len(samples), 512):
+            window = samples[offset : offset + 512]
+            self._front = SimpleNamespace(
+                samples=window,
+                start=self._next_start,
+            )
+            self._next_start += len(window)
+
+    def flush(self) -> None:
+        return None
+
+    @property
+    def empty(self) -> bool:
+        return self._front is None
+
+    @property
+    def front(self) -> SimpleNamespace:
+        if self._front is None:
+            raise AssertionError("empty VAD has no front segment")
+        return self._front
+
+    def pop(self) -> None:
+        self._front = None
+
+
 def _strict_sherpa_module(*, ready: bool = True) -> SimpleNamespace:
     extractor = _StrictSpeakerExtractor(ready=ready)
     return SimpleNamespace(
@@ -811,6 +842,27 @@ def test_presence_embedding_checks_stream_readiness_after_input_finished() -> No
     )
 
     assert backend._embedding((0.1, 0.2)) == (0.6, 0.8)
+
+
+def test_presence_score_drains_vad_segments_between_windows() -> None:
+    backend = adapter_main._SherpaBackend(
+        request=_request(),
+        samples=(0.1,) * 1_280,
+        reference=(0.6, 0.8),
+        vad=_SingleSlotStreamingVad(),
+        extractor=_StrictSpeakerExtractor(),
+    )
+
+    response = backend.score()
+
+    assert [
+        (segment.ordinal, segment.start_ms, segment.end_ms)
+        for segment in response.segments
+    ] == [
+        (1, 0, 32),
+        (2, 32, 64),
+        (3, 64, 80),
+    ]
 
 
 def test_reference_embedding_rejects_a_finished_stream_that_is_not_ready(

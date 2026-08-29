@@ -43,6 +43,7 @@ from market_voice_forecast_ledger.voice.protocol import (
 
 
 MAX_ADAPTER_REQUEST_BYTES = 2_097_152
+_VAD_WINDOW_SIZE = 512
 
 
 class _Backend(Protocol):
@@ -423,7 +424,7 @@ class _SherpaBackend:
             min_silence_duration=0.25,
             min_speech_duration=0.25,
             max_speech_duration=30.0,
-            window_size=512,
+            window_size=_VAD_WINDOW_SIZE,
         )
         vad_config = sherpa.VadModelConfig(
             silero_vad=silero,
@@ -444,45 +445,57 @@ class _SherpaBackend:
         )
 
     def score(self) -> AdapterResponse:
-        self._vad.accept_waveform(self._samples)
-        self._vad.flush()
         scored: list[dict[str, object]] = []
-        while not _vad_empty(self._vad):
-            segment = _vad_front(self._vad)
-            segment_samples = tuple(float(value) for value in segment.samples)
-            start_sample = int(segment.start)
-            self._vad.pop()
-            if not segment_samples:
-                continue
-            embedding = self._embedding(segment_samples)
-            raw_score = _cosine(self._reference, embedding)
-            start_ms = (start_sample * 1_000) // 16_000
-            end_ms = ((start_sample + len(segment_samples)) * 1_000) // 16_000
-            if end_ms <= start_ms:
-                continue
-            ordinal = len(scored) + 1
-            evidence_hash = sha256_text(
-                canonical_json(
+
+        def drain_segments() -> None:
+            while not _vad_empty(self._vad):
+                segment = _vad_front(self._vad)
+                segment_samples = tuple(
+                    float(value) for value in segment.samples
+                )
+                start_sample = int(segment.start)
+                self._vad.pop()
+                if not segment_samples:
+                    continue
+                embedding = self._embedding(segment_samples)
+                raw_score = _cosine(self._reference, embedding)
+                start_ms = (start_sample * 1_000) // 16_000
+                end_ms = (
+                    (start_sample + len(segment_samples)) * 1_000
+                ) // 16_000
+                if end_ms <= start_ms:
+                    continue
+                ordinal = len(scored) + 1
+                evidence_hash = sha256_text(
+                    canonical_json(
+                        {
+                            "audio_sha256": self._request.audio_sha256,
+                            "end_ms": end_ms,
+                            "ordinal": ordinal,
+                            "raw_score": raw_score,
+                            "start_ms": start_ms,
+                        }
+                    )
+                )
+                scored.append(
                     {
-                        "audio_sha256": self._request.audio_sha256,
                         "end_ms": end_ms,
+                        "evidence_hash": evidence_hash,
                         "ordinal": ordinal,
                         "raw_score": raw_score,
                         "start_ms": start_ms,
                     }
                 )
+                if len(scored) > MAX_ADAPTER_SEGMENTS:
+                    raise ValueError("too many speech segments")
+
+        for offset in range(0, len(self._samples), _VAD_WINDOW_SIZE):
+            self._vad.accept_waveform(
+                self._samples[offset : offset + _VAD_WINDOW_SIZE]
             )
-            scored.append(
-                {
-                    "end_ms": end_ms,
-                    "evidence_hash": evidence_hash,
-                    "ordinal": ordinal,
-                    "raw_score": raw_score,
-                    "start_ms": start_ms,
-                }
-            )
-            if len(scored) > MAX_ADAPTER_SEGMENTS:
-                raise ValueError("too many speech segments")
+            drain_segments()
+        self._vad.flush()
+        drain_segments()
         if not scored:
             raise ValueError("speech is unavailable")
         maximum = max(float(item["raw_score"]) for item in scored)
