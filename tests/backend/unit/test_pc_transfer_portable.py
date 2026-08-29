@@ -283,6 +283,30 @@ def test_inventory_ignores_redundant_and_stale_install_material(
     assert not any("archive" in source.parts for source in sources)
 
 
+def test_inventory_excludes_nonportable_operator_artifacts(
+    portable_source: PortableSourceFixture,
+    tmp_path: Path,
+) -> None:
+    excluded = (
+        portable_source.operator_state_dir / "__pycache__/state.pyc",
+        portable_source.operator_state_dir / ".codex/session.sqlite3",
+        portable_source.operator_state_dir / "logs/review.log",
+        portable_source.operator_state_dir / "temp-audio/chunk.wav",
+        portable_source.operator_state_dir / "archive/old.md",
+        portable_source.operator_state_dir / "scratch.tmp",
+    )
+    for path in excluded:
+        write_file(path, b"excluded")
+
+    inventory = collect_fixture_inventory(portable_source, tmp_path)
+
+    sources = {item.source for item in inventory.files}
+    assert not sources.intersection(path.resolve() for path in excluded)
+    assert (
+        portable_source.operator_state_dir / "progress.md"
+    ).resolve() in sources
+
+
 def test_inventory_rejects_runtime_tool_hash_drift(
     portable_source: PortableSourceFixture,
     tmp_path: Path,

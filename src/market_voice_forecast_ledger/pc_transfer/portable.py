@@ -55,6 +55,40 @@ TOOL_FILES = (
 )
 MAX_PORTABLE_FILES = 20_000
 MAX_PORTABLE_BYTES = 4 * 1024 * 1024 * 1024
+EXCLUDED_OPERATOR_DIRECTORY_NAMES = frozenset(
+    {
+        ".cache",
+        ".codex",
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "archive",
+        "audio-temp",
+        "cache",
+        "credentials",
+        "logs",
+        "secrets",
+        "task11-work",
+        "temp",
+        "temp-audio",
+        "tmp",
+        "voice-runtime",
+    }
+)
+EXCLUDED_OPERATOR_FILE_NAMES = frozenset(
+    {".ds_store", "desktop.ini", "thumbs.db"}
+)
+EXCLUDED_OPERATOR_FILE_SUFFIXES = (
+    ".bak",
+    ".log",
+    ".part",
+    ".pyc",
+    ".pyo",
+    ".tmp",
+)
 EXPECTED_REQUIREMENT_LINES = (
     "annotated-types==0.8.0 --hash=sha256:"
     "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0",
@@ -334,10 +368,21 @@ def _operator_files(operator_state_dir: Path) -> tuple[PortableFile, ...]:
         current_path = Path(current)
         if _is_reparse(current_path):
             raise _portable_error()
+        directories[:] = [
+            directory
+            for directory in directories
+            if directory.casefold() not in EXCLUDED_OPERATOR_DIRECTORY_NAMES
+        ]
         for directory in directories:
             if _is_reparse(current_path / directory):
                 raise _portable_error()
         for filename in filenames:
+            folded_name = filename.casefold()
+            if (
+                folded_name in EXCLUDED_OPERATOR_FILE_NAMES
+                or folded_name.endswith(EXCLUDED_OPERATOR_FILE_SUFFIXES)
+            ):
+                continue
             candidate = _require_regular_source(current_path / filename, root)
             relative = candidate.relative_to(root).as_posix()
             files.append(
