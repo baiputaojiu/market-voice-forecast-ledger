@@ -10,6 +10,7 @@ from market_voice_forecast_ledger.db.connection import open_database
 from market_voice_forecast_ledger.db.migrate import apply_migrations
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.pc_transfer.snapshot import (
+    DatabaseSnapshotGuard,
     IMPORTANT_TABLES,
     create_database_snapshot,
     validate_database_snapshot,
@@ -273,3 +274,19 @@ def test_snapshot_rejects_migration_identity_mismatch(
             repository_migration_names()[:-1],
         ),
     )
+
+
+def test_snapshot_guard_detects_change_after_snapshot(
+    migrated_db: Path,
+    tmp_path: Path,
+) -> None:
+    seed_valid_reference_feature(migrated_db)
+    destination = tmp_path / "snapshot.sqlite3"
+
+    with DatabaseSnapshotGuard(
+        migrated_db,
+        repository_migration_names(),
+    ) as guard:
+        guard.create_snapshot(destination)
+        insert_job(migrated_db, "succeeded")
+        assert_transfer_error("PC_TRANSFER_SOURCE_CHANGED", guard.verify_unchanged)

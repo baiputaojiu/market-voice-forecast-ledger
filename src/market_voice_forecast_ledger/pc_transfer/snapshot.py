@@ -148,6 +148,22 @@ def _read_only_uri(path: Path) -> str:
     return path.resolve(strict=True).as_uri() + "?mode=ro"
 
 
+def _open_read_only(path: Path) -> sqlite3.Connection:
+    if not path.is_file():
+        raise _database_error()
+    connection = sqlite3.connect(_read_only_uri(path), uri=True)
+    connection.row_factory = None
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def _read_data_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA data_version").fetchone()
+    if row is None or len(row) != 1 or type(row[0]) is not int:
+        raise _database_error()
+    return row[0]
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -191,62 +207,28 @@ def _remove_incomplete_snapshot(path: Path) -> None:
             pass
 
 
-def create_database_snapshot(
-    source: Path,
+def _backup_and_summarize(
+    source_connection: sqlite3.Connection,
     destination: Path,
     expected_migrations: tuple[str, ...],
-    backup_progress: Callable[[int, int, int], None] | None = None,
+    backup_progress: Callable[[int, int, int], None] | None,
 ) -> SnapshotResult:
-    if (
-        type(expected_migrations) is not tuple
-        or not expected_migrations
-        or expected_migrations != tuple(sorted(set(expected_migrations)))
-        or destination.exists()
-        or destination.is_symlink()
-        or not source.is_file()
-    ):
+    if destination.exists() or destination.is_symlink():
         raise _database_error()
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        source_uri = _read_only_uri(source)
-        with closing(sqlite3.connect(source_uri, uri=True)) as source_connection:
-            source_connection.row_factory = None
-            source_connection.execute("PRAGMA query_only=ON")
-            before_version_row = source_connection.execute(
-                "PRAGMA data_version"
+        with closing(sqlite3.connect(destination)) as snapshot_connection:
+            source_connection.backup(
+                snapshot_connection,
+                pages=128,
+                progress=backup_progress,
+                sleep=0.0,
+            )
+            journal_mode = snapshot_connection.execute(
+                "PRAGMA journal_mode=DELETE"
             ).fetchone()
-            if (
-                before_version_row is None
-                or len(before_version_row) != 1
-                or type(before_version_row[0]) is not int
-            ):
+            if journal_mode != ("delete",):
                 raise _database_error()
-            before_version = before_version_row[0]
-            before = _inspect_connection(source_connection, expected_migrations)
-            with closing(sqlite3.connect(destination)) as snapshot_connection:
-                source_connection.backup(
-                    snapshot_connection,
-                    pages=128,
-                    progress=backup_progress,
-                    sleep=0.0,
-                )
-                journal_mode = snapshot_connection.execute(
-                    "PRAGMA journal_mode=DELETE"
-                ).fetchone()
-                if journal_mode != ("delete",):
-                    raise _database_error()
-            after_version_row = source_connection.execute(
-                "PRAGMA data_version"
-            ).fetchone()
-            if (
-                after_version_row is None
-                or len(after_version_row) != 1
-                or type(after_version_row[0]) is not int
-            ):
-                raise _database_error()
-            after = _inspect_connection(source_connection, expected_migrations)
-        if before_version != after_version_row[0] or before != after:
-            raise _source_changed_error()
         database = _summarize_closed_snapshot(
             destination,
             expected_migrations,
@@ -258,6 +240,110 @@ def create_database_snapshot(
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         _remove_incomplete_snapshot(destination)
         raise _database_error() from exc
+
+
+class DatabaseSnapshotGuard:
+    """Hold one source connection and detect commits throughout export."""
+
+    def __init__(
+        self,
+        source: Path,
+        expected_migrations: tuple[str, ...],
+    ) -> None:
+        self._source = source
+        self._expected_migrations = expected_migrations
+        self._connection: sqlite3.Connection | None = None
+        self._data_version: int | None = None
+        self._identity: object | None = None
+
+    def __enter__(self) -> "DatabaseSnapshotGuard":
+        if self._connection is not None:
+            raise _database_error()
+        if (
+            type(self._expected_migrations) is not tuple
+            or not self._expected_migrations
+            or self._expected_migrations
+            != tuple(sorted(set(self._expected_migrations)))
+        ):
+            raise _database_error()
+        try:
+            self._connection = _open_read_only(self._source)
+            self._data_version = _read_data_version(self._connection)
+            self._identity = _inspect_connection(
+                self._connection,
+                self._expected_migrations,
+            )
+            return self
+        except DomainError:
+            self.__exit__(None, None, None)
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            self.__exit__(None, None, None)
+            raise _database_error() from exc
+
+    def create_snapshot(
+        self,
+        destination: Path,
+        backup_progress: Callable[[int, int, int], None] | None = None,
+    ) -> SnapshotResult:
+        if self._connection is None:
+            raise _database_error()
+        result = _backup_and_summarize(
+            self._connection,
+            destination,
+            self._expected_migrations,
+            backup_progress,
+        )
+        try:
+            self.verify_unchanged()
+        except DomainError:
+            _remove_incomplete_snapshot(destination)
+            raise
+        return result
+
+    def verify_unchanged(self) -> None:
+        try:
+            if (
+                self._connection is None
+                or self._data_version is None
+                or self._identity is None
+                or _read_data_version(self._connection) != self._data_version
+                or _inspect_connection(
+                    self._connection,
+                    self._expected_migrations,
+                )
+                != self._identity
+            ):
+                raise _source_changed_error()
+        except DomainError as exc:
+            if exc.code == "PC_TRANSFER_SOURCE_CHANGED":
+                raise
+            raise _source_changed_error() from None
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise _source_changed_error() from exc
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc: object,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc, traceback
+        if self._connection is not None:
+            self._connection.close()
+        self._connection = None
+        self._data_version = None
+        self._identity = None
+
+
+def create_database_snapshot(
+    source: Path,
+    destination: Path,
+    expected_migrations: tuple[str, ...],
+    backup_progress: Callable[[int, int, int], None] | None = None,
+) -> SnapshotResult:
+    with DatabaseSnapshotGuard(source, expected_migrations) as guard:
+        return guard.create_snapshot(destination, backup_progress)
 
 
 def validate_database_snapshot(
