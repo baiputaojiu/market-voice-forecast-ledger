@@ -3,7 +3,7 @@
 ## Status
 
 - Date: 2026-09-03
-- State: user selected the guarded one-shot CLI approach; written-spec review pending
+- State: user-approved design; runtime-lock dependency clarified during implementation planning
 - Branch: `feature/presence-verification`
 - Depends on: `2026-08-22-presence-verification-design.md`, streaming VAD fix `11a9c76`, and completed PC-transfer acceptance
 
@@ -17,6 +17,7 @@
 2. 旧契約の影響を受けた既存20件だけを、事前バックアップと厳密な照合を伴う一度限りのCLIで除去する。
 3. 同じ20 candidateを同じ順序で、新しい`vad-v2` jobとして`queued`へ再作成する。
 4. candidate、presence decision、discovery、video、reference、calibrationその他のデータを変更しない。
+5. private voice runtimeの3 lockを非上書きbackup後に`vad-v2`へ進め、再作成jobを実行可能にする。
 
 修復CLIは音声取得やpresence workerを実行しない。再作成後の20 jobを処理する作業は、DB修復の受入後に別段階で行う。
 
@@ -108,6 +109,14 @@ repair ledgerには少なくとも次を保存する。
 
 `vad-v1`から`vad-v2`への完了行はuniqueとし、二度目の適用をDB制約とserviceの両方で拒否する。
 
+### Private runtime lock upgrade
+
+active、CAMPPlus、WeSpeakerの3 runtime lockは現在`vad-v1`を記録している。DB manifestだけを`vad-v2`へ進めると、workerのruntime/manifest identity検証で新jobを実行できない。このため`apply`はDB修復前に3 lockを検証し、全lockの`vad_contract_version`だけを`vad-v2`へ更新する。
+
+更新前の3 lockはrepair専用backup directoryへexclusive createで複製し、SHA-256をrereadする。model、VAD artifact、Python、Sherpa、yt-dlp、Deno、FFmpeg、provider、adapter contract、startup manifestのfieldとhashは変更しない。更新はcandidate lockを先、active `runtime-lock.json`を最後に原子的file replaceし、3 lockすべてを再attestする。
+
+3 lockがすべて正しい`vad-v1`またはすべて正しい`vad-v2`の場合だけ進める。前回中断等によるmixed version、未知field、identity差異、artifact/probe不一致はDBを変更せず拒否する。runtime更新後にDB transactionが失敗した場合も、検証済みlock backupを保持し、次回はall-`vad-v2`状態から同じDB previewを再確認して続行できる。
+
 ## Exact Target Gate
 
 previewとapply時の再照合は、少なくとも次をすべて要求する。
@@ -136,19 +145,23 @@ preview hashは、from/to contract、candidate順序、全target row identity、
 
 1. CLI引数とproduction DB identityを検証する。
 2. read-only previewを再生成し、指定hashと一致させる。
-3. backup destinationが存在しないことを確認する。
-4. SQLite online backup APIでfull DB backupを作成し、sourceとは別接続で`integrity_check`、`foreign_key_check`、migration inventory、target fingerprintを照合する。
-5. backup fileをclose後にSHA-256 rereadし、ledgerへ保存する値を固定する。
-6. `BEGIN IMMEDIATE` transactionを開始し、target inventoryとpreview hashを再計算する。backup後にtargetが変わっていればrollbackする。
-7. exact row authorizationを設定し、外部キーの子から親の順に対象だけを削除する。
-8. 旧manifest snapshotからcandidate順序と全identityを復元し、VAD versionだけを`vad-v2`へ替えて20件のjob、binding、manifestを`queued`で作る。
-9. transaction内で旧行が0件、新しい`vad-v2` jobが20件、candidate順序が同じ、保持対象fingerprintが同じことを検証する。
-10. repair ledgerを挿入し、authorizationを解除してcommitする。
-11. 新しい接続で`integrity_check`、`foreign_key_check`、migration、repair ledger、行数、candidate順序、全jobのcanonical rereadを確認する。
+3. repair backup directoryが存在しないことを確認する。
+4. 3 runtime lockをattestし、backup directoryへexclusive copyしてSHA-256をrereadする。
+5. SQLite online backup APIでfull DB backupを作成し、sourceとは別接続で`integrity_check`、`foreign_key_check`、migration inventory、target fingerprintを照合する。
+6. backup fileをclose後にSHA-256 rereadし、ledgerへ保存する値を固定する。
+7. 3 runtime lockのVAD contractだけを`vad-v2`へ原子的に更新し、全lockを再attestする。既にall-`vad-v2`なら書き換えない。
+8. `BEGIN IMMEDIATE` transactionを開始し、target inventoryとpreview hashを再計算する。backup後にtargetが変わっていればrollbackする。
+9. exact row authorizationを設定し、外部キーの子から親の順に対象だけを削除する。
+10. 旧manifest snapshotからcandidate順序と全identityを復元し、VAD versionだけを`vad-v2`へ替えて20件のjob、binding、manifestを`queued`で作る。
+11. transaction内で旧行が0件、新しい`vad-v2` jobが20件、candidate順序が同じ、保持対象fingerprintが同じことを検証する。
+12. repair ledgerを挿入し、authorizationを解除してcommitする。
+13. 新しい接続でruntime 3 lock、`integrity_check`、`foreign_key_check`、migration、repair ledger、行数、candidate順序、全jobのcanonical rereadを確認する。
 
 削除順序は外部キーとtriggerを満たすよう、概ねreview、segment、run、manifest、event、attempt、binding、binding set、unit、job、対象local artifact記録とする。実装計画ではschemaから正確な順序を固定し、各DELETEの`rowcount`をpreview件数と一致させる。
 
 backupは追加作成のみで、既存fileを上書きしない。applyが途中で失敗した場合、DB transactionはrollbackし、検証済みbackupは削除せず保持する。事後検証が失敗してもbackupから自動復元しない。自動復元は現DBの上書きになるため、診断とユーザー確認を先に行う。
+
+runtime lockの更新自体は既存3 fileのmetadata書き換えだが、各元fileは事前にexclusive backupされる。binary、model、audio、embedding、cacheは書き換えない。
 
 ## Preserved and Changed Data
 
@@ -195,6 +208,8 @@ run、segment、attempt、eventの実行結果、reviewは再作成時点では�
 - preview不一致、対象drift、想定外参照、review存在、active decision変更、artifact file残存: DB変更前に拒否する。
 - backup destination衝突: 別名へ暗黙上書きせず拒否する。
 - backup作成、hash、integrity、foreign key検証失敗: repair transactionを開始しない。
+- runtime lockのmixed version、backup不一致、field差異、artifact/probe不一致: DBを変更せず拒否する。
+- runtime lock更新中断: active lockを最後に更新し、保持したlock backupから診断可能にする。自動上書き復元は行わない。
 - DELETE rowcount不一致、authorizer不一致、job再作成失敗、ledger insert失敗: transaction全体をrollbackする。
 - process interruption: SQLite transaction rollbackを正本とし、再実行時は新しいpreviewを必須とする。
 - commit後の検証失敗: 成功を報告せず、backupを保持して診断へ移る。
@@ -229,6 +244,8 @@ CLI errorは固定codeと短い安全な説明だけを返し、SQL、絶対path
 - DELETEおよび再作成の各主要境界へfault injectionし、全rollbackとdefault-deny復帰を確認する。
 - 二重実行をservice、CLI、DB unique constraintで拒否する。
 - backup file collisionとbackup検証失敗時にlive DBが不変である。
+- all-`vad-v1` runtime lockを3件とも`vad-v2`へ進め、VAD contract以外のcanonical contentと全artifact attestationが不変である。
+- all-`vad-v2` runtime lockは再書き換えせず受け入れ、mixed version、部分replace失敗、lock backup衝突をDB変更前に拒否する。
 
 ### CLI and architecture tests
 
@@ -246,6 +263,7 @@ CLI errorは固定codeと短い安全な説明だけを返し、SQL、絶対path
 - WorkingTree/Staged public-safety scan
 - production preflight read-only inventory
 - production backup hash/integrity verification
+- production runtime lock 3件のbefore backup hash、after `vad-v2` attestation、非VAD field不変検証
 - production apply後のintegrity、foreign key、exact counts、candidate order、preserved hashes
 - Git clean、限定stage/commit、push、live remote HEAD一致
 
@@ -255,14 +273,15 @@ CLI errorは固定codeと短い安全な説明だけを返し、SQL、絶対path
 
 1. `vad-v2` contract testsと全必須suiteが成功している。
 2. production backupが新規fileとして存在し、SHA-256 reread、integrity、foreign key、migration、target fingerprintを通過している。
-3. one-shot ledgerが1件だけ存在する。
-4. 旧20 jobと専用従属行がexact preview件数どおり0件になっている。
-5. 同じ20 candidateが同じ順序で20 queued `vad-v2` jobへ再作成されている。
-6. 旧run、segment、review、旧job専用artifact recordが残っていない。
-7. candidate current decision、discovery、video、reference、calibration、unrelated dataのfingerprintが変わっていない。
-8. `integrity_check`が`ok`、`foreign_key_check`が0件である。
-9. 通常接続からのDELETEが引き続き拒否され、二度目のrepairも拒否される。
-10. branchのlocal HEAD、upstream、live remote HEADが一致する。
+3. private runtimeのactive、CAMPPlus、WeSpeaker lockがすべて`vad-v2`としてattestされ、VAD contract以外のfieldが更新前と一致する。
+4. one-shot ledgerが1件だけ存在する。
+5. 旧20 jobと専用従属行がexact preview件数どおり0件になっている。
+6. 同じ20 candidateが同じ順序で20 queued `vad-v2` jobへ再作成されている。
+7. 旧run、segment、review、旧job専用artifact recordが残っていない。
+8. candidate current decision、discovery、video、reference、calibration、unrelated dataのfingerprintが変わっていない。
+9. `integrity_check`が`ok`、`foreign_key_check`が0件である。
+10. 通常接続からのDELETEが引き続き拒否され、二度目のrepairも拒否される。
+11. branchのlocal HEAD、upstream、live remote HEADが一致する。
 
 新しい20 jobの音声処理完了や人のreview完了は、このrepairの受入条件には含めない。
 
