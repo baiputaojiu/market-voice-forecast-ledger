@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import closing
 from datetime import time
 from pathlib import Path
 
@@ -39,6 +40,12 @@ _PUBLIC_CLI_ERROR_CODES = frozenset(
     }
 )
 _PUBLIC_PRESENCE_CLI_ERRORS = {
+    **{code: code for code in (
+        "PRESENCE_REPAIR_TARGET_INVALID", "PRESENCE_REPAIR_PREVIEW_CHANGED",
+        "PRESENCE_REPAIR_BACKUP_FAILED", "PRESENCE_REPAIR_RUNTIME_INVALID",
+        "PRESENCE_REPAIR_ALREADY_APPLIED", "PRESENCE_REPAIR_APPLY_FAILED",
+        "PRESENCE_REPAIR_POSTVERIFY_FAILED",
+    )},
     "VOICE_REFERENCE_INVALID": "Presence reference unavailable.",
     "VOICE_REFERENCE_STORED_INVALID": "Presence reference unavailable.",
     "VOICE_REFERENCE_CALIBRATION_FAILED": "Presence calibration unavailable.",
@@ -60,6 +67,12 @@ _PRIVATE_PATH = re.compile(
     r"|(?<![\\/])(?:\\\\|//)[^\\/\s]"
     r"|(?<![A-Za-z0-9/])/(?!/)[^/\s])"
 )
+
+
+def _parse_preview_hash(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("invalid preview hash")
+    return value
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -208,6 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="presence_pilot_command", required=True
     )
     pilot_commands.add_parser("create")
+    repair = pilot_commands.add_parser("repair")
+    repair_commands = repair.add_subparsers(dest="presence_repair_command", required=True)
+    repair_commands.add_parser("preview")
+    repair_apply = repair_commands.add_parser("apply")
+    repair_apply.add_argument("--expected-preview-hash", type=_parse_preview_hash, action=_SingleUseAction, required=True)
     presence_worker = presence_commands.add_parser("worker")
     presence_worker.add_argument(
         "--once",
@@ -246,6 +264,7 @@ def main(
     presence_service_factory: Callable[[], object] | None = None,
     calibration_runner: Callable[[], object] | None = None,
     presence_worker_runner: Callable[[], object] | None = None,
+    presence_repair_service_factory: Callable[[], object] | None = None,
 ) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -331,6 +350,7 @@ def main(
                 presence_service_factory=presence_service_factory,
                 calibration_runner=calibration_runner,
                 presence_worker_runner=presence_worker_runner,
+                presence_repair_service_factory=presence_repair_service_factory,
             )
         except DomainError as error:
             if error.code in _PUBLIC_PRESENCE_CLI_ERRORS:
@@ -352,7 +372,26 @@ def _run_presence_command(
     presence_service_factory: Callable[[], object] | None,
     calibration_runner: Callable[[], object] | None,
     presence_worker_runner: Callable[[], object] | None,
+    presence_repair_service_factory: Callable[[], object] | None,
 ) -> int:
+    if arguments.presence_command == "pilot" and arguments.presence_pilot_command == "repair":
+        command = arguments.presence_repair_command
+        token = getattr(arguments, "expected_preview_hash", None)
+        if presence_repair_service_factory is None:
+            result = _run_production_presence_repair(command, token)
+        else:
+            service = presence_repair_service_factory()
+            result = service.preview() if command == "preview" else service.apply(token)
+        if command == "preview":
+            if (result.from_vad_contract_version, result.to_vad_contract_version) != ("vad-v1", "vad-v2") or result.target.counts["jobs"] != 20:
+                raise ValueError("invalid repair preview")
+            preview_hash = _parse_preview_hash(result.preview_hash)
+            print(f"Presence repair preview: 20 jobs, vad-v1 -> vad-v2, preview_hash={preview_hash}")
+        else:
+            if result.to_vad_contract_version != "vad-v2" or type(result.new_job_ids) is not tuple or len(result.new_job_ids) != 20 or len(set(result.new_job_ids)) != 20 or any(type(value) is not int or value <= 0 for value in result.new_job_ids):
+                raise ValueError("invalid repair result")
+            print("Presence repair completed: 20 queued vad-v2 jobs.")
+        return 0
     if arguments.presence_command == "reference":
         if reference_service_factory is None:
             _presence_dependency_unavailable()
@@ -448,6 +487,26 @@ def _run_presence_command(
         )
         return 0
     raise DomainError("PRESENCE_COMMAND_FAILED", "presence command failed")
+
+
+def _run_production_presence_repair(command: str, expected_preview_hash: str | None = None):
+    from market_voice_forecast_ledger.db.connection import open_database
+    from market_voice_forecast_ledger.db.migrate import apply_migrations
+    from market_voice_forecast_ledger.pc_transfer.runtime_rebuild import probe_version
+    from market_voice_forecast_ledger.services.presence_repair import PresenceRepairService, open_repair_readonly
+
+    settings = default_settings()
+    with closing(open_repair_readonly(settings.database_path)) as readonly:
+        preview = PresenceRepairService(readonly, settings, version_probe=probe_version).preview()
+    if command == "preview":
+        return preview
+    if command != "apply" or expected_preview_hash != preview.preview_hash:
+        raise DomainError("PRESENCE_REPAIR_PREVIEW_CHANGED", "presence repair preview changed")
+    with closing(open_database(settings.database_path)) as conn:
+        service = PresenceRepairService(conn, settings, version_probe=probe_version)
+        service._validate_database()
+        apply_migrations(conn)
+        return service.apply(expected_preview_hash)
 
 
 def _presence_dependency_unavailable() -> None:
@@ -553,6 +612,7 @@ def run_cli(
     presence_service_factory: Callable[[], object] | None = None,
     calibration_runner: Callable[[], object] | None = None,
     presence_worker_runner: Callable[[], object] | None = None,
+    presence_repair_service_factory: Callable[[], object] | None = None,
 ) -> int:
     try:
         return main(
@@ -564,6 +624,7 @@ def run_cli(
             presence_service_factory=presence_service_factory,
             calibration_runner=calibration_runner,
             presence_worker_runner=presence_worker_runner,
+            presence_repair_service_factory=presence_repair_service_factory,
         )
     except DomainError as error:
         presence_message = _PUBLIC_PRESENCE_CLI_ERRORS.get(error.code)

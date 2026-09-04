@@ -3,12 +3,14 @@
 from pathlib import Path
 from types import SimpleNamespace
 import json
+from importlib import resources
 
 import pytest
 
 from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
-from market_voice_forecast_ledger.db.connection import open_database
-from market_voice_forecast_ledger.db.migrate import apply_migrations
+from market_voice_forecast_ledger.db.connection import open_database, transaction
+from market_voice_forecast_ledger.db.migrate import apply_migrations, _execute_script
+from market_voice_forecast_ledger.domain.common import utc_iso
 
 from tests.backend.integration.test_presence_pilot import (
     MODEL_NAME,
@@ -44,7 +46,7 @@ def seed_twenty_succeeded_v1_jobs(conn, tmp_path: Path):
 
 
 @pytest.fixture
-def repair_environment(tmp_path: Path):
+def repair_environment(tmp_path: Path, request):
     settings, probe, allowlists = three_lock_fixture(tmp_path)
     for name in (LOCK_NAMES[0], LOCK_NAMES[-1]):
         path = settings.voice_runtime_dir / name
@@ -53,7 +55,15 @@ def repair_environment(tmp_path: Path):
         document["model"]["version"] = MODEL_VERSION
         path.write_text(json.dumps(document), encoding="utf-8")
     conn = open_database(settings.database_path)
-    apply_migrations(conn)
+    if getattr(request, "param", None) == "0020":
+        conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+        for item in sorted(resources.files("market_voice_forecast_ledger.db.migrations").iterdir()):
+            if item.name.endswith(".sql") and item.name[:4].isdigit() and item.name[:4] <= "0020":
+                with transaction(conn):
+                    _execute_script(conn, item.read_text(encoding="utf-8"))
+                    conn.execute("INSERT INTO schema_migrations VALUES (?, ?)", (item.name.removesuffix(".sql"), utc_iso(NOW)))
+    else:
+        apply_migrations(conn)
     bootstrap_reference_data(conn)
     creation = seed_twenty_succeeded_v1_jobs(conn, tmp_path)
     try:

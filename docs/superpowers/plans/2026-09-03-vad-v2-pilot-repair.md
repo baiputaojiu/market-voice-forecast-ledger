@@ -460,7 +460,7 @@ additional CLI/worker synthetic E2E is tracked with Task 8.
 - Produces: `_run_production_presence_repair(command, expected_preview_hash=None)`, opening preview through a SQLite `mode=ro`/`query_only` connection and opening apply through the normal writable connection. Apply installs schema-only migration `0021` before rebuilding and matching the same data-bound preview; preview itself never installs migrations or writes WAL state.
 - Preserves: injectable `presence_repair_service_factory` for tests.
 
-- [ ] **Step 1: Write parser, output, and error-boundary tests**
+- [x] **Step 1: Write parser, output, and error-boundary tests**
 
 ```python
 def test_repair_preview_prints_only_public_counts_and_hash(capsys, repair_factory):
@@ -474,23 +474,23 @@ def test_repair_apply_requires_exact_preview_hash(parser):
         parser.parse_args(["presence", "pilot", "repair", "apply"])
 ```
 
-- [ ] **Step 2: Run CLI tests and confirm RED**
+- [x] **Step 2: Run CLI tests and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_repair_cli.py tests/backend/integration/test_cli.py -q`
 
 Expected: parser failure because the repair subcommands do not exist.
 
-- [ ] **Step 3: Implement the production wiring and public output**
+- [x] **Step 3: Implement the production wiring and public output**
 
 Preview prints only transition, target count, and preview hash. Apply prints only completion count and destination contract. The read-only preview accepts migration inventory `0020` or `0021`; apply installs `0021`, then requires the data-bound preview hash to remain identical before any backup or delete. Map every repair failure to fixed safe codes such as `PRESENCE_REPAIR_TARGET_INVALID`, `PRESENCE_REPAIR_PREVIEW_CHANGED`, `PRESENCE_REPAIR_BACKUP_FAILED`, `PRESENCE_REPAIR_RUNTIME_INVALID`, and `PRESENCE_REPAIR_ALREADY_APPLIED`; never print exceptions, SQL, absolute paths, or hashes other than the preview token intentionally returned to the local operator.
 
-- [ ] **Step 4: Run CLI tests and confirm GREEN**
+- [x] **Step 4: Run CLI tests and confirm GREEN**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_repair_cli.py tests/backend/integration/test_cli.py tests/backend/integration/test_presence_cli.py -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit the repair CLI**
+- [x] **Step 5: Commit the repair CLI**
 
 ```powershell
 git add src/market_voice_forecast_ledger/cli.py tests/backend/integration/test_presence_repair_cli.py tests/backend/integration/test_cli.py
@@ -498,6 +498,12 @@ git commit -m "feat: add guarded presence repair cli"
 ```
 
 ---
+
+Execution evidence (2026-09-04): 75 CLI tests passed, including the real production
+wiring against a synthetic populated 0020 database. Preview leaves 0020 intact;
+apply installs only 0021, retains the same preview hash, and creates 20 queued
+jobs without executing a worker. Duplicate/abbreviated/unknown arguments and
+private exception text are rejected at the public boundary.
 
 ### Task 8: Close architecture and regression coverage
 
