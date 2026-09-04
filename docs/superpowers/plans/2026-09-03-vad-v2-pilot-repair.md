@@ -177,13 +177,13 @@ The separate work-state suite passed 260 tests with zero failures.
 
 **Interfaces:**
 - Produces: `RepairRowIdentity(table: str, identity: str)`.
-- Produces: `PresenceRepairJob(job_id: int, candidate_id: int, eligibility_id: int, snapshot: VoiceManifestSnapshot, manifest_hash: str, row_identities: tuple[RepairRowIdentity, ...])`.
+- Produces: `PresenceRepairJob(job_id: int, candidate_id: int, snapshot: VoiceManifestSnapshot, manifest_hash: str)`.
 - Produces: `PresenceRepairTarget(jobs: tuple[PresenceRepairJob, ...], counts: Mapping[str, int], candidate_order_hash: str, target_fingerprint: str, preserved_fingerprint: str)`.
 - Produces: `PresenceRepairPreview(from_vad_contract_version: str, to_vad_contract_version: str, target: PresenceRepairTarget, preview_hash: str)`.
 - Produces: `PresenceRepairResult(old_job_ids: tuple[int, ...], new_job_ids: tuple[int, ...], candidate_ids: tuple[int, ...], to_vad_contract_version: str)`.
 - Produces: `PresenceRepairRepository.read_target(from_contract: str, to_contract: str) -> PresenceRepairTarget`.
 
-- [ ] **Step 1: Write canonical hashing and exact-inventory tests**
+- [x] **Step 1: Write canonical hashing and exact-inventory tests**
 
 ```python
 def test_preview_hash_binds_transition_and_all_target_fingerprints(target):
@@ -200,23 +200,23 @@ def test_inventory_rejects_any_noncanonical_target(migrated_conn, mutation):
         PresenceRepairRepository(migrated_conn).read_target("vad-v1", "vad-v2")
 ```
 
-- [ ] **Step 2: Run the domain and inventory tests and confirm RED**
+- [x] **Step 2: Run the domain and inventory tests and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_presence_repair_domain.py tests/backend/integration/test_presence_repair_inventory.py -q`
 
 Expected: import failure because the new domain and repository modules do not exist.
 
-- [ ] **Step 3: Implement canonical target reading**
+- [x] **Step 3: Implement canonical target reading**
 
 Use explicit column lists and stable `ORDER BY` clauses. Rebuild each `VoiceManifestSnapshot`, call `build_presence_job_manifest`, and require both stored manifest hashes to match the rebuilt value. Compute hashes with existing `canonical_json` and `sha256_text`; exclude paths and secret-bearing data. Read and hash all current presence decisions, active references/features, active calibration, candidate/video/profile identity, and unrelated table counts as the preserved fingerprint.
 
-- [ ] **Step 4: Run the tests and confirm GREEN**
+- [x] **Step 4: Run the tests and confirm GREEN**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_presence_repair_domain.py tests/backend/integration/test_presence_repair_inventory.py -q`
 
 Expected: all exact-gate mutations fail closed and the canonical twenty-job fixture passes.
 
-- [ ] **Step 5: Commit exact inventory support**
+- [x] **Step 5: Commit exact inventory support**
 
 ```powershell
 git add src/market_voice_forecast_ledger/domain/presence_repair.py src/market_voice_forecast_ledger/repositories/presence_repair.py tests/backend/unit/test_presence_repair_domain.py tests/backend/integration/test_presence_repair_inventory.py
@@ -224,6 +224,14 @@ git commit -m "feat: fingerprint presence repair target"
 ```
 
 ---
+
+Execution evidence (2026-09-04): the real synthetic twenty-job worker flow passed
+8 inventory tests, including seven fail-closed mutations. Hash binding is tested
+through the inventory consumer instead of a separate trivial domain test file.
+The fixture uses one clock for job creation and execution so canonical event
+ordering remains meaningful. All normal table columns are typed and hashed in
+stable row order; only exact owned identities are excluded from the preserved
+fingerprint. Cutover bindings use candidate IDs, not legacy eligibility IDs.
 
 ### Task 4: Back up and upgrade all runtime locks
 
@@ -237,7 +245,7 @@ git commit -m "feat: fingerprint presence repair target"
 - Produces: `RuntimeLockUpgradeResult(backup_directory: Path, backup_fingerprint: str, before_contract: str, after_contract: str, attestations: tuple[RuntimeAttestation, ...])`.
 - Produces: `upgrade_runtime_locks(settings: Settings, *, backup_directory: Path, from_contract: str, to_contract: str, version_probe: VersionProbe) -> RuntimeLockUpgradeResult`.
 
-- [ ] **Step 1: Write lock-transition tests**
+- [x] **Step 1: Write lock-transition tests**
 
 ```python
 def test_upgrade_changes_only_vad_identity_and_attests_all_three(runtime_fixture, tmp_path):
@@ -267,23 +275,23 @@ def test_upgrade_rejects_mixed_versions_before_writing(runtime_fixture, tmp_path
     assert not (tmp_path / "repair-backup").exists()
 ```
 
-- [ ] **Step 2: Run the runtime-upgrade tests and confirm RED**
+- [x] **Step 2: Run the runtime-upgrade tests and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_voice_runtime_upgrade.py -q`
 
 Expected: import failure because `runtime_upgrade` does not exist.
 
-- [ ] **Step 3: Implement exclusive backup, atomic replacement, and re-attestation**
+- [x] **Step 3: Implement exclusive backup, atomic replacement, and re-attestation**
 
 Parse each lock with the existing strict lock validator, attest all three, compare canonical documents after removing only `vad_contract_version`, create the backup directory and files with exclusive-create semantics, flush and reread hashes, write each replacement to a sibling temporary file, flush, and `Path.replace` candidate locks before the active lock. If all locks already say `vad-v2`, verify and return without rewriting; still require a fresh backup directory for the current apply attempt.
 
-- [ ] **Step 4: Run the runtime tests and confirm GREEN**
+- [x] **Step 4: Run the runtime tests and confirm GREEN**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_voice_runtime_upgrade.py tests/backend/unit/test_voice_runtime.py tests/backend/unit/test_pc_transfer_runtime_rebuild.py -q`
 
 Expected: all tests pass, including mixed-version, backup-collision, partial-replace, all-v2 idempotence, and artifact/probe mismatch cases.
 
-- [ ] **Step 5: Commit runtime-lock upgrade support**
+- [x] **Step 5: Commit runtime-lock upgrade support**
 
 ```powershell
 git add src/market_voice_forecast_ledger/voice/runtime.py src/market_voice_forecast_ledger/voice/runtime_upgrade.py tests/backend/unit/test_voice_runtime_upgrade.py
@@ -291,6 +299,15 @@ git commit -m "feat: upgrade attested presence runtime locks"
 ```
 
 ---
+
+Execution evidence (2026-09-04): runtime-upgrade, existing runtime, offline rebuild,
+and architecture coverage passed 80 tests. Backup and replacement are separate
+APIs, allowing the verified database snapshot to occur between them. The existing
+pc_transfer.runtime_rebuild.probe_version is reused; runtime.py needs no new
+probe. Both candidate locks must share every non-model field with the active
+lock, whose model must match exactly one candidate. Existing backups are never
+replaced; partial replacement preserves all originals and leaves the active
+lock last.
 
 ### Task 5: Implement preview and verified database backup
 
