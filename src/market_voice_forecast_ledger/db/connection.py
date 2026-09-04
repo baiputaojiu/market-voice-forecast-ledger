@@ -12,6 +12,7 @@ def open_database(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA recursive_triggers = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
+    conn.create_function("presence_vad_repair_delete_authorized", 2, lambda *_: 0)
     conn.create_function(
         "voice_reference_threshold_transition_authorized",
         3,

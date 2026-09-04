@@ -70,6 +70,7 @@ APPROVED_REVIEW_WRITER_CALLERS = (
 )
 EXPECTED_VOICE_TABLES = frozenset(
     {
+        "voice_vad_repairs",
         "voice_reference_calibrations",
         "voice_reference_clips",
         "voice_reference_features",

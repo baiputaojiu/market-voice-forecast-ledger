@@ -110,7 +110,7 @@ The finite adapter import allowlist now includes the shared domain constant.
 - Produces: table `voice_vad_repairs` with a unique `(from_vad_contract_version, to_vad_contract_version)` transition.
 - Produces: guarded delete triggers for the exact repair-owned tables.
 
-- [ ] **Step 1: Write migration and guard tests**
+- [x] **Step 1: Write migration and guard tests**
 
 ```python
 def test_normal_connection_cannot_delete_repair_rows(migrated_conn):
@@ -125,13 +125,13 @@ def test_repair_transition_is_unique(migrated_conn):
         insert_repair_ledger(migrated_conn, "vad-v1", "vad-v2")
 ```
 
-- [ ] **Step 2: Run the guard test and confirm RED**
+- [x] **Step 2: Run the guard test and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_vad_repair_guards.py -q`
 
 Expected: failure because migration `0021` and the UDF do not exist.
 
-- [ ] **Step 3: Implement the schema boundary**
+- [x] **Step 3: Implement the schema boundary**
 
 Create a ledger with safe-token/hash checks, old/new target counts, candidate-order hash, target fingerprint, preserved fingerprint, database-backup SHA-256, runtime-backup fingerprint, and timestamps. Replace only the existing no-delete triggers required by the repair with triggers shaped as:
 
@@ -144,18 +144,26 @@ BEGIN SELECT RAISE(ABORT, 'PRESENCE_VAD_REPAIR_REQUIRED'); END;
 
 For composite identities, pass canonical text such as `CAST(OLD.job_id AS TEXT) || ':' || OLD.unit_key`; never authorize a table-wide wildcard. Register the UDF with `lambda *_: 0` in `open_database`.
 
-- [ ] **Step 4: Run migration, architecture, and guard tests**
+- [x] **Step 4: Run migration, architecture, and guard tests**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_vad_repair_guards.py tests/backend/integration/test_presence_architecture.py tests/backend/integration/test_database_foundation.py -q`
 
 Expected: all tests pass and the voice-table inventory includes exactly `voice_vad_repairs` in addition to the previous eight tables.
 
-- [ ] **Step 5: Commit the schema boundary**
+- [x] **Step 5: Commit the schema boundary**
 
 ```powershell
 git add src/market_voice_forecast_ledger/db/connection.py src/market_voice_forecast_ledger/db/migrations/0021_presence_vad_repair.sql tests/backend/integration/test_presence_vad_repair_guards.py tests/backend/integration/test_presence_architecture.py
 git commit -m "feat: guard one-shot presence repair"
 ```
+
+Execution evidence (2026-09-04): four missing-capability tests failed before the
+migration; after implementation, 41 guard/architecture/database tests passed.
+Existing delete error codes remain unchanged; only the new jobs guard uses
+`PRESENCE_VAD_REPAIR_REQUIRED`. Authorization uses `IS NOT 1` so NULL denies too.
+The exact offline-wheel migration inventory in
+`tests/backend/integration/test_database_foundation.py` now includes `0021`.
+The separate work-state suite passed 260 tests with zero failures.
 
 ---
 
