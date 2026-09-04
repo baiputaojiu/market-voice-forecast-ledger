@@ -139,6 +139,22 @@ def assert_transfer_error(code: str, callable_under_test) -> None:
     assert error.value.code == code
 
 
+def test_snapshot_never_overwrites_a_destination_created_after_preflight(migrated_db, tmp_path, monkeypatch):
+    seed_valid_reference_feature(migrated_db)
+    destination = tmp_path / "new-backup" / "snapshot.sqlite3"
+    original_mkdir = Path.mkdir
+
+    def competing_mkdir(path, *args, **kwargs):
+        original_mkdir(path, *args, **kwargs)
+        if path == destination.parent:
+            destination.write_bytes(b"preserve-concurrent-file")
+
+    monkeypatch.setattr(Path, "mkdir", competing_mkdir)
+    with pytest.raises(DomainError):
+        create_database_snapshot(migrated_db, destination, repository_migration_names())
+    assert destination.read_bytes() == b"preserve-concurrent-file"
+
+
 def test_wal_database_is_restored_as_one_standalone_snapshot(
     migrated_db: Path,
     tmp_path: Path,

@@ -2,12 +2,22 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
+
+import pytest
+
+from market_voice_forecast_ledger.bootstrap import bootstrap_reference_data
+from market_voice_forecast_ledger.db.connection import open_database
+from market_voice_forecast_ledger.db.migrate import apply_migrations
 
 from tests.backend.integration.test_presence_pilot import (
+    MODEL_NAME,
+    MODEL_VERSION,
     NOW,
     pilot_service,
     seed_pilot_environment,
 )
+from tests.backend.unit.test_voice_runtime_upgrade import three_lock_fixture, LOCK_NAMES
 from tests.backend.integration.test_voice_verification_jobs import (
     FakePresenceAdapter,
     presence_worker_harness,
@@ -31,3 +41,22 @@ def seed_twenty_succeeded_v1_jobs(conn, tmp_path: Path):
         assert summary.job_id == job_id
         assert summary.succeeded_jobs == 1
     return creation
+
+
+@pytest.fixture
+def repair_environment(tmp_path: Path):
+    settings, probe, allowlists = three_lock_fixture(tmp_path)
+    for name in (LOCK_NAMES[0], LOCK_NAMES[-1]):
+        path = settings.voice_runtime_dir / name
+        document = json.loads(path.read_bytes())
+        document["model"]["name"] = MODEL_NAME
+        document["model"]["version"] = MODEL_VERSION
+        path.write_text(json.dumps(document), encoding="utf-8")
+    conn = open_database(settings.database_path)
+    apply_migrations(conn)
+    bootstrap_reference_data(conn)
+    creation = seed_twenty_succeeded_v1_jobs(conn, tmp_path)
+    try:
+        yield SimpleNamespace(conn=conn, settings=settings, probe=probe, allowlists=allowlists, creation=creation)
+    finally:
+        conn.close()

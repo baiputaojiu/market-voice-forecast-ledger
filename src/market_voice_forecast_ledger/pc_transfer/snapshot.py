@@ -213,10 +213,15 @@ def _backup_and_summarize(
     expected_migrations: tuple[str, ...],
     backup_progress: Callable[[int, int, int], None] | None,
 ) -> SnapshotResult:
-    if destination.exists() or destination.is_symlink():
+    if destination.exists() or destination.is_symlink() or any(
+        path.exists() or path.is_symlink() for path in _side_car_paths(destination)
+    ):
         raise _database_error()
+    owned = False
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("xb"):
+            owned = True
         with closing(sqlite3.connect(destination)) as snapshot_connection:
             source_connection.backup(
                 snapshot_connection,
@@ -235,10 +240,12 @@ def _backup_and_summarize(
         )
         return SnapshotResult(path=destination, database=database)
     except DomainError:
-        _remove_incomplete_snapshot(destination)
+        if owned:
+            _remove_incomplete_snapshot(destination)
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
-        _remove_incomplete_snapshot(destination)
+        if owned:
+            _remove_incomplete_snapshot(destination)
         raise _database_error() from exc
 
 

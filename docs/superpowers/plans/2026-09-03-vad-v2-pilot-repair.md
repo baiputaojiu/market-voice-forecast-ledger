@@ -322,7 +322,7 @@ lock last.
 - Consumes: `create_database_snapshot(source, destination, expected_migrations)` and `validate_database_snapshot` from `pc_transfer.snapshot`.
 - Produces privately: `_create_verified_database_backup(preview, backup_path) -> DatabaseSnapshotGuard`.
 
-- [ ] **Step 1: Write read-only preview and backup tests**
+- [x] **Step 1: Write read-only preview and backup tests**
 
 ```python
 def test_preview_is_read_only(migrated_db, repair_service):
@@ -339,23 +339,23 @@ def test_backup_collision_leaves_live_database_unchanged(repair_service, backup_
     assert live_fingerprint(repair_service) == before
 ```
 
-- [ ] **Step 2: Run preview tests and confirm RED**
+- [x] **Step 2: Run preview tests and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_repair_preview.py -q`
 
 Expected: import failure because the repair service does not exist.
 
-- [ ] **Step 3: Implement preview and reuse the snapshot verifier**
+- [x] **Step 3: Implement preview and reuse the snapshot verifier**
 
 Validate lowercase hashes and exact transition tokens. Preview calls only `read_target` and canonical hashing. Backup is created before `BEGIN IMMEDIATE`, must target an absent path, and must be reopened through a separate connection for integrity, foreign-key, migration inventory, target fingerprint, and final SHA-256 reread verification.
 
-- [ ] **Step 4: Run preview and snapshot tests and confirm GREEN**
+- [x] **Step 4: Run preview and snapshot tests and confirm GREEN**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_repair_preview.py tests/backend/integration/test_pc_transfer_snapshot.py -q`
 
 Expected: all tests pass and preview produces no database, lock, or backup writes.
 
-- [ ] **Step 5: Commit preview and backup orchestration**
+- [x] **Step 5: Commit preview and backup orchestration**
 
 ```powershell
 git add src/market_voice_forecast_ledger/services/presence_repair.py tests/backend/integration/test_presence_repair_preview.py tests/backend/integration/test_pc_transfer_snapshot.py
@@ -363,6 +363,14 @@ git commit -m "feat: preview and back up presence repair"
 ```
 
 ---
+
+Execution evidence (2026-09-04): 11 preview/snapshot tests passed. The service
+compares the complete preview before and after a closed, verified online backup.
+A regression proved that the existing snapshot helper could remove a destination
+created after preflight; exclusive creation now establishes ownership before
+cleanup is permitted. Persistent DB/WAL/lock bytes remain unchanged by preview;
+SQLite's volatile shared-memory reader marks are excluded from byte comparison.
+SQLite's internal temp database is allowed without accepting attached databases.
 
 ### Task 6: Execute the exact repair transaction
 
