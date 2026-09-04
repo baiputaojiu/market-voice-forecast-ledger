@@ -1394,6 +1394,7 @@ def presence_worker_harness(
     normalizer: FakePresenceMediaNormalizer | None = None,
     runtime: RuntimeAttestation | None = None,
     after_unit_committed: Callable[[int, str], None] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> PresenceWorkerHarness:
     work_root = tmp_path / "presence-audio"
     work_root.mkdir(exist_ok=True)
@@ -1423,10 +1424,10 @@ def presence_worker_harness(
         media_acquirer=acquirer,
         media_normalizer=effective_normalizer,
         adapter=effective_adapter,
-        retention=RetentionService(db, settings, clock=lambda: NOW),
+        retention=RetentionService(db, settings, clock=clock or (lambda: NOW)),
         runtime=effective_runtime,
         temp_audio_root=work_root,
-        clock=lambda: NOW,
+        clock=clock or (lambda: NOW),
         after_unit_committed=after_unit_committed,
     )
     return PresenceWorkerHarness(
