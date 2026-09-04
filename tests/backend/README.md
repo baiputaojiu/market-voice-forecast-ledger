@@ -101,6 +101,18 @@ provider本文、audio、embeddingを表示しません。Step 4以降（公開c
 runtime lock、model、audio、database、calibration score/report、operator noteをstageまたは
 commitしてはいけません。
 
+## VAD v2限定修復の合成検証
+
+`test_presence_repair_*`は、旧contractの20件を実workerの合成adapterで作り、
+読み取り専用preview、DBと3 runtime lockのexclusive backup、限定transaction、
+同じcandidate順序の20 queued jobへの置換、二重実行拒否を検証する。
+途中故障は再接続後の全行fingerprintでrollbackを確認し、commit後の検証失敗では
+自動復元しないことを確認する。修復自体はnetworkもworkerも実行しない。
+E2E末尾のworker実行は合成データだけを使う互換性試験で、本番修復の受入範囲には含めない。
+
+通常接続のDELETE禁止とSQL所有者の有限検査は修復機能の追加後も維持する。
+本番の保存先がOSによって読み替えられる場合も、path containment検査は緩和しない。
+
 ## ローカル成果物の境界
 
 実際の全文文字起こし、音声、埋め込み、SQLiteデータベース、runtime log、

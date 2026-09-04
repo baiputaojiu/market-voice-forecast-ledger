@@ -36,12 +36,13 @@ def test_migration_runner_records_current_migrations_once_and_remains_idempotent
         first = apply_migrations(conn)
         second = apply_migrations(conn)
         assert "0018_youtube_discovery_cutover" in first
-        assert first[-1] == "0020_presence_verification"
+        assert first[-1] == "0021_presence_vad_repair"
         assert second == ()
         for migration_name in (
             "0018_youtube_discovery_cutover",
             "0019_market_masters_seed_channel",
             "0020_presence_verification",
+            "0021_presence_vad_repair",
         ):
             assert conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE name=?",
@@ -468,6 +469,11 @@ def test_voice_records_reject_raw_update_and_delete(
             )
         conn.execute("ROLLBACK")
 
+        if table.startswith("voice_verification_"):
+            with pytest.raises(sqlite3.OperationalError, match="no such function: presence_vad_repair_delete_authorized"):
+                conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["id"],))
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE rowid=?", (row["id"],)).fetchone()[0] == 1
+            conn.create_function("presence_vad_repair_delete_authorized", 2, lambda *_: 0)
         conn.execute("BEGIN")
         with pytest.raises(sqlite3.IntegrityError, match=error_code):
             conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["id"],))

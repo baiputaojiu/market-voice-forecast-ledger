@@ -36,6 +36,18 @@ PRESENCE_SQL_OWNERS = frozenset(
         "repositories/voice_verification.py",
     }
 )
+REPAIR_DELETE_TABLES = frozenset({
+    "jobs", "job_units", "job_unit_attempts", "job_events", "video_pipeline_job_binding_sets",
+    "video_pipeline_job_bindings", "voice_verification_manifests", "voice_verification_runs",
+    "voice_verification_segments", "voice_verification_reviews", "local_artifacts",
+})
+REPAIR_NORMAL_OWNERS = {
+    **{table: "repositories/jobs.py" for table in ("jobs", "job_units", "job_unit_attempts", "job_events", "video_pipeline_job_binding_sets", "video_pipeline_job_bindings")},
+    **{table: "repositories/voice_verification.py" for table in (
+        "voice_verification_manifests", "voice_verification_runs", "voice_verification_segments", "voice_verification_reviews",
+    )},
+    "local_artifacts": "repositories/retention.py",
+}
 CANONICAL_DOWNSTREAM_SQL_OWNERS = frozenset(
     {
         ("repositories/retention.py", "analysis_input_snapshots"),
@@ -230,17 +242,21 @@ def _unquote_identifier(identifier: str) -> str:
     return identifier
 
 
-def _direct_sql_writes(tree: ast.Module) -> Iterator[tuple[int, str]]:
+def _direct_sql_writes(tree: ast.Module) -> Iterator[tuple[int, str, str]]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or type(node.value) is not str:
             continue
         for match in _SQL_WRITE.finditer(node.value):
-            yield node.lineno, _unquote_identifier(
-                match.group("table")
-            ).lower()
+            yield node.lineno, _unquote_identifier(match.group("table")).lower(), match.group(0).split()[0].upper()
 
 
-def _is_protected_sql_write(relative: str, table: str) -> bool:
+def _is_protected_sql_write(relative: str, table: str, operation: str) -> bool:
+    if relative == "repositories/presence_repair.py":
+        return not (operation == "DELETE" and table in REPAIR_DELETE_TABLES or operation == "INSERT" and table == "voice_vad_repairs")
+    if table == "voice_vad_repairs":
+        return True
+    if table in REPAIR_DELETE_TABLES:
+        return operation == "DELETE" or relative != REPAIR_NORMAL_OWNERS[table]
     if table in {"presence_decisions", "subject_video_candidates"}:
         return relative not in PRESENCE_SQL_OWNERS
     is_downstream = (
@@ -264,8 +280,8 @@ def direct_sql_write_violations(
         relative = _relative(path, package_root)
         violations.extend(
             (relative, lineno, table)
-            for lineno, table in _direct_sql_writes(_tree(path))
-            if _is_protected_sql_write(relative, table)
+            for lineno, table, operation in _direct_sql_writes(_tree(path))
+            if _is_protected_sql_write(relative, table, operation)
         )
     return tuple(sorted(violations))
 
@@ -415,6 +431,9 @@ def test_protected_modules_do_not_alias_or_dynamically_dispatch_writer() -> None
     (
         ("voice/process.py", "transcript_segments"),
         ("services/presence_mutation.py", "analysis_runs"),
+        ("services/presence_mutation.py", "jobs"),
+        ("services/presence_mutation.py", "voice_verification_runs"),
+        ("repositories/presence_repair.py", "voice_reference_profiles"),
     ),
 )
 def test_finite_guard_protects_complete_presence_production_surface(
@@ -451,6 +470,15 @@ def test_finite_guard_detects_direct_protected_sql_mutation(
     assert direct_sql_write_violations(
         (mutation,), package_root=package_root
     ) == (("services/presence_mutation.py", 2, "presence_decisions"),)
+
+
+@pytest.mark.parametrize("relative", ("repositories/jobs.py", "services/presence_mutation.py"))
+def test_repair_delete_authority_cannot_expand_to_other_modules(tmp_path, relative):
+    root = tmp_path / "market_voice_forecast_ledger"
+    path = root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text("def mutate(conn):\n    conn.execute('DELETE FROM jobs WHERE id=1')\n", encoding="utf-8")
+    assert direct_sql_write_violations((path,), package_root=root) == ((relative, 2, "jobs"),)
 
 
 def test_finite_guard_detects_downstream_sql_in_presence_module(

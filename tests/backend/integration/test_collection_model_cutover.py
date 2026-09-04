@@ -21,6 +21,7 @@ from market_voice_forecast_ledger.services.youtube_sync import YouTubeSyncServic
 CUTOVER = "0018_youtube_discovery_cutover"
 SEED_CHANNEL_MIGRATION = "0019_market_masters_seed_channel"
 PRESENCE_MIGRATION = "0020_presence_verification"
+REPAIR_MIGRATION = "0021_presence_vad_repair"
 OLD_MARKET_MASTERS_CHANNEL_ID = "UCJ1DVBLVpe4FvBZZ94kreaQ"
 CURRENT_MARKET_MASTERS_CHANNEL_ID = "UCXvjRTXoDa8tKwdkTaukGug"
 
@@ -79,6 +80,7 @@ EXPECTED_TABLES = (
     "voice_reference_clips",
     "voice_reference_features",
     "voice_reference_profiles",
+    "voice_vad_repairs",
     "voice_verification_manifests",
     "voice_verification_reviews",
     "voice_verification_runs",
@@ -196,6 +198,7 @@ EXPECTED_TRIGGERS = (
     "job_units_manifest_no_extra_insert",
     "job_units_no_replace",
     "jobs_manifest_immutable",
+    "jobs_no_delete",
     "jobs_no_replace",
     "local_artifacts_limited_update",
     "local_artifacts_no_delete",
@@ -265,6 +268,9 @@ EXPECTED_TRIGGERS = (
     "voice_reference_profiles_limited_update",
     "voice_reference_profiles_no_delete",
     "voice_reference_profiles_no_replace",
+    "voice_vad_repairs_no_delete",
+    "voice_vad_repairs_no_replace",
+    "voice_vad_repairs_no_update",
     "voice_verification_manifests_no_delete",
     "voice_verification_manifests_no_replace",
     "voice_verification_manifests_no_update",
@@ -658,7 +664,7 @@ def test_seed_channel_migration_changes_only_exact_retired_configuration(
             )
 
         applied = apply_migrations(conn)
-        assert applied == (SEED_CHANNEL_MIGRATION, PRESENCE_MIGRATION)
+        assert applied == (SEED_CHANNEL_MIGRATION, PRESENCE_MIGRATION, REPAIR_MIGRATION)
         repository = DiscoveryRepository(conn)
         current = repository.get_current_profile_version(subject_id)
         assert current.seed_channel_ids == (expected_seed,)
@@ -755,6 +761,7 @@ def test_retired_seed_failed_job_is_stopped_before_new_profile_job_is_created(
         assert apply_migrations(conn) == (
             SEED_CHANNEL_MIGRATION,
             PRESENCE_MIGRATION,
+            REPAIR_MIGRATION,
         )
         bootstrap_reference_data(conn)
         assert JobStateService(conn).request_stop(old_request.job_id) is (

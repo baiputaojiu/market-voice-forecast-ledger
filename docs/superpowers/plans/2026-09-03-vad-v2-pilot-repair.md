@@ -517,7 +517,7 @@ private exception text are rejected at the public boundary.
 - Consumes: the repair repository as the sole exceptional SQL writer.
 - Guarantees: no general presence module gains direct SQL authority, the adapter import boundary remains finite, and the existing worker flow uses only `vad-v2`.
 
-- [ ] **Step 1: Add failing architecture and regression cases**
+- [x] **Step 1: Add failing architecture and regression cases**
 
 ```python
 def test_only_repair_repository_writes_repair_owned_tables() -> None:
@@ -529,23 +529,23 @@ def test_post_repair_worker_reads_v2_manifest_only(repair_harness) -> None:
     assert job.snapshot.vad_contract_version == "vad-v2"
 ```
 
-- [ ] **Step 2: Run the architecture/E2E tests and confirm RED where coverage is missing**
+- [x] **Step 2: Run the architecture/E2E tests and confirm RED where coverage is missing**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_architecture.py tests/backend/e2e/test_presence_verification_flow.py -q`
 
 Expected: the new ownership assertion fails until the finite allowlist is updated.
 
-- [ ] **Step 3: Add only the exact repair repository ownership exception**
+- [x] **Step 3: Add only the exact repair repository ownership exception**
 
 Allow `repositories/presence_repair.py` to write only the repair-owned tables enumerated by the design. Keep `presence_decisions`, candidates, discovery, videos, reference, calibration, analysis, statements, forecasts, and heatmaps outside the allowlist. Document the opt-in real smoke as read/execute validation, not a repair prerequisite.
 
-- [ ] **Step 4: Run presence and PC-transfer regression suites**
+- [x] **Step 4: Run presence and PC-transfer regression suites**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_voice_protocol.py tests/backend/unit/test_voice_runtime.py tests/backend/unit/test_voice_runtime_upgrade.py tests/backend/integration/test_presence_architecture.py tests/backend/integration/test_presence_pilot.py tests/backend/integration/test_voice_verification_jobs.py tests/backend/integration/test_presence_repair_inventory.py tests/backend/integration/test_presence_repair_apply.py tests/backend/integration/test_presence_repair_cli.py tests/backend/e2e/test_presence_repair_flow.py tests/backend/e2e/test_pc_transfer_round_trip.py -q`
 
 Expected: all tests pass; real-provider tests remain explicitly opt-in.
 
-- [ ] **Step 5: Commit regression coverage**
+- [x] **Step 5: Commit regression coverage**
 
 ```powershell
 git add tests/backend/integration/test_presence_architecture.py tests/backend/e2e/test_presence_verification_flow.py tests/backend/integration/test_presence_real_smoke.py tests/backend/README.md
@@ -554,7 +554,25 @@ git commit -m "test: close presence repair boundaries"
 
 ---
 
+Execution evidence (2026-09-04): five SQL-boundary mutation tests failed before
+the finite allowlist was extended. The architecture plus offline repair/worker
+E2E passed 20 tests. All presence and PC-transfer cases in the full backend run
+passed; its ten failures were confined to the two pre-existing migration/raw-
+connection expectation files below. Those files passed 168 tests after update,
+and all ten failed cases then passed a separate rerun. As-built additional files:
+tests/backend/integration/test_append_only_insert_guards.py and
+tests/backend/integration/test_collection_model_cutover.py. Raw uninitialized
+connections still deny DELETE through the missing UDF; initialized connections
+keep the original immutable-row error codes.
+
 ### Task 9: Verify and freeze the implementation
+
+Checkpoint evidence (2026-09-04): compileall succeeded. Full backend run:
+2473 passed, 10 failed, 4 documented skips, one existing Starlette deprecation
+warning, 1281.84 seconds. The ten failures were old test expectations, corrected
+without further production-source edits; 168 related tests and a 10-case failed-
+test rerun passed. The post-correction full rerun is still required. Work-state
+passed 260 tests. Wheel build/install and final freeze have not been completed.
 
 **Files:**
 - Modify only if evidence requires it: files already listed in Tasks 1–8.
@@ -595,6 +613,18 @@ If Step 1–4 exposes a defect, return to the owning task, add a failing regress
 ---
 
 ### Task 10: Apply the repair to production with stage gates
+
+Read-only pause (2026-09-04): no production migration, backup, repair, or runtime
+lock rewrite has run. The current packaged process sees the logical data root
+but resolves its database/runtime children through the MSIX package LocalCache.
+Existing containment checks reject this view. The observed database still ends
+at 0020, has 20 vad-v1 manifests and no repair ledger; all three locks remain v1.
+Do not relax containment, rewrite paths, move data, reset/uninstall Codex, or
+attempt automatic restoration. First confirm the same database/runtime identity
+from a normal, non-Codex execution context with the user; then finish Task 9 and
+repeat all Task 10 gates. A source-path CLI invocation is needed for that initial
+read-only preview because the project wheel in .venv is still the migration-era
+version. No new worker execution is authorized by this checkpoint.
 
 **Files:**
 - Read/write private local state only: the production SQLite database and the three runtime lock files located through `default_settings()`.
