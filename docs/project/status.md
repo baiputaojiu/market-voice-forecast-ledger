@@ -1,12 +1,12 @@
 # 作業状態
 
-最終更新: 2026-08-30 JST
+最終更新: 2026-09-04 JST
 
 この文書の状態は、このファイルを含むcommitに対応する。SHAは本文へ埋め込まず、Gitから取得する。
 
 ## 現在のフェーズ（Current Phase）
 
-M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計の完成」、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 1～12は完了済みである。`feature/presence-verification`のGit状態、本番DB、固定voice runtime、非公開operator stateを、GitHub正本・Google Drive一時搬送の自己検証bundleから新PCへ非上書きで復元し、credential、06:00 schedule、DB/runtime、work-state、公開安全、合成round-trip E2Eまで受け入れた。次のproduct作業は、ユーザーがこの受入要約を確認した後の`vad-v2` contract導入と無効な既存20 pilot runの限定修復である。アプリ全体の完成は主張しない。
+M0、M1、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 1～12は完了済みである。ユーザー承認済みの`vad-v2`限定修復を実装し、対象照合、default-deny guard、DB/runtime backup、原子的な20 job置換、strict CLI、合成E2Eを検証している。本番には未適用である。現在のCodex起動環境ではWindowsのMSIX AppData仮想化によりdata rootと子fileのcanonical pathが異なり、既存のcontainment検査で停止する。この境界は緩和しない。アプリ全体や本番修復の完成は主張しない。
 
 ## Git状態（Git State）
 
@@ -115,11 +115,12 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 作業中（In Progress）
 
-- PC移行後のpre-work summaryをユーザーへ提示し、`vad-v2`と既存20 pilot run限定修復へ進むかの確認を待つ。確認前にproduct dataの削除・再作成は行わない。
+- 承認済みVAD v2限定修復計画の実装を進め、全backend回帰テストとcheckpoint保存を行う。修復対象は旧20 jobだけとし、同一candidate順序の20 queued jobへ置換する。workerは修復操作から起動しない。
+- 本番への適用はMSIXの保存先読み替えで停止中。Codex外の通常の実行環境でread-only previewとruntime attestationを再確認するか、保存場所の扱いを別途承認する必要がある。root検査の迂回、path書き換え、データ移動、自動復元は行っていない。
 
 ## 未着手（Not Started）
 
-- `vad-v2` contract導入と、末尾segmentだけが残った既存20 pilot runに限定したrun/job/manifest/segment/cleanup行の削除、および同一20 candidate jobの再作成。これは移行受入後の最初のproduct作業とする。
+- 本番に対する0021適用、検証済みDB/runtime backupの新規作成、旧20 jobと専用行の限定削除、同じ20 candidateのqueued job再作成、別接続での事後受入。コードは実装済みだが、実行環境の確認前に本番へ適用しない。
 - Codex分析prompt、JSON Schema、バッチmanifest、集約規則の確定。
 - 期間指定なしの2か月既定、売買・助言由来シグナル、重なる期間の見解変更表示に対応するdomain contract、永続化、再投影、API、UI、回帰試験の設計と実装。今回確定したのは要件と判断方針であり、実装済みとは扱わない。
 - UI例外処理、再試行、監査ログ、テスト戦略の詳細化。
@@ -127,6 +128,12 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 - 次subproject。候補は音声・本人声確認、Codex adapter、UIで、ユーザーの明示承認までは着手しない。
 
 ## 検証結果（Verification Results）
+
+- 2026-09-04の限定修復: contract/既存presence 234 tests、guard/DB 41 tests、exact inventory 8 tests、runtime/再構築/architecture 80 tests、preview/snapshot 11 tests、transaction/guard 27 tests、CLI 75 tests、architecture/合成repair E2E 20 testsがそれぞれ成功した。重複するtestを含むため合計値にはしない。
+- 全体回帰で旧migration終端・table/trigger inventoryの固定期待値と、未初期化SQLite接続のDELETE拒否codeとの差を検出した。通常接続の拒否を維持し、未初期化接続でもUDF欠如によりfail closedすることを追加検証した。対応後のappend-only/cutover 168 testsは成功した。
+- 2026-09-04のwork-state全体検証は260 passed、0 failed。公開する状態文書には本番の識別hashやmachine固有pathを追加しない。
+- 2026-09-04の全backend runは2,473 passed、10 failed、既存skip 4件、既存Starlette deprecation warning 1件（1281.84秒）。失敗は上記2ファイルの旧期待値だけで、修正後の関連168 testsと失敗分10 testsの再実行は成功した。修正後の全件一括再実行は未実施であり、Task 9の最終greenはまだ主張しない。compileallは成功した。新wheelの本番用`.venv`への導入も未実施である。
+- 2026-09-04の本番read-only確認: schema終端は0020、`vad-v1` manifestは20件、repair ledgerなし、3 runtime lockもすべて`vad-v1`。修復用のDB変更・runtime更新は未実施である。
 
 - scheduler XML追加修正source `9adef31`・統合`5db7dbf`: 関連scheduler・CLI・API 216 passed。全backendは1747件中1745 passed、既存Windows symlink capability skip 1件、明示opt-in real smoke skip 1件、failure 0。compileall、diff check、WorkingTree公開安全206ファイルが成功し、実機statusは`installed 06:00`だった。`main` push後のlive remote SHA一致とlocal/remote feature branch・worktree削除も確認した。
 - 実YouTube read-only smoke: Credential statusは`configured`。公開video IDをprocess環境だけに設定したopt-in実行は3 passed、exit 0だった。`channels.list`と`videos.list`のresponse shapeを検証し、secret・provider値は出力されず、実行後にenv 2件が不存在であることを確認した。
@@ -189,6 +196,8 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 既知の問題（Known Issues）
 
+- 現在のCodex起動環境では、論理上のprivate data rootと、DB/runtime fileが返すMSIX package LocalCache配下のcanonical pathが一致しない。対象ディレクトリのsame-file identityは一致し、reparse pointではなかったが、承認済みpath containment契約はalias許可へ変更しない。read-only previewは`PRESENCE_REPAIR_TARGET_INVALID`、runtime attestationは`VOICE_RUNTIME_INVALID`で停止した。Codex外から見えるDBとの同一性は未確認であり、本番データの不正・消失とは断定しない。保存先の確認・保全前にCodexのresetやuninstallは行わない。WindowsのAppData仮想化は[Microsoftの説明](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes)を参照。
+
 - `.stitch/DESIGN.md` と `.stitch/metadata.json` の日本語が文字化けしている。
 - `.stitch` のHTMLには実在人物名と架空の予想・証拠文が組み合わされ、外部CDN、Google Fonts、外部プロフィール画像も参照されている。
 - `analysis-run.html` など一部画面に英語の「Analyst Ledger」が残る。
@@ -213,11 +222,15 @@ M0「複数PC間の作業状態保存・再開基盤」、M1「アプリ設計�
 
 ## 次の作業（Next Actions）
 
-1. ユーザーがPC移行後のpre-work summaryを確認する。旧PC dataとDrive/DownloadsのZIPは保持し、旧PC writerを再開しない。
-2. ユーザー承認後、最初のproduct作業として`vad-v2`を導入し、無効な既存20 runに属するrun/job/manifest/segment/cleanup行だけを限定削除して同一20 candidate jobを再作成する。
-3. 修復後にruntime contract、DB整合性、20 candidateの再作成結果、fresh presence E2Eを検証する。
+1. ユーザーと本番適用の実行環境を確認する。まずCodex外で同じDB/runtimeを参照できるか、変更を伴わないpreview・attestationで検証する。初回previewは旧wheelではなく`src`を明示して起動する。保存先の統合・移動やruntime path変更は別途承認なしに行わない。
+2. 修正後の全backendを一括再実行し、Task 9の残りを検証する。旧PC dataとDrive/DownloadsのZIPは保持し、旧PC writerを再開しない。
+3. 実行環境と全検証が整った後だけ、計画Task 9のwheel導入とTask 10のバックアップ、hash-bound apply、別接続での事後受入を行う。新20 jobはqueuedのままにし、Task 11で本番受入結果とlive remote一致を記録する。
 
 ## 重要ファイル（Important Files）
+
+- `docs/superpowers/specs/2026-09-03-vad-v2-pilot-repair-design.md`: 承認済みの一回限定修復と保持境界。
+- `docs/superpowers/plans/2026-09-03-vad-v2-pilot-repair.md`: 実装・検証・本番適用の進捗と次のstage gate。
+- `src/market_voice_forecast_ledger/services/presence_repair.py`: read-only previewとverified backup、限定apply。
 
 - `docs/project/requirements.md`: 現在有効な要件の正本。
 - `docs/project/decisions.md`: 重要な決定、理由、却下案。

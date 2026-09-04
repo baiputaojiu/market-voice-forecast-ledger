@@ -2,9 +2,9 @@
 
 ## 現在のマイルストーン（Current Milestone）
 
-### PC移行完了・presence verification修復待ち
+### PC移行完了・presence限定修復の実装と適用環境確認
 
-M0、M1、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 1～12は完了済みである。`feature/presence-verification`のGit状態、本番DB、固定voice runtime、非公開operator stateを新PCへ非上書きで復元し、Git/live remote、bundle、DB、runtime、credential、06:00 schedule、fresh tests、合成round-trip E2Eの受入を完了した。GitHubだけを開発状態の正本とし、Google Drive/Downloadsの完成ZIPと旧PC private dataは回復元として保持する。次はユーザーのpre-work summary確認後に、`vad-v2` contractと無効な既存20 pilot runの限定修復へ進む。
+M0、M1、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 1～12は完了済みである。ユーザー承認済みの`vad-v2`限定修復コードを実装し、全体回帰とcheckpoint保存を進める。本番は旧20件・3 runtime lockとも`vad-v1`のままであり、MSIXの保存先読み替えによりread-only preflightが停止している。実行環境を確認するまで、本番データやruntime pathを変更しない。GitHubを開発状態の正本とし、Google Drive/Downloadsの完成ZIPと旧PC private dataは回復元として保持する。
 
 ## 完了済み（Completed）
 
@@ -80,7 +80,7 @@ M0、M1、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 
 
 ## 作業中（In Progress）
 
-- PC移行後のpre-work summaryをユーザーへ提示し、最初のproduct修復へ進む明示確認を待つ。確認前は既存20 runや関連rowを変更しない。
+- 承認済み限定修復の実装と合成検証、全体回帰、checkpoint保存。本番への適用はMSIXの保存先読み替えで停止しており、通常の実行環境からのread-only確認を次のstage gateとする。
 
 ## 未着手（Not Started）
 
@@ -88,7 +88,7 @@ M0、M1、M2中核バックエンド、YouTube収集Task 1～13、PC移行Tasks 
 
 PC移行後のproduct作業は次の順序とする。
 
-1. `vad-v2` contractを導入し、既存の無効な20 pilot runに属するrun/job/manifest/segment/cleanup行だけを限定削除し、同じ20 candidate jobを再作成する。
+1. 実装済み`vad-v2`限定修復の本番実行環境を確認する。全体検証とDB/runtime backupの照合後に、旧20 jobだけを同じcandidate順序の20 queued jobへ置換する。現時点では本番未適用であり、修復操作はworkerを実行しない。
 2. Codex prompt、JSON Schema、CLI adapter、外部ツール0件検証の詳細specと実装。
 3. 指数割当規則、4資産比較ヒートマップ、レビュー・証拠UIの詳細specと実装。
 4. 実server/socket、UI、電源断・disk failure、性能の統合検証。
