@@ -435,6 +435,22 @@ def test_pilot_selects_exact_five_per_active_profile_in_contract_order(db) -> No
         assert tuple(item.source_kind.value for item in selected) == expected_sources
 
 
+def test_default_pilot_creates_queued_jobs_with_corrected_vad_identity(db) -> None:
+    seed_pilot_environment(db)
+    service = PresenceVerificationService(db, clock=lambda: NOW)
+
+    preview = service.preview_pilot()
+    creation = service.create_pilot(preview.preview_hash)
+
+    rows = db.execute(
+        "SELECT manifest.vad_contract_version, job.status, job.total_units "
+        "FROM voice_verification_manifests AS manifest "
+        "JOIN jobs AS job ON job.id=manifest.job_id ORDER BY job.id"
+    ).fetchall()
+    assert len(creation.job_ids) == 20
+    assert [tuple(row) for row in rows] == [("vad-v2", "queued", 7)] * 20
+
+
 def test_pilot_backfills_seed_shortage_by_newest_then_keeps_oldest_slot(db) -> None:
     seed = seed_pilot_environment(db, seed_shortage=True)
 

@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from math import isfinite
-from typing import Literal
+from typing import Final, Literal
 
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.enums import JobKind, JobStage
@@ -12,6 +12,9 @@ from market_voice_forecast_ledger.domain.speakers import (
     ScoreRule,
     SpeakerThresholdConfig,
 )
+
+
+PRESENCE_VAD_CONTRACT_VERSION: Final = "vad-v2"
 
 
 class VoiceProposal(StrEnum):

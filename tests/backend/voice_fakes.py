@@ -332,7 +332,7 @@ def fake_runtime_attestation(
             vad_version="vad-v1",
             provider="CPUExecutionProvider",
             adapter_contract_version="voice-adapter-v1",
-            vad_contract_version="vad-v1",
+            vad_contract_version="vad-v2",
             sherpa_onnx_version="1.13.4",
             sherpa_wheel_sha256=(
                 "cb1834182c4047b8edb1dceeed8d5cf7d6e10295a4079e5e0fea674b4314db06"

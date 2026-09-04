@@ -107,6 +107,11 @@ ADAPTER_ALLOWED_IMPORTS = frozenset(
             f'{PACKAGE_ROOT.name}.domain.voice_verification',
             'VoiceProposal',
         ),
+        (
+            'from',
+            f'{PACKAGE_ROOT.name}.domain.voice_verification',
+            'PRESENCE_VAD_CONTRACT_VERSION',
+        ),
         *(
             ('from', f'{PACKAGE_ROOT.name}.voice.protocol', symbol)
             for symbol in (

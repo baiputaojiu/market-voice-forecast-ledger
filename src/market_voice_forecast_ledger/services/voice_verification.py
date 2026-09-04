@@ -21,6 +21,7 @@ from market_voice_forecast_ledger.domain.discovery import (
 from market_voice_forecast_ledger.domain.enums import JobStatus, UnitStatus
 from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.voice_verification import (
+    PRESENCE_VAD_CONTRACT_VERSION,
     ReviewAction,
     VoiceManifestSnapshot,
     VoiceProposal,
@@ -43,7 +44,6 @@ from market_voice_forecast_ledger.services.audit import validate_audit_reason
 from market_voice_forecast_ledger.services.job_state import JobStateService
 
 
-PRESENCE_VAD_CONTRACT_VERSION: Final = "vad-v1"
 PRESENCE_SELECTION_CONTRACT_VERSION: Final = "presence-pilot-selection-v1"
 _CALIBRATION_VERSION_PREFIX = "voice-calibration-"
 _SQLITE_INT_MAX = 2**63 - 1

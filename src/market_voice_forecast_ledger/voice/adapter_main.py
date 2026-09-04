@@ -15,7 +15,10 @@ from typing import Any, Protocol
 
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text
 from market_voice_forecast_ledger.domain.errors import DomainError
-from market_voice_forecast_ledger.domain.voice_verification import VoiceProposal
+from market_voice_forecast_ledger.domain.voice_verification import (
+    PRESENCE_VAD_CONTRACT_VERSION,
+    VoiceProposal,
+)
 from market_voice_forecast_ledger.voice.protocol import (
     MAX_ADAPTER_RESPONSE_BYTES,
     MAX_ADAPTER_SEGMENTS,
@@ -157,6 +160,8 @@ def _decode_request(payload: object) -> AdapterRequest:
     request = AdapterRequest.model_validate_json(canonical_json(value), strict=True)
     if encode_request(request) != payload:
         raise ValueError("adapter request is not canonical")
+    if request.vad_contract_version != PRESENCE_VAD_CONTRACT_VERSION:
+        raise ValueError("unsupported VAD execution contract")
     return request
 
 

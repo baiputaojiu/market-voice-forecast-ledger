@@ -61,7 +61,7 @@ def _request() -> AdapterRequest:
         "reference_feature_sha256": hashlib.sha256(feature).hexdigest(),
         "subject_boundary": 0.8,
         "threshold_config_version": "threshold-v1",
-        "vad_contract_version": "vad-v1",
+        "vad_contract_version": "vad-v2",
         "vad_model_path": "C:/private/models/vad.onnx",
         "vad_model_sha256": "c" * 64,
     }
@@ -532,6 +532,33 @@ def test_adapter_entrypoint_wipes_feature_when_initialization_fails(
     assert captured[0] == bytearray(len(captured[0]))
     assert "private-sentinel" not in str(caught.value)
     assert request.audio_path not in str(caught.value)
+
+
+def test_adapter_entrypoint_rejects_legacy_vad_before_backend_execution() -> None:
+    values = _request().model_dump(mode="python", exclude={"input_hash"})
+    values["vad_contract_version"] = "vad-v1"
+    request = AdapterRequest.with_canonical_hash(**values)
+    started = False
+
+    class Backend:
+        def score(self) -> AdapterResponse:
+            return decode_response(_response_payload(request), expected_request=request)
+
+    def backend_factory(received: AdapterRequest, feature: bytearray) -> Backend:
+        nonlocal started
+        started = True
+        return Backend()
+
+    with pytest.raises(DomainError, match="voice adapter process failed") as caught:
+        adapter_main.process_payload(
+            encode_request(request),
+            backend_factory=backend_factory,
+            socket_module=SimpleNamespace(),
+            low_level_socket_module=SimpleNamespace(),
+        )
+
+    assert caught.value.code == "VOICE_ADAPTER_PROCESS_FAILED"
+    assert not started
 
 
 def _adapter_forbidden_imports(source: str) -> tuple[str, ...]:

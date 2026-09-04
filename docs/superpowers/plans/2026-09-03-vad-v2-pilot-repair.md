@@ -43,7 +43,7 @@
 - Consumes: `VoiceManifestSnapshot.vad_contract_version` and `AdapterRequest.vad_contract_version`.
 - Guarantees: pilot manifests, adapter requests/responses, runtime-attested workers, and test fakes use the same current contract identity.
 
-- [ ] **Step 1: Write failing contract-identity tests**
+- [x] **Step 1: Write failing contract-identity tests**
 
 ```python
 def test_current_presence_vad_contract_is_v2() -> None:
@@ -55,13 +55,13 @@ def test_adapter_rejects_legacy_vad_contract(valid_request: AdapterRequest) -> N
         _PresenceEngine(legacy, fake_backend()).run()
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_voice_protocol.py tests/backend/integration/test_presence_pilot.py -q`
 
 Expected: failure because the current constant is `vad-v1` and the adapter accepts that identity.
 
-- [ ] **Step 3: Move the current constant to the domain boundary and enforce it**
+- [x] **Step 3: Move the current constant to the domain boundary and enforce it**
 
 ```python
 PRESENCE_VAD_CONTRACT_VERSION: Final = "vad-v2"
@@ -75,18 +75,25 @@ if request.vad_contract_version != PRESENCE_VAD_CONTRACT_VERSION:
 
 Import the constant in the service and adapter; delete the service-local `vad-v1` declaration. Update only current-pipeline test factories to `vad-v2`; historical PC-transfer manifest fixtures remain explicit `vad-v1` fixtures.
 
-- [ ] **Step 4: Run focused tests and confirm GREEN**
+- [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/unit/test_voice_protocol.py tests/backend/integration/test_presence_pilot.py tests/backend/integration/test_voice_verification_jobs.py -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit the contract change**
+- [x] **Step 5: Commit the contract change**
 
 ```powershell
 git add src/market_voice_forecast_ledger/domain/voice_verification.py src/market_voice_forecast_ledger/services/voice_verification.py src/market_voice_forecast_ledger/voice/adapter_main.py tests/backend/voice_fakes.py tests/backend/unit/test_voice_protocol.py tests/backend/integration/test_presence_pilot.py tests/backend/integration/test_voice_verification_jobs.py
 git commit -m "fix: version corrected presence vad contract"
 ```
+
+Execution evidence (2026-09-04): two consumer-behavior regressions failed before
+the source change; the corrected tree passed 234 focused tests in 112.76 seconds.
+The public adapter entrypoint keeps its existing safe `VOICE_ADAPTER_PROCESS_FAILED`
+error and rejects the legacy identity before backend initialization. Historical
+explicit `vad-v1` fixtures remain available; the default runtime fake is `vad-v2`.
+The finite adapter import allowlist now includes the shared domain constant.
 
 ---
 
