@@ -2,7 +2,11 @@
 
 import hashlib
 import sqlite3
+import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 
 from market_voice_forecast_ledger.domain.common import canonical_json, sha256_text, utc_iso
@@ -10,6 +14,7 @@ from market_voice_forecast_ledger.domain.errors import DomainError
 from market_voice_forecast_ledger.domain.presence_repair import (
     PresenceRepairJob,
     PresenceRepairTarget,
+    PresenceRepairPreview,
     RepairRowIdentity,
 )
 from market_voice_forecast_ledger.domain.voice_verification import PRESENCE_UNITS
@@ -32,6 +37,19 @@ _IDENTITY_COLUMNS = {
     **{name: ("id",) for name in REPAIR_COUNTS if name not in {
         "job_units", "video_pipeline_job_bindings", "video_pipeline_job_binding_sets"
     }},
+}
+_DELETE_SQL = {
+    "voice_verification_reviews": "DELETE FROM voice_verification_reviews WHERE id=?",
+    "voice_verification_segments": "DELETE FROM voice_verification_segments WHERE id=?",
+    "voice_verification_runs": "DELETE FROM voice_verification_runs WHERE id=?",
+    "voice_verification_manifests": "DELETE FROM voice_verification_manifests WHERE id=?",
+    "job_events": "DELETE FROM job_events WHERE id=?",
+    "job_unit_attempts": "DELETE FROM job_unit_attempts WHERE id=?",
+    "video_pipeline_job_bindings": "DELETE FROM video_pipeline_job_bindings WHERE job_id=? AND candidate_id=?",
+    "video_pipeline_job_binding_sets": "DELETE FROM video_pipeline_job_binding_sets WHERE job_id=?",
+    "job_units": "DELETE FROM job_units WHERE job_id=? AND unit_key=?",
+    "local_artifacts": "DELETE FROM local_artifacts WHERE id=?",
+    "jobs": "DELETE FROM jobs WHERE id=?",
 }
 
 
@@ -67,6 +85,125 @@ def _fingerprint(rows: dict[str, tuple[dict, ...]]) -> str:
 class PresenceRepairRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        self._authorizing = False
+
+    def next_job_id(self) -> int:
+        if not self._conn.in_transaction:
+            raise _invalid()
+        return self._conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM jobs").fetchone()[0]
+
+    @contextmanager
+    def authorize(self, rows: tuple[RepairRowIdentity, ...]):
+        if not self._conn.in_transaction or self._authorizing or len(rows) != len(set(rows)):
+            raise _invalid()
+        for row in rows:
+            if row.table not in _DELETE_SQL or type(row.identity) is not str:
+                raise _invalid()
+            values = row.identity.split(":", len(_IDENTITY_COLUMNS[row.table]) - 1)
+            if len(values) != len(_IDENTITY_COLUMNS[row.table]) or re.fullmatch(r"[1-9][0-9]*", values[0]) is None:
+                raise _invalid()
+            if row.table == "job_units" and values[1] not in {key for key, _ in PRESENCE_UNITS}:
+                raise _invalid()
+            if row.table == "video_pipeline_job_bindings" and re.fullmatch(r"[1-9][0-9]*", values[1]) is None:
+                raise _invalid()
+        remaining = set(rows)
+
+        def allow_once(table, identity):
+            row = RepairRowIdentity(table, identity)
+            if not self._conn.in_transaction or row not in remaining:
+                return 0
+            remaining.remove(row)
+            return 1
+
+        def revoke_at_transaction_end(action, first, _second, _database, _source):
+            if action == sqlite3.SQLITE_TRANSACTION and first in {"COMMIT", "ROLLBACK"}:
+                remaining.clear()
+            return sqlite3.SQLITE_OK
+
+        self._authorizing = True
+        try:
+            self._conn.set_authorizer(revoke_at_transaction_end)
+            self._conn.create_function("presence_vad_repair_delete_authorized", 2, allow_once)
+            yield
+        finally:
+            remaining.clear()
+            self._conn.create_function("presence_vad_repair_delete_authorized", 2, lambda *_: 0)
+            self._conn.set_authorizer(None)
+            self._authorizing = False
+
+    def delete_target(self, target: PresenceRepairTarget, *, fault_hook: Callable[[str], None]) -> None:
+        if not self._conn.in_transaction or not self._authorizing or dict(target.counts) != REPAIR_COUNTS:
+            raise _invalid()
+        for table, sql in _DELETE_SQL.items():
+            identities = tuple(row for row in target.row_identities if row.table == table)
+            if len(identities) != target.counts[table]:
+                raise _invalid()
+            for row in identities:
+                values = row.identity.split(":", len(_IDENTITY_COLUMNS[table]) - 1)
+                if self._conn.execute(sql, values).rowcount != 1:
+                    raise _invalid()
+            fault_hook("after_delete:" + table)
+
+    def verify_replacement(self, target: PresenceRepairTarget, new_job_ids: tuple[int, ...]) -> None:
+        old_ids = {job.job_id for job in target.jobs}
+        if len(new_job_ids) != 20 or len(set(new_job_ids)) != 20 or old_ids.intersection(new_job_ids):
+            raise _invalid()
+        rows = self._all_rows()
+        if any(row["id"] in old_ids for row in rows["jobs"]) or any(row["vad_contract_version"] == "vad-v1" for row in rows["voice_verification_manifests"]):
+            raise _invalid()
+        voice = VoiceVerificationRepository(self._conn)
+        identities = []
+        expected_counts = {name: 0 for name in REPAIR_COUNTS}
+        expected_counts.update(jobs=20, job_units=140, job_events=20, video_pipeline_job_binding_sets=20, video_pipeline_job_bindings=20, voice_verification_manifests=20)
+        for table, count in expected_counts.items():
+            owned = tuple(row for row in rows[table] if (
+                row["id"] in new_job_ids if table == "jobs" else row.get("job_id") in new_job_ids
+            ))
+            if len(owned) != count:
+                raise _invalid()
+            identities.extend(_identity(table, row) for row in owned)
+        for old, job_id in zip(target.jobs, new_job_ids, strict=True):
+            artifacts = voice.require_job_artifacts(job_id)
+            job = self._one(rows["jobs"], "id", job_id)
+            if artifacts.manifest.snapshot != replace(old.snapshot, vad_contract_version="vad-v2") or artifacts.run is not None or job["status"] != "queued" or job["source_job_id"] is not None:
+                raise _invalid()
+            units = tuple(row for row in rows["job_units"] if row["job_id"] == job_id)
+            if any(row["status"] != "pending" or row["attempt_count"] != 0 for row in units):
+                raise _invalid()
+            event = self._one(rows["job_events"], "job_id", job_id)
+            if event["unit_key"] is not None or event["event_kind"] != "job_created" or event["metadata_json"] != canonical_json({"source_job_id": None}) or event["created_at"] != job["created_at"]:
+                raise _invalid()
+        if self.fingerprint_except(tuple(identities), all_rows=rows) != target.preserved_fingerprint:
+            raise _invalid()
+
+    def add_completion(self, *, preview: PresenceRepairPreview, new_job_ids: tuple[int, ...], database_backup_sha256: str, runtime_backup_fingerprint: str, completed_at: str) -> None:
+        if not self._conn.in_transaction:
+            raise _invalid()
+        target = preview.target
+        self._conn.execute(
+            "INSERT INTO voice_vad_repairs(schema_version, from_vad_contract_version, to_vad_contract_version, "
+            "preview_hash, target_fingerprint, preserved_fingerprint, candidate_order_hash, database_backup_sha256, "
+            "runtime_backup_fingerprint, deleted_counts_json, candidate_ids_json, old_job_ids_json, new_job_ids_json, completed_at) "
+            "VALUES ('presence-vad-repair.v1', 'vad-v1', 'vad-v2', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (preview.preview_hash, target.target_fingerprint, target.preserved_fingerprint, target.candidate_order_hash,
+             database_backup_sha256, runtime_backup_fingerprint, canonical_json(dict(target.counts)),
+             canonical_json([job.candidate_id for job in target.jobs]), canonical_json([job.job_id for job in target.jobs]),
+             canonical_json(list(new_job_ids)), completed_at),
+        )
+
+    def verify_completion(self, preview: PresenceRepairPreview, new_job_ids: tuple[int, ...], database_backup_sha256: str, runtime_backup_fingerprint: str) -> None:
+        rows = self._conn.execute("SELECT * FROM voice_vad_repairs").fetchall()
+        expected = {
+            "schema_version": "presence-vad-repair.v1", "from_vad_contract_version": "vad-v1", "to_vad_contract_version": "vad-v2",
+            "preview_hash": preview.preview_hash, "target_fingerprint": preview.target.target_fingerprint,
+            "preserved_fingerprint": preview.target.preserved_fingerprint, "candidate_order_hash": preview.target.candidate_order_hash,
+            "database_backup_sha256": database_backup_sha256, "runtime_backup_fingerprint": runtime_backup_fingerprint,
+            "deleted_counts_json": canonical_json(dict(preview.target.counts)),
+            "candidate_ids_json": canonical_json([job.candidate_id for job in preview.target.jobs]),
+            "old_job_ids_json": canonical_json([job.job_id for job in preview.target.jobs]), "new_job_ids_json": canonical_json(list(new_job_ids)),
+        }
+        if len(rows) != 1 or any(rows[0][key] != value for key, value in expected.items()):
+            raise _invalid()
 
     def read_target(self, from_contract: str = "vad-v1", to_contract: str = "vad-v2") -> PresenceRepairTarget:
         owns_transaction = not self._conn.in_transaction

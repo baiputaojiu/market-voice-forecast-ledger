@@ -50,12 +50,16 @@ class JobRepository:
         *,
         source_job_id: int | None,
         created_at: datetime,
+        requested_job_id: int | None = None,
     ) -> int:
         self._require_transaction()
+        if requested_job_id is not None and (type(requested_job_id) is not int or not 0 < requested_job_id <= 9_223_372_036_854_775_807):
+            raise DomainError("INVALID_JOB_ID", "job identity is invalid")
         timestamp = utc_iso(created_at)
         cursor = self._conn.execute(
             """
             INSERT INTO jobs(
+                id,
                 source_job_id,
                 job_kind,
                 manifest_hash,
@@ -63,9 +67,10 @@ class JobRepository:
                 status,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                requested_job_id,
                 source_job_id,
                 manifest.kind.value,
                 manifest.manifest_hash,

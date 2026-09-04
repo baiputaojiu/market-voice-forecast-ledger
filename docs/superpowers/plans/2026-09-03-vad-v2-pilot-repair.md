@@ -380,6 +380,10 @@ SQLite's internal temp database is allowed without accepting attached databases.
 - Create: `tests/backend/integration/test_presence_repair_apply.py`
 - Create: `tests/backend/e2e/test_presence_repair_flow.py`
 
+As-built file additions: repositories/jobs.py and services/job_state.py accept an
+optional validated requested_job_id. Repair allocates IDs above the original
+maximum, preventing SQLite from reusing the removed highest job IDs.
+
 **Interfaces:**
 - Produces: `PresenceRepairRepository.authorize(rows: tuple[RepairRowIdentity, ...]) -> AbstractContextManager[None]`.
 - Produces: `PresenceRepairRepository.delete_target(target: PresenceRepairTarget) -> None`, verifying every `rowcount`.
@@ -387,7 +391,7 @@ SQLite's internal temp database is allowed without accepting attached databases.
 - Produces: `PresenceRepairService.apply(expected_preview_hash: str) -> PresenceRepairResult`.
 - Consumes: `JobStateService.create_video_pipeline_in_transaction(manifest: JobManifest, candidate_ids: Sequence[int], created_at: str | None = None) -> int`.
 
-- [ ] **Step 1: Write apply, rollback, and one-shot tests**
+- [x] **Step 1: Write apply, rollback, and one-shot tests**
 
 ```python
 def test_apply_replaces_only_twenty_target_jobs(repair_harness):
@@ -410,23 +414,23 @@ def test_apply_rolls_back_every_database_change(repair_harness, fault):
     assert repair_harness.normal_delete_is_denied()
 ```
 
-- [ ] **Step 2: Run apply tests and confirm RED**
+- [x] **Step 2: Run apply tests and confirm RED**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_repair_apply.py tests/backend/e2e/test_presence_repair_flow.py -q`
 
 Expected: failure because apply and deletion authorization are not implemented.
 
-- [ ] **Step 3: Implement finite authorization and one transaction**
+- [x] **Step 3: Implement finite authorization and one transaction**
 
 After verified runtime/database backups and runtime-lock upgrade, issue `BEGIN IMMEDIATE`, reread the target, require the same preview hash, and set a closure-backed UDF that returns `1` only for exact authorized tuples. Delete in schema-derived child-to-parent order, verify each count, reconstruct each snapshot with only `vad_contract_version="vad-v2"`, create one queued job/binding/manifest at a time through the normal service/repository path, verify old/new/preserved fingerprints, insert one ledger row, clear the UDF, and commit. In every exception path clear the UDF before rollback.
 
-- [ ] **Step 4: Run apply and E2E tests and confirm GREEN**
+- [x] **Step 4: Run apply and E2E tests and confirm GREEN**
 
 Run: `$env:PYTHONPATH=(Resolve-Path src).Path; .\.venv\Scripts\python.exe -m pytest tests/backend/integration/test_presence_repair_apply.py tests/backend/e2e/test_presence_repair_flow.py tests/backend/integration/test_presence_vad_repair_guards.py -q`
 
 Expected: all success, drift, unauthorized-delete, fault-injection, rollback, and rerun-rejection tests pass.
 
-- [ ] **Step 5: Commit transactional repair**
+- [x] **Step 5: Commit transactional repair**
 
 ```powershell
 git add src/market_voice_forecast_ledger/repositories/presence_repair.py src/market_voice_forecast_ledger/services/presence_repair.py tests/backend/integration/test_presence_repair_apply.py tests/backend/e2e/test_presence_repair_flow.py
@@ -434,6 +438,14 @@ git commit -m "feat: repair invalid presence pilot atomically"
 ```
 
 ---
+
+Execution evidence (2026-09-04): 27 apply/guard tests passed. Eight transaction
+fault boundaries roll back after reconnect; authorization is exact, single-use,
+and revoked at commit/rollback as well as context exit. Backup corruption is
+rechecked before BEGIN IMMEDIATE. Postcommit failure retains the committed result
+and backup, reports failure, and does not restore automatically. The integration
+success case crosses the full backup/runtime/service/repository boundary; the
+additional CLI/worker synthetic E2E is tracked with Task 8.
 
 ### Task 7: Expose a strict production CLI
 

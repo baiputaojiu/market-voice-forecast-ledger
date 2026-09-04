@@ -86,6 +86,8 @@ class JobStateService:
         manifest: JobManifest,
         candidate_ids: list[int] | tuple[int, ...],
         created_at: datetime | None = None,
+        *,
+        requested_job_id: int | None = None,
     ) -> int:
         self._require_transaction()
         normalized = self._validate_manifest(manifest)
@@ -116,6 +118,7 @@ class JobStateService:
             normalized,
             source_job_id=None,
             created_at=created_at or self._clock(),
+            requested_job_id=requested_job_id,
         )
         self._jobs.create_sealed_video_pipeline_bindings(job_id, bindings)
         self._require_video_pipeline_runnable(self._jobs.get(job_id))
